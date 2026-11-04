@@ -2,7 +2,7 @@
   "name": "frosted-background",
   "displayName": "Frosted Background · 毛玻璃背景",
   "description": "为整个代码区选择图片或静音视频背景，带可调毛玻璃效果与自适应缩放。",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "frostedBackgroundUpdates": {
     "repository": "yunshen4277/frosted-background"
   },
@@ -185,11 +185,13 @@
           "type": "string",
           "enum": [
             "cover",
-            "contain"
+              "contain",
+              "fill"
           ],
           "enumDescriptions": [
             "等比铺满整个代码区，允许裁剪边缘（推荐）。",
-            "等比完整显示，空白处使用主题底色。"
+              "等比完整显示，空白处使用主题底色。",
+              "自适应拉伸：随编辑区拉伸，可能改变画面比例。"
           ],
           "default": "cover",
           "scope": "application",
