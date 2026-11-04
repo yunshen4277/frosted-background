@@ -1,0 +1,242 @@
+{
+  "name": "frosted-background",
+  "displayName": "Frosted Background · 毛玻璃背景",
+  "description": "为整个代码区选择图片或静音视频背景，带可调毛玻璃效果与自适应缩放。",
+  "version": "0.3.0",
+  "frostedBackgroundUpdates": {
+    "repository": "yunshen4277/frosted-background"
+  },
+  "publisher": "local-frosted",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "background",
+    "glass",
+    "video",
+    "wallpaper",
+    "毛玻璃"
+  ],
+  "main": "./src/extension.js",
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    },
+    "virtualWorkspaces": true
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "package": "node scripts/package.js"
+  },
+  "devDependencies": {
+    "jszip": "3.10.1"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "frostedBackground.openPanel",
+        "title": "打开控制面板",
+        "category": "毛玻璃背景"
+      },
+      {
+        "command": "frostedBackground.checkUpdates",
+        "title": "检查插件更新",
+        "category": "毛玻璃背景"
+      },
+      {
+        "command": "frostedBackground.selectImage",
+        "title": "选择图片",
+        "category": "毛玻璃背景"
+      },
+      {
+        "command": "frostedBackground.selectVideo",
+        "title": "选择视频",
+        "category": "毛玻璃背景"
+      },
+      {
+        "command": "frostedBackground.openSettings",
+        "title": "打开效果设置（控制面板）",
+        "category": "毛玻璃背景"
+      },
+      {
+        "command": "frostedBackground.apply",
+        "title": "应用设置 / 更新后修复",
+        "category": "毛玻璃背景"
+      },
+      {
+        "command": "frostedBackground.restore",
+        "title": "关闭背景并恢复原状",
+        "category": "毛玻璃背景"
+      },
+      {
+        "command": "frostedBackground.status",
+        "title": "查看状态",
+        "category": "毛玻璃背景"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "frostedBackground",
+          "title": "毛玻璃背景",
+          "icon": "media/background-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "frostedBackground": [
+        {
+          "id": "frostedBackground.controls",
+          "name": "背景控制面板",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "frostedBackground.selectImage",
+          "when": "false"
+        },
+        {
+          "command": "frostedBackground.selectVideo",
+          "when": "false"
+        },
+        {
+          "command": "frostedBackground.openSettings",
+          "when": "false"
+        },
+        {
+          "command": "frostedBackground.status",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "毛玻璃背景",
+      "properties": {
+        "frostedBackground.updateMode": {
+          "type": "string",
+          "enum": [
+            "automatic",
+            "notify",
+            "off"
+          ],
+          "enumDescriptions": [
+            "自动检查、下载并安装 GitHub 新版，提示重载后生效。",
+            "自动检查，有新版时通知，由你决定安装。",
+            "停止后台检查，仍可手动检查更新。"
+          ],
+          "default": "automatic",
+          "scope": "application",
+          "description": "从插件绑定的公开 GitHub 仓库获取更新。首次启动后约 30 秒检查，此后每 6 小时检查；不会自动重载窗口。"
+        },
+        "frostedBackground.blur": {
+          "type": "number",
+          "default": 14,
+          "minimum": 0,
+          "maximum": 60,
+          "scope": "application",
+          "description": "背景模糊半径（像素），只模糊图片或视频，不模糊代码。修改后执行“毛玻璃背景: 应用设置”。"
+        },
+        "frostedBackground.opacity": {
+          "type": "number",
+          "default": 0.35,
+          "minimum": 0.05,
+          "maximum": 1,
+          "scope": "application",
+          "description": "背景浓度，越大越明显。建议 0.2–0.5。"
+        },
+        "frostedBackground.tintOpacity": {
+          "type": "number",
+          "default": 0.18,
+          "minimum": 0,
+          "maximum": 0.9,
+          "scope": "application",
+          "description": "毛玻璃蒙层浓度，自动使用当前主题颜色；越大代码越容易阅读。"
+        },
+        "frostedBackground.saturation": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "maximum": 2,
+          "scope": "application",
+          "description": "背景饱和度，1 为原色，0 为灰度。"
+        },
+        "frostedBackground.brightness": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0.2,
+          "maximum": 2,
+          "scope": "application",
+          "description": "背景亮度，1 为原始亮度。"
+        },
+        "frostedBackground.fit": {
+          "type": "string",
+          "enum": [
+            "cover",
+            "contain"
+          ],
+          "enumDescriptions": [
+            "等比铺满整个代码区，允许裁剪边缘（推荐）。",
+            "等比完整显示，空白处使用主题底色。"
+          ],
+          "default": "cover",
+          "scope": "application",
+          "description": "图片与视频都随编辑区尺寸自动调整。"
+        },
+        "frostedBackground.position": {
+          "type": "string",
+          "enum": [
+            "center center",
+            "center top",
+            "center bottom",
+            "left center",
+            "right center"
+          ],
+          "default": "center center",
+          "scope": "application",
+          "description": "背景对齐位置。"
+        },
+        "frostedBackground.playbackRate": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0.25,
+          "maximum": 2,
+          "scope": "application",
+          "description": "视频播放速度。视频始终静音、循环播放。"
+        },
+        "frostedBackground.pauseWhenUnfocused": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "窗口失去焦点时暂停视频。窗口隐藏时始终暂停。"
+        },
+        "frostedBackground.respectReducedMotion": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "系统开启“减少动态效果”时将视频保持为静止画面。"
+        }
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yunshen4277/frosted-background.git"
+  },
+  "homepage": "https://github.com/yunshen4277/frosted-background#readme",
+  "bugs": {
+    "url": "https://github.com/yunshen4277/frosted-background/issues"
+  }
+}
