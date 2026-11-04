@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { Transform } = require('node:stream');
+const { Readable, Transform } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { normalizeConfig } = require('./config');
 
@@ -138,7 +138,8 @@ async function stageAsset(source, directory, prefix, extension, limit, created) 
     },
   });
   try {
-    await pipeline(fs.createReadStream(source), meter, fs.createWriteStream(temporary, { flags: 'wx' }));
+    const input = Buffer.isBuffer(source) ? Readable.from([source]) : fs.createReadStream(source);
+    await pipeline(input, meter, fs.createWriteStream(temporary, { flags: 'wx' }));
     if (!total) throw new Error('所选背景文件为空。');
     const name = `${prefix}-${hash.digest('hex')}${extension}`;
     const destination = path.join(directory, name);
@@ -179,6 +180,12 @@ async function applyChecked({ appRoot, rendererPath, mediaPath, config = {} }, c
     if (mediaInfo.size > MAX_MEDIA_BYTES) throw new Error('背景文件过大，请选择不超过 500 MB 的文件。');
     const rendererInfo = await fsp.stat(rendererPath);
     if (!rendererInfo.isFile()) throw new Error('插件渲染文件缺失，请重新安装插件。');
+    // The video page has its own media policy. The workbench CSP is untouched.
+    const videoPlayerPath = path.join(path.dirname(rendererPath), 'video-player.js');
+    if (kind === 'video') {
+      const playerInfo = await exists(videoPlayerPath);
+      if (!playerInfo?.isFile() || playerInfo.isSymbolicLink()) throw new Error('视频播放器文件缺失，请重新安装插件。');
+    }
     const workbenchPath = await findWorkbench(appRoot);
     const directory = await ensureAssets(workbenchPath, true);
     return await withLock(directory, async () => {
@@ -200,6 +207,13 @@ async function applyChecked({ appRoot, rendererPath, mediaPath, config = {} }, c
         const mediaName = await stageAsset(mediaPath, directory, 'media', extension, MAX_MEDIA_BYTES, created);
         if (cachedExpectation && mediaName !== cachedExpectation.mediaName) throw new Error('缓存背景在更新期间被修改，已停止应用。');
         const payload = { ...config, enabled: true, source: `./${ASSET_DIRECTORY}/${mediaName}`, kind };
+        delete payload.videoPlayer;
+        if (kind === 'video') {
+          const playerName = await stageAsset(videoPlayerPath, directory, 'video-player', '.js', 2 * 1024 * 1024, created);
+          const videoPage = Buffer.from(`<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; connect-src 'self'; media-src blob:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent}video{position:absolute;inset:0;width:100%;height:100%;display:block;pointer-events:none}</style><script src="./${playerName}" defer></script></head><body></body></html>\n`);
+          const pageName = await stageAsset(videoPage, directory, 'video-host', '.html', 64 * 1024, created);
+          payload.videoPlayer = `./${ASSET_DIRECTORY}/${pageName}`;
+        }
         const next = inject(original, rendererName, payload);
         if (next !== original) await atomicReplace(workbenchPath, next, original);
         return { workbenchPath, kind, backupPath: backup };
@@ -272,7 +286,7 @@ async function restore({ appRoot }) {
       const cleanupErrors = [];
       if (directory) {
         for (const entry of await fsp.readdir(directory, { withFileTypes: true })) {
-          if (!/^(renderer-[a-f0-9]{64}\.js|media-[a-f0-9]{64}\.(png|jpe?g|gif|webp|bmp|avif|mp4|webm))$/.test(entry.name)) continue;
+          if (!/^(renderer-[a-f0-9]{64}\.js|video-player-[a-f0-9]{64}\.js|video-host-[a-f0-9]{64}\.html|media-[a-f0-9]{64}\.(png|jpe?g|gif|webp|bmp|avif|mp4|webm))$/.test(entry.name)) continue;
           // Never follow links or remove unknown files. Backups remain for recovery.
           if (!entry.isFile() || entry.isSymbolicLink()) continue;
           try { await fsp.unlink(path.join(directory, entry.name)); } catch (error) { cleanupErrors.push(error.message); }
