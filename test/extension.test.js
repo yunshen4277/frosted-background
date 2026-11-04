@@ -282,6 +282,8 @@ test('concurrent commands cannot race an apply operation against restore', async
   await env.run('restore');
   assert.equal(env.calls.restore.length, 0);
   assert.ok(env.calls.info.some(args => args[0].includes('正在处理背景')));
+  await env.run('closePanel');
+  assert.equal(env.calls.command.at(-1)[0], 'workbench.action.closeSidebar', 'the controls can be hidden while applying');
   finish();
   await applying;
   assert.equal(env.state.get('enabled'), true);
@@ -339,10 +341,18 @@ test('the activity view, status bar and both settings commands lead to the same 
   assert.equal(env.calls.statusBars[0].command, 'frostedBackground.openPanel');
   await env.run('openPanel');
   await env.run('openSettings');
+  await env.run('closePanel');
+  const panel = attachPanel(env);
+  await panel.send({ type: 'closePanel' });
   assert.deepEqual(env.calls.command, [
-    ['frostedBackground.controls.focus'], ['frostedBackground.controls.focus']
+    ['frostedBackground.controls.focus'], ['frostedBackground.controls.focus'],
+    ['workbench.action.closeSidebar'], ['workbench.action.closeSidebar']
   ]);
   assert.equal(env.calls.apply.length, 0);
+  assert.equal(env.calls.restore.length, 0, 'closing the controls never turns off the background');
+  assert.equal(env.calls.configurationWrites.length, 0);
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '../package.json'), 'utf8'));
+  assert.ok(manifest.contributes.menus['view/title'].some(item => item.command === 'frostedBackground.closePanel' && item.when === 'view == frostedBackground.controls'));
   env.dispose();
 });
 

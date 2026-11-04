@@ -50,7 +50,8 @@ test('renderer fits the editor, preserves interaction and manages image/video li
       .content { display:flex;width:100%;height:100%;background:var(--vscode-editor-background); }
       .editor-group-container { flex:1;min-width:0;background:var(--vscode-editor-background);border-right:1px solid #ffffff30; }
       .title { height:34px;padding:8px;background:#1b2332; }
-      .editor-container,.editor-instance,.monaco-editor { height:calc(100% - 34px);background:var(--vscode-editor-background); }
+      .editor-container { height:calc(100% - 34px);background:var(--vscode-editor-background); }
+      .editor-instance,.monaco-editor { height:100%;background:var(--vscode-editor-background); }
       .monaco-editor { display:flex;height:100%;padding:15px 0;position:relative; }
       .margin { width:42px;text-align:center;color:#a5b4c8; }
       .monaco-editor-background { flex:1;background:var(--vscode-editor-background); }
@@ -124,10 +125,15 @@ test('renderer fits the editor, preserves interaction and manages image/video li
     await openFixture();
     await page.waitForSelector('.frosted-background-ready');
     assert.equal(await page.locator('.frosted-background-layer').count(), 1, 'split groups share one background');
-    async function verifyBounds() {
+    async function verifyBounds(fit = 'cover') {
       const host = await page.locator('.part.editor').boundingBox();
+      const expected = fit === 'fill' ? { x: host.x, y: host.y + 34, width: host.width - 1, height: host.height - 34 } : host;
+      await page.waitForFunction(expected => {
+        const box = document.querySelector('.frosted-background-layer').getBoundingClientRect();
+        return ['x', 'y', 'width', 'height'].every(key => Math.abs(box[key] - expected[key]) < 0.1);
+      }, expected);
       const background = await page.locator('.frosted-background-layer').boundingBox();
-      assert.deepEqual(background, host, 'background exactly follows editor bounds');
+      assert.deepEqual(background, expected, fit === 'fill' ? 'complete compression excludes the opaque title bars' : 'background exactly follows editor bounds');
     }
     await verifyBounds();
     assert.equal(await page.locator('.frosted-background-media').evaluate(el => getComputedStyle(el).objectFit), 'cover');
@@ -168,9 +174,10 @@ test('renderer fits the editor, preserves interaction and manages image/video li
     await openFixture('fit=fill');
     await page.waitForSelector('.frosted-background-ready');
     assert.equal(await page.locator('img.frosted-background-media').evaluate(el => getComputedStyle(el).objectFit), 'fill');
-    assert.deepEqual(await page.locator('.frosted-background-media').boundingBox(), await page.locator('.part.editor').boundingBox(), 'stretch mode uses every editor pixel without preserving media aspect ratio');
+    await verifyBounds('fill');
+    assert.deepEqual(await page.locator('.frosted-background-media').boundingBox(), await page.locator('.frosted-background-layer').boundingBox(), 'complete compression has no overscan that could crop edge pixels');
     await page.setViewportSize({ width: 900, height: 610 });
-    await verifyBounds();
+    await verifyBounds('fill');
 
     // Regression: native Sticky Scroll uses opaque fills on several nested
     // surfaces, and both it and scroll-decoration add black scroll shadows.
@@ -277,10 +284,10 @@ test('renderer fits the editor, preserves interaction and manages image/video li
     assert.match(await page.locator('meta[http-equiv="Content-Security-Policy"]').getAttribute('content'), /media-src 'self';/);
     assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
     assert.deepEqual(await frame.evaluate(() => window.__cspViolations), []);
-    await verifyBounds();
-    assert.deepEqual(await page.locator('iframe').boundingBox(), await page.locator('.part.editor').boundingBox());
+    await verifyBounds('fill');
+    assert.deepEqual(await page.locator('iframe').boundingBox(), await page.locator('.frosted-background-layer').boundingBox());
     await page.setViewportSize({ width: 1060, height: 510 });
-    await verifyBounds();
+    await verifyBounds('fill');
     const frameSize = await frame.locator('video').evaluate(el => ({ width: el.clientWidth, height: el.clientHeight }));
     const frameBounds = await page.locator('iframe').boundingBox();
     assert.deepEqual(frameSize, { width: frameBounds.width, height: frameBounds.height }, 'stretched child video follows both dimensions of the resized editor');
@@ -400,4 +407,119 @@ test('renderer fits the editor, preserves interaction and manages image/video li
     if (browser) await browser.close();
     fs.rmSync(fixtureDirectory, { recursive: true, force: true });
   }
+});
+
+test('complete compression keeps all four image and video edges visible in small code viewports', {
+  skip: !process.env.PLAYWRIGHT_MODULE,
+  timeout: 60000,
+}, async () => {
+  const { chromium } = require(process.env.PLAYWRIGHT_MODULE);
+  const executablePath = process.env.BROWSER_EXECUTABLE || [
+    'C:/Program Files/Google/Chrome/Application/chrome.exe',
+    'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+  ].find(value => fs.existsSync(value));
+  const renderer = fs.readFileSync(path.join(__dirname, '../media/renderer.js'));
+  const playerScript = fs.readFileSync(path.join(__dirname, '../media/video-player.js'));
+  const mediaName = `media-${'c'.repeat(64)}.webm`;
+  const playerName = `video-host-${'d'.repeat(64)}.html`;
+  const playerHtml = '<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'self\'; connect-src \'self\'; media-src blob:; style-src \'unsafe-inline\';"><body><script src="./video-player.js" defer></script></body>';
+  function edgeFixture(video) {
+    const config = {
+      enabled: true, kind: video ? 'video' : 'image', fit: 'fill', blur: 0, opacity: 1, tintOpacity: 0,
+      source: video ? `./frosted-background-assets/${mediaName}` : './edges.png',
+      ...(video ? { videoPlayer: `./frosted-background-assets/${playerName}` } : {}),
+    };
+    // Match the workbench hierarchy: breadcrumbs belong to the opaque title,
+    // while the right minimap is inside Monaco's scrollable area. The separate
+    // code-surface marks the visible region; it is not consulted by the renderer.
+    return `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self'; media-src 'self'; frame-src 'self'; connect-src 'self';"><style>
+      :root { --vscode-editor-background:#181818; } * { box-sizing:border-box; }
+      body { margin:0;background:#333; } .part.editor { position:absolute;inset:20px;--title-height:56px;background:var(--vscode-editor-background); }
+      .content,.editor-group-container,.editor-instance,.monaco-editor,.overflow-guard { width:100%;height:100%;background:var(--vscode-editor-background); }
+      .title { height:var(--title-height);background:#101010; } .tabs-container { height:34px; } .breadcrumbs-control { height:22px;background:#080808; }
+      .editor-container { height:calc(100% - var(--title-height)); } .monaco-editor,.overflow-guard { position:relative; }
+      .overflow-guard { background:transparent; } .editor-scrollable { position:absolute;inset:0; }
+      #code-surface { position:absolute;left:0;right:60px;top:0;bottom:12px;background:var(--vscode-editor-background); }
+      .minimap { position:absolute;right:12px;top:0;bottom:0;width:48px;background:#111; }
+      .scrollbar.vertical { position:absolute;right:0;top:0;bottom:0;width:12px;background:#222; }
+      .scrollbar.horizontal { position:absolute;left:0;right:12px;bottom:0;height:12px;background:#222; }
+      .minimap-left .minimap { left:0;right:auto; } .minimap-left #code-surface { left:48px;right:12px; }
+    </style><main class="part editor"><div class="content"><div class="editor-group-container"><div class="title"><div class="tabs-container"></div><div class="breadcrumbs-below-tabs"><div class="breadcrumbs-control"></div></div></div><div class="editor-container"><div class="editor-instance"><div class="monaco-editor"><div class="overflow-guard"><div class="editor-scrollable"><div id="code-surface" class="monaco-editor-background"></div><div class="minimap"></div><div class="scrollbar vertical"></div><div class="scrollbar horizontal"></div></div></div></div></div></div></div></div></main><script src="./renderer.js" data-frosted-config="${JSON.stringify(config).replace(/"/g, '&quot;')}"></script>`;
+  }
+  const browser = await chromium.launch({ headless: true, executablePath });
+  try {
+    const page = await browser.newPage({ viewport: { width: 340, height: 240 } });
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.route('https://edges.test/**', async route => {
+      const requested = new URL(route.request().url());
+      if (requested.pathname === '/index.html') return route.fulfill({ contentType: 'text/html', body: edgeFixture(requested.searchParams.has('video')) });
+      const assets = new Map([
+        ['/renderer.js', ['text/javascript', renderer]],
+        ['/edges.png', ['image/png', fs.readFileSync(path.join(__dirname, 'fixtures/edges.png'))]],
+        [`/frosted-background-assets/${mediaName}`, ['video/webm', fs.readFileSync(path.join(__dirname, 'fixtures/edges.webm'))]],
+        [`/frosted-background-assets/${playerName}`, ['text/html', playerHtml]],
+        ['/frosted-background-assets/video-player.js', ['text/javascript', playerScript]],
+      ]);
+      const asset = assets.get(requested.pathname);
+      return route.fulfill(asset ? { contentType: asset[0], body: asset[1] } : { status: 404, body: '' });
+    });
+    async function verifyVisibleEdges(label) {
+      await page.waitForFunction(() => {
+        const visible = document.querySelector('#code-surface').getBoundingClientRect();
+        const layer = document.querySelector('.frosted-background-layer').getBoundingClientRect();
+        return ['x', 'y', 'width', 'height'].every(key => Math.abs(visible[key] - layer[key]) < 0.1);
+      });
+      const box = await page.locator('#code-surface').boundingBox();
+      const screenshot = await page.screenshot();
+      // Read the composited screenshot, not image source pixels or object-fit.
+      // Opaque titles/minimaps, incorrect media sizing or cropping all fail here.
+      const samples = await page.evaluate(async ({ bytes, box }) => {
+        const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: 'image/png' }));
+        const canvas = document.createElement('canvas'); canvas.width = bitmap.width; canvas.height = bitmap.height;
+        const context = canvas.getContext('2d'); context.drawImage(bitmap, 0, 0); bitmap.close();
+        const read = (x, y) => [...context.getImageData(Math.floor(x), Math.floor(y), 1, 1).data].slice(0, 3);
+        return {
+          top: read(box.x + box.width / 2, box.y + 2), bottom: read(box.x + box.width / 2, box.y + box.height - 3),
+          left: read(box.x + 2, box.y + box.height / 2), right: read(box.x + box.width - 3, box.y + box.height / 2),
+        };
+      }, { bytes: [...screenshot], box });
+      const diagnostic = `${label}: ${JSON.stringify({ box, samples })}`;
+      assert.ok(samples.top[0] > 160 && samples.top[1] < 100 && samples.top[2] < 100, `top red edge remains visible; ${diagnostic}`);
+      assert.ok(samples.bottom[2] > 160 && samples.bottom[0] < 100 && samples.bottom[1] < 100, `bottom blue edge remains visible; ${diagnostic}`);
+      assert.ok(samples.left[1] > 160 && samples.left[0] < 100 && samples.left[2] < 100, `left green edge remains visible; ${diagnostic}`);
+      assert.ok(samples.right[0] > 160 && samples.right[1] > 160 && samples.right[2] < 100, `right yellow edge remains visible; ${diagnostic}`);
+      assert.equal(await page.locator('.frosted-background-media').count(), 1, 'one shared media surface');
+      assert.equal(await page.locator('.monaco-editor').evaluate(el => getComputedStyle(el).filter), 'none');
+      assert.equal(await page.locator('.title').evaluate(el => getComputedStyle(el).backgroundColor), 'rgb(16, 16, 16)', 'tabs retain their readable native surface');
+      assert.equal(await page.locator('.minimap').evaluate(el => getComputedStyle(el).backgroundColor), 'rgb(17, 17, 17)', 'minimap is not made globally transparent');
+    }
+    for (const kind of ['image', 'video']) {
+      await page.goto(`https://edges.test/index.html${kind === 'video' ? '?video=1' : ''}`);
+      await page.waitForSelector('.frosted-background-ready');
+      const frame = kind === 'video' ? page.frames().find(value => value.url().includes(playerName)) : undefined;
+      if (frame) {
+        await frame.waitForFunction(() => document.querySelector('video').readyState >= 2 && !document.querySelector('video').paused);
+        const start = await frame.locator('video').evaluate(video => video.currentTime);
+        await frame.waitForFunction(start => document.querySelector('video').currentTime !== start, start);
+      }
+      await verifyVisibleEdges(`${kind} initial`);
+      await page.setViewportSize({ width: 220, height: 420 });
+      await verifyVisibleEdges(`${kind} narrow/tall`);
+      await page.locator('.monaco-editor').evaluate(element => {
+        const widget = document.createElement('div'); widget.className = 'suggest-widget';
+        widget.innerHTML = '<div class="scrollbar vertical" style="left:40px;top:45px;width:8px;height:40px;background:transparent"></div>';
+        element.append(widget);
+      });
+      await verifyVisibleEdges(`${kind} nested suggestion scrollbar does not shrink the wallpaper`);
+      await page.locator('.suggest-widget').evaluate(element => element.remove());
+      await page.setViewportSize({ width: 680, height: 180 });
+      await verifyVisibleEdges(`${kind} wide/short`);
+      await page.setViewportSize({ width: 340, height: 240 });
+      await page.locator('.part.editor').evaluate(element => element.style.setProperty('--title-height', '78px'));
+      await page.locator('.monaco-editor').evaluate(element => element.classList.add('minimap-left'));
+      await verifyVisibleEdges(`${kind} moved minimap and expanded title`);
+    }
+    assert.deepEqual(errors, [], 'fill layout and video player raise no uncaught errors');
+  } finally { await browser.close(); }
 });

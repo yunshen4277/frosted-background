@@ -11,7 +11,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 async function settle() { for (let index = 0; index < 5; index++) await tick(); }
 
 function harness(options = {}) {
-  const calls = { messages: [], choose: [], apply: [], restore: [], reload: [], log: [] };
+  const calls = { messages: [], choose: [], apply: [], restore: [], reload: [], closePanel: [], log: [] };
   const saved = new Map(Object.entries(options.state || {}));
   let onMessage;
   let onDispose;
@@ -61,6 +61,7 @@ function harness(options = {}) {
       return { needsReload: true, notice: 'Restored' };
     },
     reload: async () => { calls.reload.push(true); },
+    closePanel: async () => { calls.closePanel.push(true); },
     log: error => calls.log.push(error),
     isBusy: () => options.busy === true
   });
@@ -194,6 +195,40 @@ test('host command activity prevents competing panel operations', async () => {
   assert.equal(env.calls.apply.length, 0);
   assert.equal(env.calls.restore.length, 0);
   assert.equal(env.calls.choose.length, 0);
+  env.dispose();
+});
+
+test('closing during host activity only hides the panel and leaves state and draft media intact', async () => {
+  const env = harness({ state: { enabled: true, mediaPath: 'D:/saved.png' }, busy: true });
+  env.provider.mediaPath = 'D:/unsaved-selection.webm';
+  env.provider.notice = 'Keep this notice';
+  env.provider.error = 'Keep this error';
+  const messages = env.calls.messages.length;
+  await env.send({ type: 'closePanel', enabled: false, mediaPath: 'D:/injected.png', config: { blur: 0 } });
+  assert.deepEqual(env.calls.closePanel, [true]);
+  assert.equal(env.saved.get('enabled'), true);
+  assert.equal(env.saved.get('mediaPath'), 'D:/saved.png');
+  assert.equal(env.provider.mediaPath, 'D:/unsaved-selection.webm');
+  assert.equal(env.provider.notice, 'Keep this notice');
+  assert.equal(env.provider.error, 'Keep this error');
+  assert.equal(env.calls.messages.length, messages, 'closing does not refresh or reset the draft');
+  assert.equal(env.calls.restore.length + env.calls.apply.length + env.calls.reload.length, 0);
+  env.dispose();
+});
+
+test('closing is also available while a panel apply is pending', async () => {
+  let finish;
+  const pending = new Promise(resolve => { finish = resolve; });
+  const env = harness({ state: { mediaPath: 'D:/saved.png' }, apply: async () => pending });
+  const applying = env.send({ type: 'apply', config: { ...DEFAULTS, blur: 24 } });
+  await settle();
+  assert.equal(env.provider.pending, true);
+  await env.send({ type: 'closePanel' });
+  assert.equal(env.calls.closePanel.length, 1);
+  assert.equal(env.provider.pending, true, 'closing does not cancel or unlock the in-flight operation');
+  assert.equal(env.calls.restore.length, 0);
+  finish({ needsReload: true });
+  await applying;
   env.dispose();
 });
 
