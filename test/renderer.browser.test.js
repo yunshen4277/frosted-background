@@ -320,16 +320,49 @@ test('renderer fits the editor, preserves interaction and manages image/video li
     });
     localPage.on('requestfailed', request => record({ type: 'requestfailed', url: request.url(), error: request.failure()?.errorText }));
     localPage.on('pageerror', error => { pageErrors.push(error.message); record({ type: 'pageerror', text: error.message }); });
-    await localPage.addInitScript(() => {
+    await localPage.addInitScript(({ fixtureMediaURL }) => {
       window.__localPlayerMessages = [];
       window.__localCspViolations = [];
+      window.__localFileBridgeRequests = [];
+      // Chromium's standalone file: scheme does not consistently implement
+      // Fetch (Linux headless-shell rejects it even with file access enabled).
+      // VS Code explicitly registers vscode-file with supportFetchAPI. Model
+      // that one protocol capability here using XHR's real local-file bytes;
+      // the production player, origin handshake, Blob decoder and CSP stay real.
+      // HTTPS/COI cases above still exercise the browser's native Fetch path.
+      const nativeFetch = window.fetch.bind(window);
+      window.fetch = (input, options = {}) => {
+        const requested = new URL(typeof input === 'string' ? input : input.url, location.href);
+        if (location.protocol !== 'file:' || requested.href !== fixtureMediaURL) return nativeFetch(input, options);
+        return new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          const record = { url: requested.href, transport: 'XMLHttpRequest', state: 'loading' };
+          window.__localFileBridgeRequests.push(record);
+          const signal = options.signal;
+          const aborted = () => { record.state = 'aborted'; xhr.abort(); reject(new DOMException('Aborted', 'AbortError')); };
+          if (signal?.aborted) { aborted(); return; }
+          xhr.open('GET', requested.href);
+          xhr.responseType = 'blob';
+          signal?.addEventListener('abort', aborted, { once: true });
+          xhr.onload = () => {
+            signal?.removeEventListener('abort', aborted);
+            if ((xhr.status !== 0 && xhr.status !== 200) || !(xhr.response instanceof Blob)) {
+              record.state = 'failed'; reject(new TypeError('Local fixture read failed.')); return;
+            }
+            record.state = 'loaded'; record.bytes = xhr.response.size;
+            resolve(new Response(xhr.response, { status: 200, headers: { 'Content-Type': 'video/webm', 'Content-Length': String(xhr.response.size) } }));
+          };
+          xhr.onerror = () => { signal?.removeEventListener('abort', aborted); record.state = 'failed'; reject(new TypeError('Local fixture XHR failed.')); };
+          xhr.send();
+        });
+      };
       document.addEventListener('securitypolicyviolation', event => window.__localCspViolations.push({ directive: event.effectiveDirective, blocked: event.blockedURI }));
       window.addEventListener('message', event => {
         if (event.data?.type !== 'frosted-background-player') return;
         window.__localPlayerMessages.push({ origin: event.origin, action: event.data.action, event: event.data.event, detail: event.data.detail, fromParent: event.source === parent });
         if (window.__localPlayerMessages.length > 20) window.__localPlayerMessages.shift();
       });
-    });
+    }, { fixtureMediaURL: pathToFileURL(path.join(localAssets, mediaName)).href });
     fs.writeFileSync(path.join(fixtureDirectory, 'index.html'), fixture('/?kind=video&player=1&local=1&fit=fill'));
     await localPage.goto(`${fixtureUrl}?kind=video&player=1&local=1&fit=fill`);
     await localPage.bringToFront();
@@ -341,6 +374,10 @@ test('renderer fits the editor, preserves interaction and manages image/video li
       await localFrame.waitForFunction(() => document.querySelector('video').readyState >= 2 && !document.querySelector('video').paused, undefined, { timeout: 10000 });
       assert.equal(await localFrame.locator('video').evaluate(el => getComputedStyle(el).objectFit), 'fill');
       assert.match(await localFrame.locator('video').evaluate(el => el.currentSrc), /^blob:/, 'opaque local origins can initialize and decode the player too');
+      const bridgeReads = await localFrame.evaluate(() => window.__localFileBridgeRequests);
+      assert.equal(bridgeReads.length, 1);
+      assert.equal(bridgeReads[0].state, 'loaded');
+      assert.equal(bridgeReads[0].bytes, fs.statSync(path.join(localAssets, mediaName)).size, 'protocol bridge reads the actual fixture bytes');
     } catch (error) {
       const frames = await Promise.all(localPage.frames().map(async frame => {
         try {
@@ -351,7 +388,7 @@ test('renderer fits the editor, preserves interaction and manages image/video li
               isolated: globalThis.crossOriginIsolated, focused: document.hasFocus(), hidden: document.hidden,
               state: document.querySelector('.frosted-background-layer')?.dataset.state,
               video: video ? { readyState: video.readyState, networkState: video.networkState, error: video.error?.message, errorCode: video.error?.code, sourceProtocol: video.currentSrc.split(':')[0], paused: video.paused, width: video.videoWidth } : null,
-              messages: window.__localPlayerMessages, csp: window.__localCspViolations,
+              messages: window.__localPlayerMessages, csp: window.__localCspViolations, bridge: window.__localFileBridgeRequests,
             };
           });
         } catch (inspectionError) { return { inspectionError: inspectionError.message }; }
