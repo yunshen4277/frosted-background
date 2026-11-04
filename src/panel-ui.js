@@ -20,7 +20,7 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, nonce }) {
   <main id="panel" aria-busy="true">
     <header class="panel-heading">
       <div><div class="eyebrow"><span class="brand-dot"></span>FROSTED / EDITOR</div><h1>毛玻璃背景</h1></div>
-      <span class="status-pill" id="status"><span></span><span id="status-text">连接中</span></span>
+      <div class="heading-actions"><span class="status-pill" id="status"><span></span><span id="status-text">连接中</span></span><button type="button" class="close-panel-button" id="close-panel" aria-label="关闭控制面板" title="关闭控制面板"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8"/></svg></button></div>
     </header>
 
     <section class="preview-section" aria-label="背景效果预览">
@@ -60,7 +60,7 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, nonce }) {
 
     <section class="layout-section" aria-labelledby="layout-heading">
       <div class="section-heading"><h2 id="layout-heading">画面布局</h2><span class="subtle-label">随窗口自适应</span></div>
-      <fieldset class="fit-control" aria-describedby="fit-description"><legend class="sr-only">背景缩放方式</legend><label><input type="radio" name="fit" value="cover" checked><span>等比铺满</span></label><label><input type="radio" name="fit" value="contain"><span>完整显示</span></label><label><input type="radio" name="fit" value="fill"><span>自适应拉伸</span></label></fieldset>
+      <fieldset class="fit-control" aria-describedby="fit-description"><legend class="sr-only">背景缩放方式</legend><label><input type="radio" name="fit" value="cover" checked><span>等比铺满</span></label><label><input type="radio" name="fit" value="contain"><span>完整显示</span></label><label><input type="radio" name="fit" value="fill"><span>完整压缩</span></label></fieldset>
       <p class="fit-description" id="fit-description">等比铺满，允许裁剪边缘</p>
       <div class="select-control"><label for="position">对齐位置</label><select id="position"><option value="center center">居中</option><option value="center top">顶部</option><option value="center bottom">底部</option><option value="left center">靠左</option><option value="right center">靠右</option></select></div>
     </section>

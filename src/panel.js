@@ -73,8 +73,11 @@ class BackgroundPanel {
 
   async receive(message) {
     if (this.disposed || !message || typeof message !== 'object' || Array.isArray(message)) return;
-    if (!['ready', 'chooseMedia', 'apply', 'restore', 'reload', 'checkUpdates', 'setUpdateMode'].includes(message.type)) return;
+    if (!['ready', 'closePanel', 'chooseMedia', 'apply', 'restore', 'reload', 'checkUpdates', 'setUpdateMode'].includes(message.type)) return;
     if (message.type === 'ready') return this.refresh();
+    // Hiding the controls must remain available while an unrelated operation is
+    // pending, without changing media, enabled state, or the unsaved draft.
+    if (message.type === 'closePanel') return this.callbacks.closePanel?.();
     if (this.pending || this.callbacks.isBusy()) return;
     if (message.type === 'chooseMedia' && !['image', 'video'].includes(message.kind)) return;
     if (message.type === 'apply' && (!message.config || typeof message.config !== 'object' || Array.isArray(message.config))) return;

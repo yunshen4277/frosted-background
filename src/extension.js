@@ -16,7 +16,7 @@ function activate(context) {
   let savingConfig = false;
   let panel;
   let updater;
-  const extensionVersion = context.extension?.packageJSON?.version || '0.3.0';
+  const extensionVersion = context.extension?.packageJSON?.version || '0.5.0';
 
   const readConfig = () => {
     const config = vscode.workspace.getConfiguration('frostedBackground');
@@ -160,6 +160,10 @@ function activate(context) {
     return { needsReload: true, notice: notice + ' 重载窗口后生效。' };
   }
 
+  // Hiding the controls is a layout action, so it does not acquire the
+  // background operation lock or restore/disable the current background.
+  const closePanel = () => vscode.commands.executeCommand('workbench.action.closeSidebar');
+  context.subscriptions.push(vscode.commands.registerCommand('frostedBackground.closePanel', closePanel));
   panel = new BackgroundPanel(vscode, context, {
     readConfig,
     isBusy: () => busy,
@@ -167,6 +171,7 @@ function activate(context) {
     apply: (mediaPath, config) => runExclusive(() => applyMedia(mediaPath, config, true)),
     restore: () => runExclusive(() => restoreBackground(true)),
     reload: () => vscode.commands.executeCommand('workbench.action.reloadWindow'),
+    closePanel,
     readUpdateState: () => updater?.getState() || null,
     checkUpdates: () => updater.check(true),
     setUpdateMode: mode => updater.setMode(mode),
