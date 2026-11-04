@@ -1,0 +1,647 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const { DEFAULTS } = require('../src/config');
+
+const extensionFile = path.resolve(__dirname, '../src/extension.js');
+const extensionSource = fs.readFileSync(extensionFile, 'utf8');
+
+function harness(options = {}) {
+  const handlers = new Map();
+  const state = new Map(Object.entries({ lastAppliedExtensionVersion: '0.2.0', ...(options.state || {}) }));
+  const configuration = { ...(options.config || {}) };
+  const timers = new Map();
+  const calls = { apply: [], reapply: [], restore: [], status: [], open: [], warning: [], info: [], error: [], command: [], state: [], progress: [], log: [], configurationWrites: [], providers: [], statusBars: [] };
+  const uri = file => ({ scheme: 'file', fsPath: file, path: file.replace(/\\/g, '/'), toString: () => 'file:///' + file.replace(/\\/g, '/') });
+  const context = {
+    subscriptions: [],
+    extensionUri: uri(path.resolve(path.dirname(extensionFile), '..')),
+    extension: { packageJSON: { version: options.version || '0.2.0' } },
+    asAbsolutePath: name => path.resolve(path.dirname(extensionFile), '..', name),
+    globalState: {
+      get: (key, fallback) => state.has(key) ? state.get(key) : fallback,
+      update: async (key, value) => { calls.state.push([key, value]); state.set(key, value); }
+    }
+  };
+  const patcher = {
+    apply: async data => {
+      calls.apply.push(data);
+      if (options.apply) return options.apply(data);
+      return { workbenchPath: 'test/workbench.html' };
+    },
+    reapply: async data => {
+      calls.reapply.push(data);
+      if (options.reapply) return options.reapply(data);
+      return { workbenchPath: 'test/workbench.html' };
+    },
+    restore: async data => {
+      calls.restore.push(data);
+      if (options.restore) return options.restore(data);
+      return { workbenchPath: 'test/workbench.html' };
+    },
+    status: async data => {
+      calls.status.push(data);
+      if (options.status) return options.status(data);
+      return { installed: options.installed ?? true, workbenchPath: 'test/workbench.html' };
+    }
+  };
+  const vscode = {
+    UIKind: { Desktop: 1, Web: 2 },
+    ProgressLocation: { Notification: 15 },
+    StatusBarAlignment: { Left: 1, Right: 2 },
+    ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
+    version: '1.144.1',
+    env: { uiKind: options.web ? 2 : 1, appRoot: 'test/app-root' },
+    Uri: { file: uri, joinPath: (base, ...segments) => uri(path.join(base.fsPath, ...segments)) },
+    commands: {
+      registerCommand: (name, callback) => { handlers.set(name, callback); return { dispose() {} }; },
+      executeCommand: async (name, ...args) => {
+        calls.command.push([name, ...args]);
+        if (handlers.has(name)) return handlers.get(name)(...args);
+      }
+    },
+    window: {
+      registerWebviewViewProvider: (id, provider, settings) => {
+        calls.providers.push({ id, provider, settings });
+        return { dispose() {} };
+      },
+      createStatusBarItem: (alignment, priority) => {
+        const item = { alignment, priority, visible: false, show() { this.visible = true; }, hide() { this.visible = false; }, dispose() {} };
+        calls.statusBars.push(item);
+        return item;
+      },
+      createOutputChannel: () => ({ appendLine: line => calls.log.push(line), show() {}, dispose() {} }),
+      showOpenDialog: async config => { calls.open.push(config); return options.files; },
+      showWarningMessage: async (...args) => { calls.warning.push(args); return options.consent; },
+      showInformationMessage: async (...args) => {
+        calls.info.push(args);
+        return typeof options.info === 'function' ? options.info(...args) : options.info;
+      },
+      showErrorMessage: async (...args) => { calls.error.push(args); return undefined; },
+      showQuickPick: async () => options.quickPick,
+      withProgress: async (config, work) => { calls.progress.push(config); return work(); }
+    },
+    workspace: {
+      getConfiguration: () => ({
+        get: key => configuration[key],
+        inspect: key => ({ globalValue: configuration[key] }),
+        update: async (key, value, target) => {
+          calls.configurationWrites.push({ key, value, target });
+          if (options.updateConfiguration) await options.updateConfiguration(key, value, target);
+          configuration[key] = value;
+          calls.configurationListener?.({ affectsConfiguration: namespace => namespace === 'frostedBackground' || namespace === 'frostedBackground.' + key });
+        }
+      }),
+      onDidChangeConfiguration: callback => { calls.configurationListener = callback; return { dispose() {} }; }
+    }
+  };
+  const sandbox = {
+    module: { exports: {} },
+    require: name => {
+      if (name === 'vscode') return vscode;
+      if (name === './patcher') return patcher;
+      if (name === './config') return require('../src/config');
+      if (name === './panel') return require('../src/panel');
+      if (name === './updater') return require('../src/updater');
+      return require(name);
+    },
+    setTimeout: options.captureTimers ? (callback, delay) => {
+      const timer = {};
+      timers.set(timer, { callback, delay });
+      return timer;
+    } : setTimeout,
+    clearTimeout: options.captureTimers ? timer => timers.delete(timer) : clearTimeout,
+    Error
+  };
+  vm.runInNewContext(extensionSource, sandbox, { filename: extensionFile });
+  sandbox.module.exports.activate(context);
+  return {
+    calls, state, context, configuration, timers,
+    run: name => handlers.get('frostedBackground.' + name)(),
+    dispose: () => context.subscriptions.forEach(item => item.dispose())
+  };
+}
+
+async function settle() { for (let index = 0; index < 5; index++) await new Promise(resolve => setImmediate(resolve)); }
+
+function attachPanel(env) {
+  let receive;
+  const messages = [];
+  const webview = {
+    cspSource: 'vscode-webview://extension-test', options: {}, html: '',
+    asWebviewUri: value => ({ toString: () => 'vscode-webview-resource://test/' + encodeURIComponent(value.fsPath) }),
+    postMessage: async message => { messages.push(JSON.parse(JSON.stringify(message))); return true; },
+    onDidReceiveMessage: callback => { receive = callback; return { dispose() {} }; }
+  };
+  env.calls.providers[0].provider.resolveWebviewView({
+    webview, visible: true,
+    onDidDispose: () => ({ dispose() {} }),
+    onDidChangeVisibility: () => ({ dispose() {} })
+  });
+  return {
+    messages,
+    send: async message => { await receive(message); await settle(); },
+    latest: () => messages.at(-1)
+  };
+}
+
+test('canceling either file picker never patches or requests first-use consent', async () => {
+  for (const command of ['selectImage', 'selectVideo']) {
+    for (const files of [undefined, []]) {
+      const env = harness({ files });
+      await env.run(command);
+      assert.equal(env.calls.open.length, 1);
+      assert.equal(env.calls.apply.length, 0);
+      assert.equal(env.calls.warning.length, 0);
+      assert.equal(env.calls.state.length, 0);
+      env.dispose();
+    }
+  }
+});
+
+test('declining first-use consent leaves files and enabled state unchanged', async () => {
+  const env = harness({ files: [{ scheme: 'file', fsPath: 'D:/photos/background.jpg' }] });
+  await env.run('selectImage');
+  assert.equal(env.calls.warning.length, 1);
+  assert.equal(env.calls.warning[0][1].modal, true);
+  assert.equal(env.calls.apply.length, 0);
+  assert.equal(env.state.has('injectionConsent'), false);
+  assert.equal(env.state.has('mediaPath'), false);
+  assert.equal(env.calls.command.length, 0);
+  env.dispose();
+});
+
+test('choosing an image applies normalized settings, then persists state and offers reload', async () => {
+  const file = 'D:/照片/背景 with spaces.jpg';
+  const env = harness({
+    files: [{ scheme: 'file', fsPath: file }], consent: '启用背景', info: '立即重载',
+    config: { blur: 18, opacity: 0.42, fit: 'contain', saturation: 999 }
+  });
+  await env.run('selectImage');
+  assert.equal(env.calls.apply.length, 1);
+  const applied = env.calls.apply[0];
+  assert.equal(applied.appRoot, 'test/app-root');
+  assert.equal(applied.mediaPath, file);
+  assert.equal(applied.rendererPath, path.resolve(__dirname, '../media/renderer.js'));
+  assert.deepEqual(applied.config, { ...DEFAULTS, blur: 18, opacity: 0.42, fit: 'contain', saturation: 2 });
+  assert.equal(env.calls.progress.length, 1);
+  assert.equal(env.state.get('enabled'), true);
+  assert.equal(env.state.get('mediaPath'), file);
+  assert.equal(env.state.get('lastVersion'), '1.144.1');
+  assert.equal(env.state.get('injectionConsent'), true);
+  assert.deepEqual(env.calls.command, [['workbench.action.reloadWindow']]);
+  env.dispose();
+});
+
+test('video selection accepts WebM and reuses existing consent', async () => {
+  const env = harness({ files: [{ scheme: 'file', fsPath: 'D:/loop.webm' }], state: { injectionConsent: true } });
+  await env.run('selectVideo');
+  assert.deepEqual(Array.from(env.calls.open[0].filters['视频']), ['mp4', 'webm']);
+  assert.equal(env.calls.warning.length, 0);
+  assert.equal(env.calls.apply[0].mediaPath, 'D:/loop.webm');
+  assert.equal(env.state.get('enabled'), true);
+  env.dispose();
+});
+
+test('failed application keeps the previous selected file and does not reload', async () => {
+  const env = harness({
+    files: [{ scheme: 'file', fsPath: 'D:/new.jpg' }],
+    state: { injectionConsent: true, mediaPath: 'D:/previous.jpg', enabled: true },
+    apply: async () => { throw Object.assign(new Error('Read-only installation'), { code: 'EACCES' }); }
+  });
+  await env.run('selectImage');
+  assert.equal(env.calls.error.length, 1);
+  assert.match(env.calls.error[0][0], /无法写入 VS Code 安装目录/);
+  assert.equal(env.state.get('mediaPath'), 'D:/previous.jpg');
+  assert.equal(env.state.get('enabled'), true);
+  assert.equal(env.calls.command.length, 0);
+  env.dispose();
+});
+
+test('failed restore keeps enabled state so the user can retry recovery', async () => {
+  const env = harness({
+    state: { enabled: true, mediaPath: 'D:/background.jpg' },
+    restore: async () => { throw new Error('Could not restore original file'); }
+  });
+  await env.run('restore');
+  assert.equal(env.calls.restore.length, 1);
+  assert.equal(env.state.get('enabled'), true);
+  assert.equal(env.calls.state.length, 0);
+  assert.equal(env.calls.error.length, 1);
+  assert.equal(env.calls.command.length, 0);
+  env.dispose();
+});
+
+test('successful restore disables state and reloads only after explicit reload choice', async () => {
+  const env = harness({ state: { enabled: true }, info: '立即重载' });
+  await env.run('restore');
+  assert.equal(env.calls.restore[0].appRoot, 'test/app-root');
+  assert.equal(env.state.get('enabled'), false);
+  assert.deepEqual(env.calls.command, [['workbench.action.reloadWindow']]);
+  env.dispose();
+});
+
+test('web UI and remote file selections are rejected before patching', async () => {
+  const web = harness({ web: true });
+  await web.run('selectImage');
+  assert.equal(web.calls.open.length, 0);
+  assert.equal(web.calls.apply.length, 0);
+  assert.match(web.calls.error[0][0], /桌面版 VS Code/);
+  web.dispose();
+  const remote = harness({ files: [{ scheme: 'vscode-remote', fsPath: '/tmp/image.jpg' }] });
+  await remote.run('selectImage');
+  assert.equal(remote.calls.apply.length, 0);
+  assert.equal(remote.calls.warning.length, 0);
+  assert.match(remote.calls.error[0][0], /本机/);
+  remote.dispose();
+});
+
+test('reapplying uses the last local file without reopening the picker', async () => {
+  const env = harness({ state: { injectionConsent: true, mediaPath: 'D:/saved.png' } });
+  await env.run('apply');
+  assert.equal(env.calls.open.length, 0);
+  assert.equal(env.calls.warning.length, 0);
+  assert.equal(env.calls.apply[0].mediaPath, 'D:/saved.png');
+  env.dispose();
+});
+
+test('concurrent commands cannot race an apply operation against restore', async () => {
+  let finish;
+  const pending = new Promise(resolve => { finish = resolve; });
+  const env = harness({
+    state: { injectionConsent: true, mediaPath: 'D:/saved.png' },
+    apply: async () => { await pending; return { workbenchPath: 'test/workbench.html' }; }
+  });
+  const applying = env.run('apply');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(env.calls.apply.length, 1);
+  await env.run('restore');
+  assert.equal(env.calls.restore.length, 0);
+  assert.ok(env.calls.info.some(args => args[0].includes('正在处理背景')));
+  finish();
+  await applying;
+  assert.equal(env.state.get('enabled'), true);
+  env.dispose();
+});
+
+test('an unanswered reload notification does not block a later restore', async () => {
+  let dismiss;
+  const notification = new Promise(resolve => { dismiss = resolve; });
+  const env = harness({
+    state: { injectionConsent: true, mediaPath: 'D:/saved.png' },
+    info: () => notification
+  });
+  try {
+    let applied = false;
+    const applying = env.run('apply').then(() => { applied = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(env.calls.apply.length, 1);
+    assert.equal(applied, true, 'apply must release its command lock without waiting for notification dismissal');
+    await applying;
+    await env.run('restore');
+    assert.equal(env.calls.restore.length, 1);
+    assert.equal(env.state.get('enabled'), false);
+    assert.equal(env.calls.info.length, 2);
+    assert.equal(env.calls.info.some(args => args[0].includes('正在处理背景')), false);
+    assert.equal(env.calls.command.length, 0);
+  } finally {
+    env.dispose();
+    dismiss(undefined);
+  }
+});
+
+test('restoring with leftover occupied assets disables the background and explains cleanup recovery', async () => {
+  const env = harness({
+    state: { enabled: true },
+    restore: async () => ({ workbenchPath: 'test/workbench.html', cleanupErrors: ['media.webm: EBUSY', 'renderer.js: EPERM'] })
+  });
+  await env.run('restore');
+  assert.equal(env.state.get('enabled'), false);
+  assert.equal(env.calls.error.length, 0);
+  assert.ok(env.calls.log.includes('清理旧资源：media.webm: EBUSY'));
+  assert.ok(env.calls.log.includes('清理旧资源：renderer.js: EPERM'));
+  assert.equal(env.calls.info.length, 1);
+  assert.match(env.calls.info[0][0], /部分旧资源仍被占用/);
+  assert.match(env.calls.info[0][0], /重载后再次.*清理/);
+  env.dispose();
+});
+
+test('the activity view, status bar and both settings commands lead to the same panel', async () => {
+  const env = harness();
+  assert.equal(env.calls.providers.length, 1);
+  assert.equal(env.calls.providers[0].id, 'frostedBackground.controls');
+  assert.equal(env.calls.statusBars.length, 1);
+  assert.equal(env.calls.statusBars[0].visible, true);
+  assert.equal(env.calls.statusBars[0].command, 'frostedBackground.openPanel');
+  await env.run('openPanel');
+  await env.run('openSettings');
+  assert.deepEqual(env.calls.command, [
+    ['frostedBackground.controls.focus'], ['frostedBackground.controls.focus']
+  ]);
+  assert.equal(env.calls.apply.length, 0);
+  env.dispose();
+});
+
+test('panel apply patches once, saves only known global settings and suppresses its own change notifications', async () => {
+  const file = 'D:/selected-background.png';
+  const env = harness({
+    files: [{ scheme: 'file', fsPath: file }], captureTimers: true,
+    state: { injectionConsent: true, enabled: true, mediaPath: 'D:/previous.png' }
+  });
+  const panel = attachPanel(env);
+  await panel.send({ type: 'chooseMedia', kind: 'image' });
+  assert.equal(env.calls.apply.length, 0);
+  await panel.send({ type: 'apply', mediaPath: 'C:/ignored.png', config: { ...DEFAULTS, blur: 22, opacity: 0.6, source: 'file:///C:/injected.js' } });
+  assert.equal(env.calls.apply.length, 1);
+  assert.equal(env.calls.progress.length, 1);
+  assert.equal(env.calls.apply[0].mediaPath, file);
+  assert.deepEqual(env.calls.apply[0].config, { ...DEFAULTS, blur: 22, opacity: 0.6 });
+  assert.deepEqual(env.calls.configurationWrites, [
+    { key: 'blur', value: 22, target: 1 }, { key: 'opacity', value: 0.6, target: 1 }
+  ]);
+  assert.equal(env.state.get('mediaPath'), file);
+  assert.equal(env.state.get('lastAppliedExtensionVersion'), '0.2.0');
+  assert.equal(env.calls.info.length, 0, 'panel status should not create a competing notification flow');
+  assert.equal(env.timers.size, 0, 'internal settings writes must not schedule change notices');
+  assert.equal(panel.latest().needsReload, true);
+  assert.equal(panel.latest().resetDraft, true);
+  assert.equal(env.calls.command.length, 0);
+  await panel.send({ type: 'reload' });
+  assert.deepEqual(env.calls.command, [['workbench.action.reloadWindow']]);
+  env.dispose();
+});
+
+test('panel patch failures preserve previous applied state, selected draft and saved settings', async () => {
+  const env = harness({
+    files: [{ scheme: 'file', fsPath: 'D:/new.png' }], captureTimers: true,
+    state: { injectionConsent: true, enabled: true, mediaPath: 'D:/previous.png' },
+    apply: async () => { throw new Error('Write failed'); }
+  });
+  const panel = attachPanel(env);
+  await panel.send({ type: 'chooseMedia', kind: 'image' });
+  await panel.send({ type: 'apply', config: { ...DEFAULTS, blur: 24 } });
+  assert.equal(env.calls.apply.length, 1);
+  assert.equal(env.calls.configurationWrites.length, 0);
+  assert.equal(env.state.get('mediaPath'), 'D:/previous.png');
+  assert.equal(env.state.get('enabled'), true);
+  assert.equal(panel.latest().media.name, 'new.png');
+  assert.equal(panel.latest().resetDraft, false);
+  assert.match(panel.latest().error, /Write failed/);
+  assert.equal(env.calls.command.length, 0);
+  env.dispose();
+});
+
+test('panel native picker rejects remote URIs before changing draft or patching', async () => {
+  const env = harness({
+    files: [{ scheme: 'vscode-remote', fsPath: '/remote/background.png' }],
+    state: { mediaPath: 'D:/previous.png' }
+  });
+  const panel = attachPanel(env);
+  await panel.send({ type: 'chooseMedia', kind: 'image' });
+  assert.equal(env.calls.apply.length, 0);
+  assert.equal(panel.latest().media.name, 'previous.png');
+  assert.match(panel.latest().error, /本机/);
+  env.dispose();
+});
+
+test('a pending panel apply also blocks command-based recovery until the operation completes', async () => {
+  let finish;
+  const pending = new Promise(resolve => { finish = resolve; });
+  const env = harness({
+    state: { injectionConsent: true, mediaPath: 'D:/saved.png' },
+    apply: async () => pending
+  });
+  const panel = attachPanel(env);
+  await panel.send({ type: 'apply', config: DEFAULTS });
+  assert.equal(env.calls.apply.length, 1);
+  await env.run('restore');
+  assert.equal(env.calls.restore.length, 0);
+  assert.ok(env.calls.info.some(args => args[0].includes('正在处理背景')));
+  finish({ workbenchPath: 'test/workbench.html' });
+  await settle();
+  await env.run('restore');
+  assert.equal(env.calls.restore.length, 1);
+  env.dispose();
+});
+
+test('startup distinguishes an extension upgrade from a missing installation patch without changing files', async () => {
+  const upgrade = harness({ state: { enabled: true, lastAppliedExtensionVersion: '0.1.0' }, installed: true, info: '打开控制面板' });
+  await settle();
+  assert.equal(upgrade.calls.apply.length, 0);
+  assert.match(upgrade.calls.info[0][0], /已更新/);
+  assert.deepEqual(upgrade.calls.command, [['frostedBackground.openPanel'], ['frostedBackground.controls.focus']]);
+  upgrade.dispose();
+  const missing = harness({ state: { enabled: true }, installed: false });
+  await settle();
+  assert.equal(missing.calls.apply.length, 0);
+  assert.match(missing.calls.info[0][0], /尚未应用/);
+  missing.dispose();
+  const current = harness({ state: { enabled: true }, installed: true });
+  await settle();
+  assert.equal(current.calls.info.length, 0);
+  assert.equal(current.calls.apply.length, 0);
+  current.dispose();
+});
+
+test('a settings-save failure after a successful patch preserves the draft and still offers reload', async () => {
+  const env = harness({
+    state: { injectionConsent: true, mediaPath: 'D:/saved.png' }, captureTimers: true,
+    updateConfiguration: async () => { throw new Error('Settings file is read-only'); }
+  });
+  const panel = attachPanel(env);
+  await panel.send({ type: 'apply', config: { ...DEFAULTS, blur: 28 } });
+  assert.equal(env.calls.apply.length, 1);
+  assert.equal(env.calls.apply[0].config.blur, 28);
+  assert.equal(env.state.get('enabled'), true);
+  assert.equal(env.state.get('mediaPath'), 'D:/saved.png');
+  assert.equal(panel.latest().needsReload, true);
+  assert.equal(panel.latest().resetDraft, false);
+  assert.equal(panel.latest().error, null);
+  assert.match(panel.latest().notice, /背景已应用/);
+  assert.match(panel.latest().notice, /设置保存失败/);
+  assert.ok(env.calls.log.some(line => line.includes('Settings file is read-only')));
+  await panel.send({ type: 'reload' });
+  assert.deepEqual(env.calls.command, [['workbench.action.reloadWindow']]);
+  env.dispose();
+});
+
+test('panel actions ignored during a command operation receive the final idle state afterward', async () => {
+  let finish;
+  const pending = new Promise(resolve => { finish = resolve; });
+  const env = harness({
+    state: { injectionConsent: true, mediaPath: 'D:/saved.png' },
+    apply: async () => pending
+  });
+  const panel = attachPanel(env);
+  const applying = env.run('apply');
+  await settle();
+  assert.equal(panel.latest().busy, true);
+  await panel.send({ type: 'restore' });
+  assert.equal(env.calls.restore.length, 0);
+  finish({ workbenchPath: 'test/workbench.html' });
+  await applying;
+  await settle();
+  assert.equal(panel.latest().busy, false, 'the shared command lock must not leave the webview stuck busy');
+  await panel.send({ type: 'restore' });
+  assert.equal(env.calls.restore.length, 1);
+  assert.equal(panel.latest().busy, false);
+  env.dispose();
+});
+
+test('an automatic extension upgrade refreshes the cached background without reopening the original media', async t => {
+  const env = harness({
+    version: '0.3.0',
+    state: { enabled: true, injectionConsent: true, mediaPath: 'Z:/deleted-original.png', lastAppliedExtensionVersion: '0.2.0' },
+    config: { updateMode: 'automatic', blur: 57, fit: 'contain' },
+  });
+  t.after(() => env.dispose());
+  await settle();
+  assert.equal(env.calls.reapply.length, 1);
+  assert.equal(env.calls.reapply[0].appRoot, 'test/app-root');
+  assert.equal(env.calls.reapply[0].rendererPath, path.resolve(__dirname, '../media/renderer.js'));
+  assert.deepEqual(Object.keys(env.calls.reapply[0]).sort(), ['appRoot', 'rendererPath'], 'migration reuses the cached configuration and media instead of current drafts');
+  assert.equal(env.calls.apply.length, 0);
+  assert.equal(env.calls.open.length, 0);
+  assert.equal(env.calls.warning.length, 0);
+  assert.equal(env.calls.configurationWrites.length, 0);
+  assert.equal(env.state.get('mediaPath'), 'Z:/deleted-original.png');
+  assert.equal(env.state.get('enabled'), true);
+  assert.equal(env.state.get('lastAppliedExtensionVersion'), '0.3.0');
+  assert.equal(env.calls.info.length, 1);
+  assert.match(env.calls.info[0][0], /自动准备好/);
+  assert.equal(env.calls.info[0][1], '立即重载');
+  assert.equal(env.calls.command.length, 0, 'migration never reloads a window automatically');
+});
+
+test('migration records the new applied version only after the cached patch succeeds', async t => {
+  let finish;
+  const pending = new Promise(resolve => { finish = resolve; });
+  const env = harness({
+    version: '0.3.0', state: { enabled: true, injectionConsent: true },
+    reapply: () => pending,
+  });
+  t.after(() => env.dispose());
+  await settle();
+  assert.equal(env.calls.reapply.length, 1);
+  assert.equal(env.state.get('lastAppliedExtensionVersion'), '0.2.0');
+  assert.equal(env.calls.info.length, 0);
+  finish({ workbenchPath: 'test/workbench.html' });
+  await settle();
+  assert.equal(env.state.get('lastAppliedExtensionVersion'), '0.3.0');
+  assert.equal(env.calls.command.length, 0);
+});
+
+test('automatic migration preserves all activation and preference guards', async t => {
+  const cases = [
+    { name: 'background is disabled', state: { enabled: false, injectionConsent: true } },
+    { name: 'injection consent is absent', state: { enabled: true, injectionConsent: false } },
+    { name: 'notify mode', state: { enabled: true, injectionConsent: true }, config: { updateMode: 'notify' } },
+    { name: 'updates switched off', state: { enabled: true, injectionConsent: true }, config: { updateMode: 'off' } },
+    { name: 'VS Code patch is missing', state: { enabled: true, injectionConsent: true }, installed: false },
+    { name: 'current renderer already applied', state: { enabled: true, injectionConsent: true, lastAppliedExtensionVersion: '0.3.0' } },
+    { name: 'web editor', state: { enabled: true, injectionConsent: true }, web: true },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async child => {
+      const env = harness({ version: '0.3.0', ...entry });
+      child.after(() => env.dispose());
+      await settle();
+      assert.equal(env.calls.reapply.length, 0);
+      assert.equal(env.calls.apply.length, 0);
+      assert.equal(env.calls.open.length, 0);
+      assert.equal(env.calls.command.length, 0);
+      assert.equal(env.state.get('lastAppliedExtensionVersion'), entry.state.lastAppliedExtensionVersion || '0.2.0');
+      if (entry.installed === false) assert.match(env.calls.info[0][0], /尚未应用/);
+    });
+  }
+});
+
+test('permission or cached-media migration failures retain the previous applied version and offer the panel', async t => {
+  for (const code of ['EACCES', 'ENOENT']) {
+    await t.test(code, async child => {
+      const env = harness({
+        version: '0.3.0',
+        state: { enabled: true, injectionConsent: true, mediaPath: 'Z:/original.png' },
+        reapply: async () => { throw Object.assign(new Error('Migration failed: ' + code), { code }); },
+        info: '打开控制面板',
+      });
+      child.after(() => env.dispose());
+      await settle();
+      assert.equal(env.calls.reapply.length, 1);
+      assert.equal(env.calls.apply.length, 0);
+      assert.equal(env.state.get('lastAppliedExtensionVersion'), '0.2.0');
+      assert.equal(env.state.get('enabled'), true);
+      assert.equal(env.state.get('mediaPath'), 'Z:/original.png');
+      assert.ok(env.calls.log.some(message => message.includes(code)));
+      assert.ok(env.calls.info.some(message => message.includes('打开控制面板')));
+      assert.deepEqual(env.calls.command, [['frostedBackground.openPanel'], ['frostedBackground.controls.focus']]);
+    });
+  }
+});
+
+test('a migrated background reloads only when its notification action is chosen', async t => {
+  const env = harness({
+    version: '0.3.0', state: { enabled: true, injectionConsent: true }, info: '立即重载',
+  });
+  t.after(() => env.dispose());
+  await settle();
+  assert.equal(env.calls.reapply.length, 1);
+  assert.deepEqual(env.calls.command, [['workbench.action.reloadWindow']]);
+});
+
+test('the update panel remains offline until bound and changing update mode does not trigger effect reapply notices', async t => {
+  const env = harness({
+    version: '0.3.0', captureTimers: true,
+    state: { enabled: true, injectionConsent: true, lastAppliedExtensionVersion: '0.3.0' },
+  });
+  t.after(() => env.dispose());
+  const panel = attachPanel(env);
+  await panel.send({ type: 'ready' });
+  assert.equal(panel.latest().update.status, 'unconfigured');
+  assert.equal(panel.latest().update.currentVersion, '0.3.0');
+  await panel.send({ type: 'setUpdateMode', mode: 'off' });
+  assert.deepEqual(env.calls.configurationWrites, [{ key: 'updateMode', value: 'off', target: 1 }]);
+  assert.equal(panel.latest().update.mode, 'off');
+  assert.equal(env.timers.size, 0, 'changing only updateMode does not schedule a background-effect notice');
+  assert.equal(env.calls.info.length, 0);
+  await env.run('checkUpdates');
+  await settle();
+  assert.equal(panel.latest().update.status, 'unconfigured');
+  assert.equal(env.calls.apply.length, 0);
+  assert.equal(env.calls.reapply.length, 0);
+  assert.equal(env.calls.command.length, 0);
+  env.calls.configurationListener({ affectsConfiguration: name => ['frostedBackground', 'frostedBackground.blur'].includes(name) });
+  assert.equal(env.timers.size, 1, 'actual effect changes still schedule their normal notice');
+});
+
+test('disposing before startup inspection completes prevents cached-media migration', async () => {
+  let finish;
+  const pending = new Promise(resolve => { finish = resolve; });
+  const env = harness({
+    version: '0.3.0', state: { enabled: true, injectionConsent: true }, status: () => pending,
+  });
+  env.dispose();
+  finish({ installed: true, workbenchPath: 'test/workbench.html' });
+  await settle();
+  assert.equal(env.calls.reapply.length, 0);
+  assert.equal(env.calls.info.length, 0);
+});
+
+test('closing the background while startup inspection is pending prevents a stale automatic migration', async t => {
+  let finish;
+  const pending = new Promise(resolve => { finish = resolve; });
+  const env = harness({
+    version: '0.3.0', state: { enabled: true, injectionConsent: true }, status: () => pending,
+  });
+  t.after(() => env.dispose());
+  await env.run('restore');
+  assert.equal(env.state.get('enabled'), false);
+  finish({ installed: true, workbenchPath: 'test/workbench.html' });
+  await settle();
+  assert.equal(env.calls.reapply.length, 0, 'an earlier startup snapshot must not undo the user closing the background');
+  assert.equal(env.state.get('lastAppliedExtensionVersion'), '0.2.0');
+});
