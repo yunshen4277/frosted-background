@@ -16,11 +16,23 @@
   if (settings.enabled === false || !settings.source) return;
 
   let source;
+  let videoPlayer;
   try {
     source = new URL(settings.source, document.baseURI);
     const origin = new URL(document.baseURI);
     if (source.protocol !== origin.protocol || source.host !== origin.host || source.username || source.password) {
       throw new Error('Only media copied into this VS Code installation is supported.');
+    }
+    if (settings.kind === 'video' && settings.videoPlayer) {
+      videoPlayer = new URL(settings.videoPlayer, document.baseURI);
+      const directory = source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1);
+      if (videoPlayer.protocol !== origin.protocol || videoPlayer.host !== origin.host || videoPlayer.username || videoPlayer.password || videoPlayer.search || videoPlayer.hash ||
+          source.search || source.hash || !/\/frosted-background-assets\/$/.test(directory) ||
+          videoPlayer.pathname.slice(0, videoPlayer.pathname.lastIndexOf('/') + 1) !== directory ||
+          !/^video-host-[a-f0-9]{64}\.html$/.test(videoPlayer.pathname.slice(videoPlayer.pathname.lastIndexOf('/') + 1)) ||
+          !/^media-[a-f0-9]{64}\.(mp4|webm)$/.test(source.pathname.slice(source.pathname.lastIndexOf('/') + 1))) {
+        throw new Error('Video player and media must be owned, adjacent cached assets.');
+      }
     }
   } catch (error) {
     console.warn('[Frosted Background] Invalid local media location.', error);
@@ -39,7 +51,7 @@
     saturation: number(settings.saturation, 1, 0, 3),
     brightness: number(settings.brightness, 1, 0.1, 2),
     playbackRate: number(settings.playbackRate, 1, 0.25, 2),
-    fit: settings.fit === 'contain' ? 'contain' : 'cover',
+    fit: ['cover', 'contain', 'fill'].includes(settings.fit) ? settings.fit : 'cover',
     position: typeof settings.position === 'string' && settings.position.length < 80 ? settings.position : 'center center',
     pauseWhenUnfocused: settings.pauseWhenUnfocused !== false,
     respectReducedMotion: settings.respectReducedMotion !== false,
@@ -120,7 +132,8 @@
     layer.className = 'frosted-background-layer';
     layer.setAttribute('aria-hidden', 'true');
     layer.setAttribute('inert', '');
-    const media = document.createElement(config.kind === 'video' ? 'video' : 'img');
+    const framedVideo = config.kind === 'video' && Boolean(videoPlayer);
+    const media = document.createElement(framedVideo ? 'iframe' : config.kind === 'video' ? 'video' : 'img');
     media.className = 'frosted-background-media';
     media.setAttribute('aria-hidden', 'true');
     media.setAttribute('tabindex', '-1');
@@ -131,6 +144,7 @@
       objectFit: config.fit, objectPosition: config.position,
       filter: `blur(${config.blur}px) saturate(${config.saturation}) brightness(${config.brightness})`,
       opacity: String(config.opacity),
+      border: '0',
     });
     const tint = document.createElement('div');
     tint.className = 'frosted-background-tint';
@@ -150,6 +164,11 @@
     let playPending = false;
     let playbackBlocked = false;
     let stopped = false;
+    let playerBooted = false;
+    const channel = framedVideo ? crypto.randomUUID() : undefined;
+    const playerOrigin = framedVideo && /^https?:$/.test(videoPlayer.protocol) ? videoPlayer.origin : undefined;
+    const targetOrigin = playerOrigin || '*';
+    const postPlayer = data => media.contentWindow?.postMessage({ type: 'frosted-background-player', channel, ...data }, targetOrigin);
 
     const shouldPlay = () => !stopped && !failed && !document.hidden && inViewport &&
       host.isConnected && host.clientWidth > 0 && host.clientHeight > 0 &&
@@ -158,6 +177,10 @@
 
     const updatePlayback = () => {
       if (config.kind !== 'video') return;
+      if (framedVideo) {
+        if (playerBooted && !stopped) postPlayer({ action: 'playback', playing: shouldPlay() });
+        return;
+      }
       if (!shouldPlay()) {
         media.pause();
         return;
@@ -182,19 +205,48 @@
       host.classList.add('frosted-background-ready');
       updatePlayback();
     };
-    const onError = () => {
+    const onError = error => {
       if (stopped) return;
       failed = true;
       layer.dataset.state = 'error';
       layer.hidden = true;
       host.classList.remove('frosted-background-ready');
-      if (config.kind === 'video') media.pause();
-      console.warn('[Frosted Background] Media could not be decoded. The normal editor background has been restored.');
+      if (framedVideo) postPlayer({ action: 'playback', playing: false });
+      else if (config.kind === 'video') media.pause();
+      console.warn('[Frosted Background] Media could not be decoded. The normal editor background has been restored.', typeof error === 'string' ? error : media.error?.message || '');
     };
-    media.addEventListener(config.kind === 'video' ? 'loadeddata' : 'load', onReady);
-    media.addEventListener('error', onError);
+    const initializePlayer = () => {
+      if (stopped || failed) return;
+      playerBooted = true;
+      postPlayer({ action: 'initialize', source: source.href, fit: config.fit, position: config.position, playbackRate: config.playbackRate, playing: shouldPlay() });
+      updatePlayback();
+    };
+    const receivePlayer = event => {
+      if (event.source !== media.contentWindow || (playerOrigin && event.origin !== playerOrigin)) return;
+      const data = event.data;
+      if (!data || data.type !== 'frosted-background-player' || data.channel !== channel || stopped) return;
+      if (data.event === 'booted') initializePlayer();
+      else if (data.event === 'media-ready') onReady();
+      else if (data.event === 'error') onError(typeof data.detail === 'string' ? data.detail.slice(0, 300) : 'Player load failed.');
+      else if (data.event === 'playback-blocked') console.warn('[Frosted Background] Video playback is paused; focus or click the editor to retry.');
+    };
+    if (framedVideo) {
+      window.addEventListener('message', receivePlayer);
+      media.addEventListener('load', initializePlayer);
+    } else {
+      media.addEventListener(config.kind === 'video' ? 'loadeddata' : 'load', onReady);
+      media.addEventListener('error', onError);
+    }
 
-    if (config.kind === 'video') {
+    if (framedVideo) {
+      media.title = '毛玻璃背景视频';
+      media.setAttribute('allow', 'autoplay');
+      media.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+      const location = new URL(videoPlayer.href);
+      if (globalThis.crossOriginIsolated === true) location.searchParams.set('vscode-coi', '3');
+      location.hash = new URLSearchParams({ 'frosted-channel': channel }).toString();
+      media.src = location.href;
+    } else if (config.kind === 'video') {
       media.muted = true;
       media.defaultMuted = true;
       media.loop = true;
@@ -209,7 +261,7 @@
       media.draggable = false;
       media.decoding = 'async';
     }
-    media.src = source.href;
+    if (!framedVideo) media.src = source.href;
 
     const resize = new ResizeObserver(updatePlayback);
     resize.observe(host);
@@ -221,14 +273,22 @@
 
     const state = {
       updatePlayback,
-      retryPlayback() { playbackBlocked = false; updatePlayback(); },
+      retryPlayback() {
+        playbackBlocked = false;
+        if (framedVideo && playerBooted && !stopped) postPlayer({ action: 'playback', playing: shouldPlay(), retry: true });
+        else updatePlayback();
+      },
       dispose() {
         stopped = true;
         resize.disconnect();
         intersection.disconnect();
         media.removeEventListener(config.kind === 'video' ? 'loadeddata' : 'load', onReady);
         media.removeEventListener('error', onError);
-        if (config.kind === 'video') {
+        if (framedVideo) {
+          postPlayer({ action: 'dispose' });
+          window.removeEventListener('message', receivePlayer);
+          media.removeEventListener('load', initializePlayer);
+        } else if (config.kind === 'video') {
           media.pause();
           media.removeAttribute('src');
           media.load();
