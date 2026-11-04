@@ -59,7 +59,7 @@
     byId('fit-description').textContent = {
       cover: '等比铺满，允许裁剪边缘',
       contain: '完整显示画面，可能留白',
-      fill: '随编辑区拉伸，可能改变画面比例',
+      fill: '完整画面压缩到编辑区，不裁剪；可能改变比例',
     }[draft.fit];
     byId('position').value = draft.position;
     for (const key of ['pauseWhenUnfocused', 'respectReducedMotion']) byId(key).checked = draft[key];
@@ -209,6 +209,9 @@
   byId('apply').addEventListener('click', () => sendAction({ type: 'apply', config: { ...draft } }));
   byId('restore').addEventListener('click', () => sendAction({ type: 'restore' }));
   byId('reload').addEventListener('click', () => sendAction({ type: 'reload' }));
+  // Closing is a view-only action: do not acquire the operation lock or modify
+  // saved drafts, the selected media, or the background's enabled state.
+  byId('close-panel').addEventListener('click', () => vscode.postMessage({ type: 'closePanel' }));
   byId('update-mode').addEventListener('change', event => sendAction({ type: 'setUpdateMode', mode: event.target.value }));
   byId('check-updates').addEventListener('click', () => sendAction({ type: 'checkUpdates' }));
 

@@ -29,6 +29,11 @@ h1 { font-size: 19px; font-weight: 600; letter-spacing: .3px; margin: 8px 0 0; l
 .status-pill { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line); padding: 3px 7px; border-radius: 20px; color: var(--muted); white-space: nowrap; font-size: 10px; margin-top: 14px; }
 .status-pill > span:first-child { width: 4px; height: 4px; border-radius: 50%; background: currentColor; }
 .status-pill.is-active { color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 20%, transparent); }
+.heading-actions { display: flex; align-items: center; gap: 5px; margin-top: 14px; flex: 0 0 auto; }
+.heading-actions .status-pill { margin-top: 0; }
+.close-panel-button { display: grid; place-items: center; width: 24px; height: 24px; padding: 4px; border: 0; border-radius: 4px; color: var(--muted); background: transparent; }
+.close-panel-button svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; }
+.close-panel-button:hover { color: var(--text); background: var(--surface); }
 .preview { aspect-ratio: 1.48; position: relative; border: 1px solid color-mix(in srgb, var(--text) 13%, transparent); border-radius: 12px; overflow: hidden; isolation: isolate; background: var(--vscode-editor-background, #111923); }
 .preview-base { position: absolute; inset: 0; background: radial-gradient(ellipse at 13% 14%, #58d7c142, transparent 60%), radial-gradient(ellipse at 95% 95%, #5a78de32, transparent 62%); }
 .preview.has-media .preview-base { opacity: 0; }

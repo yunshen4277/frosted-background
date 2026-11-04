@@ -263,8 +263,81 @@
     }
     if (!framedVideo) media.src = source.href;
 
-    const resize = new ResizeObserver(updatePlayback);
+    // Complete compression must fit the pixels the user can actually see.
+    // The workbench part also includes opaque tabs/breadcrumbs, and Monaco's
+    // scrollable element includes a right minimap; neither is the code viewport.
+    let geometryFrame = 0;
+    const geometryNodes = new Set();
+    const layoutSelector = '.editor-group-container, .editor-container, .monaco-editor, .minimap, .scrollbar, .title, .breadcrumbs-control, .monaco-grid-view, .monaco-grid-branch-node, .monaco-grid-leaf-node';
+    function updateFillBounds() {
+      geometryFrame = 0;
+      if (stopped || config.fit !== 'fill') return;
+      const hostRect = host.getBoundingClientRect();
+      const rectangles = [];
+      const observed = new Set();
+      const addRectangle = (element, container) => {
+        const raw = element.getBoundingClientRect();
+        const enclosing = container.getBoundingClientRect();
+        if (!raw.width || !raw.height || getComputedStyle(element).visibility === 'hidden') return;
+        let left = Math.max(raw.left, enclosing.left, hostRect.left);
+        let top = Math.max(raw.top, enclosing.top, hostRect.top);
+        let right = Math.min(raw.right, enclosing.right, hostRect.right);
+        let bottom = Math.min(raw.bottom, enclosing.bottom, hostRect.bottom);
+        observed.add(element);
+        if (element.matches('.monaco-editor')) {
+          for (const obstacle of element.querySelectorAll('.minimap, .scrollbar.vertical, .scrollbar.horizontal')) {
+            if (obstacle.closest('.monaco-editor') !== element) continue;
+            // Suggest/hover widgets have their own scrollbars inside the same
+            // Monaco editor. Only the editor's primary scrollbars bound it.
+            if (obstacle.matches('.scrollbar') && !obstacle.parentElement?.matches('.editor-scrollable')) continue;
+            observed.add(obstacle);
+            const box = obstacle.getBoundingClientRect();
+            if (!box.width || !box.height || box.bottom <= top || box.top >= bottom || box.right <= left || box.left >= right) continue;
+            if (obstacle.matches('.scrollbar.horizontal')) {
+              if (box.top >= (top + bottom) / 2) bottom = Math.min(bottom, box.top);
+            } else if (box.left <= raw.left + 1) left = Math.max(left, box.right);
+            else right = Math.min(right, box.left);
+          }
+        }
+        if (right > left && bottom > top) rectangles.push({ left, top, right, bottom });
+      };
+      for (const container of host.querySelectorAll('.editor-group-container > .editor-container')) {
+        if (container.closest('.part.editor') !== host) continue;
+        observed.add(container);
+        // Ignore peek/embedded editors: their layout must not move the wallpaper.
+        const editors = [...container.querySelectorAll('.monaco-editor')].filter(editor => {
+          const outer = editor.parentElement?.closest('.monaco-editor');
+          return !outer || !container.contains(outer);
+        });
+        if (editors.length) editors.forEach(editor => addRectangle(editor, container));
+        else addRectangle(container, container);
+      }
+      for (const element of geometryNodes) if (!observed.has(element)) { resize.unobserve(element); geometryNodes.delete(element); }
+      for (const element of observed) if (!geometryNodes.has(element)) { resize.observe(element); geometryNodes.add(element); }
+      if (!rectangles.length || !hostRect.width || !hostRect.height) {
+        layer.style.inset = '0';
+        return;
+      }
+      const scaleX = host.offsetWidth ? hostRect.width / host.offsetWidth : 1;
+      const scaleY = host.offsetHeight ? hostRect.height / host.offsetHeight : 1;
+      const left = Math.max(0, (Math.min(...rectangles.map(box => box.left)) - hostRect.left) / scaleX - host.clientLeft);
+      const top = Math.max(0, (Math.min(...rectangles.map(box => box.top)) - hostRect.top) / scaleY - host.clientTop);
+      const right = Math.max(0, host.clientWidth - (Math.max(...rectangles.map(box => box.right)) - hostRect.left) / scaleX + host.clientLeft);
+      const bottom = Math.max(0, host.clientHeight - (Math.max(...rectangles.map(box => box.bottom)) - hostRect.top) / scaleY + host.clientTop);
+      const inset = `${top}px ${right}px ${bottom}px ${left}px`;
+      if (layer.style.inset !== inset) layer.style.inset = inset;
+    }
+    function scheduleGeometry() {
+      if (!stopped && config.fit === 'fill' && !geometryFrame) geometryFrame = requestAnimationFrame(updateFillBounds);
+    }
+    const resize = new ResizeObserver(() => { scheduleGeometry(); updatePlayback(); });
     resize.observe(host);
+    const layoutObserver = config.fit === 'fill' ? new MutationObserver(records => {
+      if (records.some(record => record.target.matches?.(layoutSelector) ||
+        [...record.addedNodes, ...record.removedNodes].some(node => node.nodeType === 1 && (node.matches(layoutSelector) || node.querySelector(layoutSelector))))) scheduleGeometry();
+    }) : undefined;
+    layoutObserver?.observe(host, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
+    updateFillBounds();
     const intersection = new IntersectionObserver(entries => {
       inViewport = entries[0]?.isIntersecting ?? true;
       updatePlayback();
@@ -280,6 +353,8 @@
       },
       dispose() {
         stopped = true;
+        cancelAnimationFrame(geometryFrame);
+        layoutObserver?.disconnect();
         resize.disconnect();
         intersection.disconnect();
         media.removeEventListener(config.kind === 'video' ? 'loadeddata' : 'load', onReady);
