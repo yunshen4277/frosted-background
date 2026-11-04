@@ -14,7 +14,7 @@ async function main() {
   const file = args.find((value, index) => !value.startsWith('--') && args[index - 1] !== '--modules')
     || path.join(path.dirname(root), `${pkg.name}-${pkg.version}.vsix`);
   const archive = await JSZip.loadAsync(await fs.readFile(file), { checkCRC32: true });
-  for (const required of ['extension.vsixmanifest', '[Content_Types].xml', 'extension/package.json', 'extension/README.md', 'extension/LICENSE', `extension/${pkg.main.replace(/^\.\//, '')}`, 'extension/src/patcher.js', 'extension/media/renderer.js', 'extension/src/panel.js', 'extension/src/panel-ui.js', 'extension/media/panel.js', 'extension/media/panel.css', 'extension/media/background-icon.svg']) {
+  for (const required of ['extension.vsixmanifest', '[Content_Types].xml', 'extension/package.json', 'extension/README.md', 'extension/LICENSE', `extension/${pkg.main.replace(/^\.\//, '')}`, 'extension/src/patcher.js', 'extension/media/renderer.js', 'extension/media/video-player.js', 'extension/src/panel.js', 'extension/src/panel-ui.js', 'extension/media/panel.js', 'extension/media/panel.css', 'extension/media/background-icon.svg']) {
     assert.ok(archive.file(required), `Missing ${required}`);
   }
   const packedPkg = JSON.parse(await archive.file('extension/package.json').async('string'));

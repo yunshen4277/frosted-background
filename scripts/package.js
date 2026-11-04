@@ -105,7 +105,7 @@ async function main(args = process.argv.slice(2)) {
     ['package.json', 'package.nls.json', 'package.nls.zh-cn.json', 'README.md', 'LICENSE', 'CHANGELOG.md'].includes(name)
     || name.startsWith('src/') || name.startsWith('media/'));
   const required = ['package.json', 'README.md', 'LICENSE', pkg.main.replace(/^\.\//, ''), 'media/renderer.js',
-    'src/panel.js', 'src/panel-ui.js', 'media/panel.js', 'media/panel.css', 'media/background-icon.svg', 'src/updater.js', 'src/github-update.js'];
+    'src/panel.js', 'src/panel-ui.js', 'media/panel.js', 'media/panel.css', 'media/background-icon.svg', 'media/video-player.js', 'src/updater.js', 'src/github-update.js'];
   for (const file of required) {
     if (!packaged.includes(file)) throw new Error(`Missing package file: ${file}`);
   }
