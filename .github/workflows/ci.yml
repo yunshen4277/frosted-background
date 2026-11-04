@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test and verify VSIX
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      - name: Bind update source to this repository
+        shell: bash
+        run: node scripts/bind-repository.js "$GITHUB_REPOSITORY"
+      - name: Install development dependencies
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --ignore-scripts
+          else
+            npm install --ignore-scripts
+          fi
+          npm install --no-save --package-lock=false --ignore-scripts playwright@1.62.1
+      - name: Install test browser
+        run: npx --no-install playwright install --with-deps chromium
+      - name: Run all unit and browser tests
+        env:
+          PLAYWRIGHT_MODULE: playwright
+        run: node --test --test-concurrency=1 test/*.test.js
+      - name: Package and verify installable extension
+        shell: bash
+        run: |
+          node scripts/package.js --out "$RUNNER_TEMP/releases"
+          node scripts/verify-package.js "$RUNNER_TEMP/releases/$(node -p "require('./package.json').name + '-' + require('./package.json').version").vsix"
