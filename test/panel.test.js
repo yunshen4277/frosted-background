@@ -136,6 +136,17 @@ test('canceling a new file choice preserves the previous draft media', async () 
   env.dispose();
 });
 
+test('stretch layout survives the panel host normalization for both media kinds', async () => {
+  for (const kind of ['image', 'video']) {
+    const mediaPath = kind === 'video' ? 'D:/stretch.webm' : 'D:/stretch.png';
+    const env = harness({ choose: mediaPath });
+    await env.send({ type: 'chooseMedia', kind });
+    await env.send({ type: 'apply', config: { ...DEFAULTS, fit: 'fill', blur: 21, position: 'center bottom' } });
+    assert.deepEqual(env.calls.apply, [{ mediaPath, config: { ...DEFAULTS, fit: 'fill', blur: 21, position: 'center bottom' } }]);
+    env.dispose();
+  }
+});
+
 test('failed apply preserves selected draft for retry and releases the busy state', async () => {
   let failure = true;
   const env = harness({

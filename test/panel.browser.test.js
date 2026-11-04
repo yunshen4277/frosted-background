@@ -72,19 +72,19 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     await sendState({ config: { ...DEFAULTS, blur: 8 } });
     assert.equal(await page.locator('#blur').inputValue(), '31', 'external changes preserve an unsaved local draft');
 
-    const update = { currentVersion: '0.3.0', repository: 'example/frosted-background', mode: 'automatic', status: 'idle', message: '已是最新版本。', availableVersion: null, pendingVersion: null };
+    const update = { currentVersion: '0.4.0', repository: 'example/frosted-background', mode: 'automatic', status: 'idle', message: '已是最新版本。', availableVersion: null, pendingVersion: null };
     await sendState({ update });
     assert.equal(await page.locator('#update-section').isVisible(), true);
-    assert.equal(await page.locator('#current-version').textContent(), 'v0.3.0');
+    assert.equal(await page.locator('#current-version').textContent(), 'v0.4.0');
     assert.equal(await page.locator('#blur').inputValue(), '31', 'update status never resets background drafts');
     await page.locator('#check-updates').click();
     assert.deepEqual(await page.evaluate(() => window.__messages.at(-1)), { type: 'checkUpdates' });
     await sendState({ update: { ...update, status: 'checking', message: '正在检查…' } });
     assert.equal(await page.locator('#check-updates').isEnabled(), false);
-    await sendState({ update: { ...update, status: 'installing', availableVersion: '0.4.0' } });
+    await sendState({ update: { ...update, status: 'installing', availableVersion: '0.5.0' } });
     assert.equal(await page.locator('#check-updates').isEnabled(), false);
-    assert.equal(await page.locator('#available-version').textContent(), '发现 v0.4.0');
-    await sendState({ update: { ...update, status: 'available', availableVersion: '0.4.0', message: '<img onerror=alert(1)>新版本可用' } });
+    assert.equal(await page.locator('#available-version').textContent(), '发现 v0.5.0');
+    await sendState({ update: { ...update, status: 'available', availableVersion: '0.5.0', message: '<img onerror=alert(1)>新版本可用' } });
     assert.equal(await page.locator('#update-message img').count(), 0);
     assert.equal(await page.locator('#update-message').textContent(), '<img onerror=alert(1)>新版本可用');
     await page.locator('#update-mode').selectOption('notify');
@@ -94,8 +94,8 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     assert.equal(await page.locator('#update-mode').isEnabled(), true, 'an unconfigured updater still permits turning updates off');
     await page.locator('#update-mode').selectOption('off');
     assert.deepEqual(await page.evaluate(() => window.__messages.at(-1)), { type: 'setUpdateMode', mode: 'off' });
-    await sendState({ update: { ...update, pendingVersion: '0.4.0' }, needsReload: true });
-    assert.equal(await page.locator('#available-version').textContent(), 'v0.4.0 · 待重载');
+    await sendState({ update: { ...update, pendingVersion: '0.5.0' }, needsReload: true });
+    assert.equal(await page.locator('#available-version').textContent(), 'v0.5.0 · 待重载');
     assert.equal(await page.locator('#reload').isVisible(), true);
     assert.equal(await page.locator('#blur').inputValue(), '31');
     await sendState({ update: null, needsReload: false });
@@ -109,12 +109,22 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     await page.locator('[data-preset="clear"]').click();
     assert.equal(await page.locator('#blur').inputValue(), '5');
     await page.locator('input[name="fit"][value="contain"]').check();
+    assert.equal(await page.locator('#preview-media img').evaluate(el => getComputedStyle(el).objectFit), 'contain');
+    await page.locator('input[name="fit"][value="fill"]').check();
+    assert.equal(await page.locator('#fit-description').textContent(), '随编辑区拉伸，可能改变画面比例');
+    const imageStretch = await page.locator('#preview-media img').evaluate(el => ({
+      fit: getComputedStyle(el).objectFit, transform: getComputedStyle(el).transform,
+      displayedRatio: el.clientWidth / el.clientHeight, naturalRatio: el.naturalWidth / el.naturalHeight,
+    }));
+    assert.equal(imageStretch.fit, 'fill');
+    assert.equal(imageStretch.transform, 'none');
+    assert.ok(Math.abs(imageStretch.displayedRatio - imageStretch.naturalRatio) > 0.1, 'fill permits a display ratio different from the image source');
     await page.locator('#position').selectOption('center top');
     await page.locator('#apply').click();
     const applying = await page.evaluate(() => window.__messages.at(-1));
     assert.equal(applying.type, 'apply');
     assert.equal(applying.config.blur, 5);
-    assert.equal(applying.config.fit, 'contain');
+    assert.equal(applying.config.fit, 'fill');
     assert.equal(applying.config.position, 'center top');
     assert.equal(Object.keys(applying.config).length, Object.keys(DEFAULTS).length);
     assert.equal(await page.locator('#apply').isEnabled(), false);
@@ -133,20 +143,24 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     assert.equal(await page.locator('#blur').inputValue(), '14');
 
     const clip = pathToFileURL(path.resolve(__dirname, 'fixtures/colors.webm')).href;
-    await sendState({ media: { name: '静音循环.webm', kind: 'video', uri: clip }, error: null });
+    await sendState({ config: { ...DEFAULTS, fit: 'fill' }, resetDraft: true, media: { name: '静音循环.webm', kind: 'video', uri: clip }, error: null });
     await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2);
     assert.equal(await page.locator('#video-section').isVisible(), true);
     assert.equal(await page.locator('video').evaluate(video => video.muted && video.loop && !video.controls), true);
+    assert.equal(await page.locator('video').evaluate(video => getComputedStyle(video).objectFit), 'fill', 'saved stretch layout is normalized and previewed for video');
+    assert.equal(await page.locator('input[name="fit"][value="fill"]').isChecked(), true);
     await page.emulateMedia({ reducedMotion: 'reduce' });
     await page.waitForFunction(() => document.querySelector('video').paused);
     await page.locator('#playbackRate').fill('1.5');
     await page.locator('#playbackRate').dispatchEvent('input');
     assert.equal(await page.locator('video').evaluate(video => video.playbackRate), 1.5);
 
-    await sendState({ config: { ...DEFAULTS, blur: 18, opacity: 0.5, tintOpacity: 0.12 }, resetDraft: true, media, enabled: true, update });
+    await sendState({ config: { ...DEFAULTS, fit: 'fill', blur: 18, opacity: 0.5, tintOpacity: 0.12 }, resetDraft: true, media, enabled: true, update });
     await page.locator('#preview-media img').evaluate(image => image.decode());
     await page.setViewportSize({ width: 280, height: 620 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, 'no horizontal overflow at 280×620');
+    assert.equal(await page.locator('.fit-control span').evaluateAll(labels => labels.length === 3 && labels.every(el => el.scrollWidth <= el.clientWidth)), true, 'three layout options fit the narrow sidebar without clipping labels');
+    assert.equal(await page.locator('#preview-media img').evaluate(el => getComputedStyle(el).objectFit), 'fill', 'stretch survives panel resizing');
     const actionBounds = await page.locator('#apply').boundingBox();
     assert.ok(actionBounds.y >= 0 && actionBounds.y + actionBounds.height <= 620, 'sticky apply action remains inside the short viewport');
     await page.locator('.advanced summary').click();

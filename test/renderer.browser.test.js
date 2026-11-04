@@ -19,16 +19,25 @@ test('renderer fits the editor, preserves interaction and manages image/video li
     'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
   ].find(value => fs.existsSync(value));
   const renderer = fs.readFileSync(path.join(__dirname, '../media/renderer.js'));
+  const playerScript = fs.readFileSync(path.join(__dirname, '../media/video-player.js'));
+  const mediaName = `media-${'a'.repeat(64)}.webm`;
+  const playerName = `video-host-${'b'.repeat(64)}.html`;
+  const playerHtml = '<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'self\'; connect-src \'self\'; media-src blob:; style-src \'unsafe-inline\';"><body><script src="./video-player.js" defer></script></body>';
   const escapeAttribute = value => value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
   function fixture(url) {
     const params = new URL(url, 'http://localhost').searchParams;
     const config = {
       enabled: true, kind: params.get('kind') || 'image',
       source: params.get('source') || './wallpaper.png', fit: params.get('fit') || 'cover',
-      opacity: 0.7, blur: 10, tintOpacity: 0.15,
+      opacity: 0.7, blur: params.has('blur') ? Number(params.get('blur')) : 10, tintOpacity: 0.15,
       pauseWhenUnfocused: true, respectReducedMotion: true,
     };
-    return `<!doctype html><html><head><meta charset="utf-8"><style>
+    if (params.has('player')) {
+      config.source = `./frosted-background-assets/${mediaName}`;
+      config.videoPlayer = `./frosted-background-assets/${playerName}`;
+    }
+    const csp = params.has('player') ? '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'self\' \'unsafe-inline\'; style-src \'unsafe-inline\'; img-src \'self\'; media-src \'self\'; frame-src \'self\'; connect-src \'self\';">' : '';
+    return `<!doctype html><html><head><meta charset="utf-8">${csp}<style>
       :root {
         --vscode-editor-background: #161c2a; --vscode-editor-foreground: #e7edf8;
         --vscode-editorStickyScroll-background: #000; --vscode-editorStickyScrollGutter-background: #000;
@@ -71,12 +80,42 @@ test('renderer fits the editor, preserves interaction and manages image/video li
   const fixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'frosted-renderer-test-'));
   fs.writeFileSync(path.join(fixtureDirectory, 'renderer.js'), renderer);
   fs.copyFileSync(path.join(__dirname, 'fixtures/wallpaper.png'), path.join(fixtureDirectory, 'wallpaper.png'));
+  const localAssets = path.join(fixtureDirectory, 'frosted-background-assets');
+  fs.mkdirSync(localAssets);
+  fs.writeFileSync(path.join(localAssets, playerName), playerHtml);
+  fs.writeFileSync(path.join(localAssets, 'video-player.js'), playerScript);
+  fs.copyFileSync(path.join(__dirname, 'fixtures/colors.webm'), path.join(localAssets, mediaName));
   const fixtureUrl = pathToFileURL(path.join(fixtureDirectory, 'index.html')).href;
   let browser;
   try {
-    browser = await chromium.launch({ headless: true, executablePath });
+    // This disposable test browser models vscode-file's local fetch capability.
+    browser = await chromium.launch({ headless: true, executablePath, args: ['--allow-file-access-from-files'] });
     const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
+    await page.addInitScript(() => {
+      window.__cspViolations = [];
+      document.addEventListener('securitypolicyviolation', event => window.__cspViolations.push(event.effectiveDirective));
+      window.__revokedBlobs = [];
+      const revoke = URL.revokeObjectURL.bind(URL);
+      URL.revokeObjectURL = value => { window.__revokedBlobs.push(value); revoke(value); };
+    });
+    await page.route('https://frosted.test/**', async route => {
+      const requested = new URL(route.request().url());
+      const files = new Map([
+        ['/renderer.js', ['text/javascript', renderer]],
+        [`/frosted-background-assets/${playerName}`, ['text/html', playerHtml]],
+        ['/frosted-background-assets/video-player.js', ['text/javascript', playerScript]],
+        [`/frosted-background-assets/${mediaName}`, ['video/webm', fs.readFileSync(path.join(__dirname, 'fixtures/colors.webm'))]],
+      ]);
+      const headers = requested.searchParams.has('coi') || requested.searchParams.get('vscode-coi') === '3'
+        ? { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp' } : {};
+      if (requested.pathname === '/index.html') return route.fulfill({ contentType: 'text/html', headers, body: fixture(requested.href) });
+      const file = files.get(requested.pathname);
+      if (file) return route.fulfill({ contentType: file[0], headers, body: file[1] });
+      return route.fulfill({ status: 404, body: '' });
+    });
     const openFixture = async (query = '') => {
+      const params = new URLSearchParams(query);
+      if (params.has('player') && !params.has('local')) return page.goto(`https://frosted.test/index.html?${query}`);
       fs.writeFileSync(path.join(fixtureDirectory, 'index.html'), fixture(`/?${query}`));
       await page.goto(`${fixtureUrl}?${query}`);
     };
@@ -124,6 +163,13 @@ test('renderer fits the editor, preserves interaction and manages image/video li
     await page.waitForSelector('.frosted-background-ready');
     assert.equal(await page.locator('.frosted-background-media').evaluate(el => getComputedStyle(el).objectFit), 'contain');
     assert.deepEqual(await page.locator('.frosted-background-media').boundingBox(), await page.locator('.part.editor').boundingBox(), 'contain has no blur overscan that would crop the image');
+    await verifyBounds();
+
+    await openFixture('fit=fill');
+    await page.waitForSelector('.frosted-background-ready');
+    assert.equal(await page.locator('img.frosted-background-media').evaluate(el => getComputedStyle(el).objectFit), 'fill');
+    assert.deepEqual(await page.locator('.frosted-background-media').boundingBox(), await page.locator('.part.editor').boundingBox(), 'stretch mode uses every editor pixel without preserving media aspect ratio');
+    await page.setViewportSize({ width: 900, height: 610 });
     await verifyBounds();
 
     // Regression: native Sticky Scroll uses opaque fills on several nested
@@ -216,6 +262,59 @@ test('renderer fits the editor, preserves interaction and manages image/video li
     await page.waitForFunction(() => document.querySelector('video').paused);
     await page.evaluate(() => window.__frostedBackgroundCleanup());
     assert.equal(await page.locator('video').count(), 0);
+
+    // The parent keeps VS Code's media-src 'self'. An actual same-origin child
+    // document owns the blob permission and decodes real video bytes locally.
+    await openFixture('kind=video&player=1&fit=fill&blur=0');
+    await page.waitForSelector('.frosted-background-ready');
+    const frame = page.frames().find(value => value.url().includes(playerName));
+    assert.ok(frame, 'the independent player document loaded');
+    await frame.waitForFunction(() => document.querySelector('video').readyState >= 2 && !document.querySelector('video').paused);
+    assert.equal(await page.locator('video').count(), 0, 'workbench does not load video directly through its restricted protocol');
+    assert.equal(new URL(await page.locator('iframe').getAttribute('src')).search, '', 'normal workbench does not add isolation parameters');
+    assert.equal(await frame.locator('video').evaluate(el => getComputedStyle(el).objectFit), 'fill');
+    assert.match(await frame.locator('video').evaluate(el => el.currentSrc), /^blob:https:\/\/frosted\.test\//);
+    assert.match(await page.locator('meta[http-equiv="Content-Security-Policy"]').getAttribute('content'), /media-src 'self';/);
+    assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+    assert.deepEqual(await frame.evaluate(() => window.__cspViolations), []);
+    await verifyBounds();
+    assert.deepEqual(await page.locator('iframe').boundingBox(), await page.locator('.part.editor').boundingBox());
+    await page.setViewportSize({ width: 1060, height: 510 });
+    await verifyBounds();
+    const frameSize = await frame.locator('video').evaluate(el => ({ width: el.clientWidth, height: el.clientHeight }));
+    const frameBounds = await page.locator('iframe').boundingBox();
+    assert.deepEqual(frameSize, { width: frameBounds.width, height: frameBounds.height }, 'stretched child video follows both dimensions of the resized editor');
+    await page.evaluate(() => {
+      const iframe = document.querySelector('iframe');
+      const channel = new URL(iframe.src).hash.slice('#frosted-channel='.length);
+      window.dispatchEvent(new MessageEvent('message', { source: window, origin: location.origin, data: { type: 'frosted-background-player', channel, event: 'error' } }));
+      window.dispatchEvent(new MessageEvent('message', { source: iframe.contentWindow, origin: location.origin, data: { type: 'frosted-background-player', channel: 'wrong', event: 'error' } }));
+    });
+    assert.equal(await page.locator('.frosted-background-ready').count(), 1, 'spoofed player messages cannot hide the background');
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await frame.waitForFunction(() => document.querySelector('video').paused);
+    assert.equal(await page.locator('.frosted-background-ready').count(), 1, 'reduced motion keeps the decoded still frame visible');
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    await frame.waitForFunction(() => !document.querySelector('video').paused);
+    await page.evaluate(() => { document.hasFocus = () => false; window.dispatchEvent(new Event('blur')); });
+    await frame.waitForFunction(() => document.querySelector('video').paused);
+    await page.evaluate(() => { document.hasFocus = () => true; window.dispatchEvent(new Event('focus')); });
+    await frame.waitForFunction(() => !document.querySelector('video').paused);
+    await frame.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+    assert.equal(await frame.evaluate(() => window.__revokedBlobs.length), 1, 'player disposal revokes its video blob');
+    assert.equal(await frame.locator('video').getAttribute('src'), null);
+    await page.evaluate(() => window.__frostedBackgroundCleanup());
+    assert.equal(await page.locator('iframe').count(), 0, 'parent cleanup releases the entire player document');
+    await openFixture('kind=video&player=1&coi=1');
+    assert.equal(await page.evaluate(() => globalThis.crossOriginIsolated), true);
+    await page.waitForSelector('.frosted-background-ready');
+    assert.equal(new URL(await page.locator('iframe').getAttribute('src')).searchParams.get('vscode-coi'), '3', 'isolated workbenches request the matching child document headers');
+    await openFixture('kind=video&player=1&local=1&fit=fill');
+    await page.waitForSelector('.frosted-background-ready');
+    const localFrame = page.frames().find(value => value.url().includes(playerName));
+    await localFrame.waitForFunction(() => document.querySelector('video').readyState >= 2 && !document.querySelector('video').paused);
+    assert.equal(await localFrame.locator('video').evaluate(el => getComputedStyle(el).objectFit), 'fill');
+    assert.match(await localFrame.locator('video').evaluate(el => el.currentSrc), /^blob:/, 'opaque local origins can initialize and decode the player too');
     assert.deepEqual(pageErrors, [], 'renderer has no uncaught errors');
   } finally {
     if (browser) await browser.close();

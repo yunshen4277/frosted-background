@@ -20,3 +20,15 @@ test('zero blur and tint are preserved, supported fit and alignment are retained
   assert.equal(config.pauseWhenUnfocused, false);
   assert.equal(DEFAULTS.blur, 14);
 });
+
+test('all three fit modes are accepted and stretch preserves the other visual settings', () => {
+  for (const fit of ['cover', 'contain', 'fill']) {
+    assert.deepEqual(normalizeConfig({ ...DEFAULTS, fit, blur: 23, position: 'right center' }), {
+      ...DEFAULTS, fit, blur: 23, position: 'right center',
+    });
+  }
+  assert.equal(normalizeConfig().fit, 'cover');
+  assert.equal(normalizeConfig({ fit: 'stretch' }).fit, 'cover');
+  const manifest = require('../package.json');
+  assert.deepEqual(manifest.contributes.configuration.properties['frostedBackground.fit'].enum, ['cover', 'contain', 'fill']);
+});

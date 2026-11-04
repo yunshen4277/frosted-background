@@ -19,6 +19,7 @@ async function fixture(t, variant = 'electron-browser') {
   const rendererPath = path.join(appRoot, 'renderer.js');
   const mediaPath = path.join(appRoot, '壁纸 & image.jpg');
   await fs.writeFile(rendererPath, '(() => { /* renderer fixture */ })();');
+  await fs.writeFile(path.join(appRoot, 'video-player.js'), '(() => { /* video player fixture */ })();');
   await fs.writeFile(mediaPath, Buffer.from([0xff, 0xd8, 0xff, 1, 2, 3, 4]));
   return { appRoot, workbenchPath, rendererPath, mediaPath, config: { blur: 14, opacity: 0.35 } };
 }
@@ -105,14 +106,73 @@ test('config is HTML-escaped and authoritative source cannot be overridden', asy
   assert.equal(decodeConfig(html).source.includes('https:'), false);
 });
 
-test('video files use the video renderer kind', async t => {
+test('video uses an owned standalone player without altering the workbench CSP', async t => {
   const data = await fixture(t);
   const mediaPath = path.join(data.appRoot, 'clip.WEBM');
   await fs.writeFile(mediaPath, Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
-  await patcher.apply({ ...data, mediaPath });
-  const config = decodeConfig(await fs.readFile(data.workbenchPath, 'utf8'));
+  await patcher.apply({ ...data, mediaPath, config: { fit: 'fill', videoPlayer: 'https://example.com/foreign.html' } });
+  const html = await fs.readFile(data.workbenchPath, 'utf8');
+  const config = decodeConfig(html);
   assert.equal(config.kind, 'video');
+  assert.equal(config.fit, 'fill');
   assert.match(config.source, /\.webm$/);
+  assert.equal(patcher.stripInjection(html), ORIGINAL);
+  assert.match(config.videoPlayer, /^\.\/frosted-background-assets\/video-host-[a-f0-9]{64}\.html$/);
+  const page = await fs.readFile(path.join(path.dirname(data.workbenchPath), config.videoPlayer), 'utf8');
+  assert.match(page, /media-src blob:/);
+  assert.match(page, /script-src 'self'/);
+  assert.doesNotMatch(page, /unsafe-eval|srcdoc|https:/);
+  const player = /src="\.\/(video-player-[a-f0-9]{64}\.js)"/.exec(page)[1];
+  const directory = path.join(path.dirname(data.workbenchPath), patcher.ASSET_DIRECTORY);
+  assert.equal(await fs.readFile(path.join(directory, player), 'utf8'), await fs.readFile(path.join(data.appRoot, 'video-player.js'), 'utf8'));
+  await fs.writeFile(path.join(directory, 'video-host-not-owned.html'), 'keep');
+  await patcher.restore(data);
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
+  assert.equal(await fs.readFile(path.join(directory, 'video-host-not-owned.html'), 'utf8'), 'keep');
+  assert.equal((await fs.readdir(directory)).some(name => /^(video-player-|video-host-[a-f0-9]{64})/.test(name)), false);
+});
+
+test('video helper failures cannot replace the current background or leave partial assets', async t => {
+  const data = await fixture(t);
+  await patcher.apply(data);
+  const before = await fs.readFile(data.workbenchPath, 'utf8');
+  const directory = path.join(path.dirname(data.workbenchPath), patcher.ASSET_DIRECTORY);
+  const names = (await fs.readdir(directory)).sort();
+  const video = path.join(data.appRoot, 'clip.mp4');
+  await fs.writeFile(video, 'video fixture');
+  const playerPath = path.join(data.appRoot, 'video-player.js');
+  await fs.unlink(playerPath);
+  await assert.rejects(patcher.apply({ ...data, mediaPath: video }), /播放器文件缺失/);
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), before);
+  assert.deepEqual((await fs.readdir(directory)).sort(), names);
+  await fs.writeFile(playerPath, 'player script');
+  const rename = fs.rename;
+  t.mock.method(fs, 'rename', async (from, to) => {
+    if (to === data.workbenchPath) throw Object.assign(new Error('in-use'), { code: 'EPERM' });
+    return rename(from, to);
+  });
+  await assert.rejects(patcher.apply({ ...data, mediaPath: video }), /无法写入/);
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), before);
+  assert.deepEqual((await fs.readdir(directory)).sort(), names);
+});
+
+test('old cached video migrates to the standalone player after its original file is removed', async t => {
+  const data = await fixture(t);
+  const video = path.join(data.appRoot, 'clip.mp4');
+  await fs.writeFile(video, 'cached video fixture');
+  await patcher.apply({ ...data, mediaPath: video, config: { ...DEFAULTS, fit: 'fill', playbackRate: 1.5 } });
+  const html = await fs.readFile(data.workbenchPath, 'utf8');
+  const payload = decodeConfig(html);
+  const source = payload.source;
+  delete payload.videoPlayer;
+  await fs.writeFile(data.workbenchPath, replaceConfig(html, payload));
+  await fs.unlink(video);
+  await patcher.reapply({ appRoot: data.appRoot, rendererPath: data.rendererPath });
+  const migrated = decodeConfig(await fs.readFile(data.workbenchPath, 'utf8'));
+  assert.equal(migrated.source, source);
+  assert.equal(migrated.fit, 'fill');
+  assert.equal(migrated.playbackRate, 1.5);
+  assert.match(migrated.videoPlayer, /video-host-[a-f0-9]{64}\.html$/);
 });
 
 test('rejects unsupported files and oversized media before touching workbench', async t => {
