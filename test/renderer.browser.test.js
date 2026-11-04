@@ -309,12 +309,55 @@ test('renderer fits the editor, preserves interaction and manages image/video li
     assert.equal(await page.evaluate(() => globalThis.crossOriginIsolated), true);
     await page.waitForSelector('.frosted-background-ready');
     assert.equal(new URL(await page.locator('iframe').getAttribute('src')).searchParams.get('vscode-coi'), '3', 'isolated workbenches request the matching child document headers');
-    await openFixture('kind=video&player=1&local=1&fit=fill');
-    await page.waitForSelector('.frosted-background-ready');
-    const localFrame = page.frames().find(value => value.url().includes(playerName));
-    await localFrame.waitForFunction(() => document.querySelector('video').readyState >= 2 && !document.querySelector('video').paused);
-    assert.equal(await localFrame.locator('video').evaluate(el => getComputedStyle(el).objectFit), 'fill');
-    assert.match(await localFrame.locator('video').evaluate(el => el.currentSrc), /^blob:/, 'opaque local origins can initialize and decode the player too');
+    // A file-origin regression must not inherit the browsing-context group of
+    // the preceding COOP/COEP page. browser.newPage creates a fresh context;
+    // retain the real file fetch, player CSP, Blob decode and playback checks.
+    const localPage = await browser.newPage({ viewport: { width: 1060, height: 510 } });
+    const localDiagnostics = [];
+    const record = value => { localDiagnostics.push(value); if (localDiagnostics.length > 40) localDiagnostics.shift(); };
+    localPage.on('console', message => {
+      if (['warning', 'error'].includes(message.type())) record({ type: message.type(), text: message.text() });
+    });
+    localPage.on('requestfailed', request => record({ type: 'requestfailed', url: request.url(), error: request.failure()?.errorText }));
+    localPage.on('pageerror', error => { pageErrors.push(error.message); record({ type: 'pageerror', text: error.message }); });
+    await localPage.addInitScript(() => {
+      window.__localPlayerMessages = [];
+      window.__localCspViolations = [];
+      document.addEventListener('securitypolicyviolation', event => window.__localCspViolations.push({ directive: event.effectiveDirective, blocked: event.blockedURI }));
+      window.addEventListener('message', event => {
+        if (event.data?.type !== 'frosted-background-player') return;
+        window.__localPlayerMessages.push({ origin: event.origin, action: event.data.action, event: event.data.event, detail: event.data.detail, fromParent: event.source === parent });
+        if (window.__localPlayerMessages.length > 20) window.__localPlayerMessages.shift();
+      });
+    });
+    fs.writeFileSync(path.join(fixtureDirectory, 'index.html'), fixture('/?kind=video&player=1&local=1&fit=fill'));
+    await localPage.goto(`${fixtureUrl}?kind=video&player=1&local=1&fit=fill`);
+    await localPage.bringToFront();
+    try {
+      assert.equal(await localPage.evaluate(() => globalThis.crossOriginIsolated), false, 'file test starts outside the prior isolated context');
+      await localPage.waitForSelector('.frosted-background-ready', { timeout: 15000 });
+      const localFrame = localPage.frames().find(value => value.url().includes(playerName));
+      assert.ok(localFrame, 'local player document exists');
+      await localFrame.waitForFunction(() => document.querySelector('video').readyState >= 2 && !document.querySelector('video').paused, undefined, { timeout: 10000 });
+      assert.equal(await localFrame.locator('video').evaluate(el => getComputedStyle(el).objectFit), 'fill');
+      assert.match(await localFrame.locator('video').evaluate(el => el.currentSrc), /^blob:/, 'opaque local origins can initialize and decode the player too');
+    } catch (error) {
+      const frames = await Promise.all(localPage.frames().map(async frame => {
+        try {
+          return await frame.evaluate(() => {
+            const video = document.querySelector('video');
+            return {
+              protocol: location.protocol, origin: location.origin, urlOrigin: new URL(location.href).origin,
+              isolated: globalThis.crossOriginIsolated, focused: document.hasFocus(), hidden: document.hidden,
+              state: document.querySelector('.frosted-background-layer')?.dataset.state,
+              video: video ? { readyState: video.readyState, networkState: video.networkState, error: video.error?.message, errorCode: video.error?.code, sourceProtocol: video.currentSrc.split(':')[0], paused: video.paused, width: video.videoWidth } : null,
+              messages: window.__localPlayerMessages, csp: window.__localCspViolations,
+            };
+          });
+        } catch (inspectionError) { return { inspectionError: inspectionError.message }; }
+      }));
+      assert.fail(`${error.message}\nLocal player diagnostics: ${JSON.stringify({ browser: await browser.version(), platform: process.platform, events: localDiagnostics, frames })}`);
+    } finally { await localPage.close(); }
     assert.deepEqual(pageErrors, [], 'renderer has no uncaught errors');
   } finally {
     if (browser) await browser.close();
