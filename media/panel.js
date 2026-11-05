@@ -56,10 +56,16 @@
   let selectedRegionId = '';
   let drawingTool = 'select';
   let drawing = null;
+  let regionDrag = null;
+  let drawingErrorKey = null;
   let activePointer = null;
+  let activeTemplate = '';
+  let templateSignature = '';
   let keyboardCursor = [0.5, 0.5];
   let showKeyboardCursor = false;
   const regionKeys = ['blur', 'opacity', 'tintOpacity', 'brightness', 'saturation'];
+  const regionPropertyKeys = [...regionKeys, 'feather'];
+  const regionRanges = { ...ranges, feather: [0, 0.3] };
   const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 
   function persistDraft() {
@@ -92,7 +98,7 @@
   }
 
   function renderControls() {
-    if (!draft.regions.enabled) { regionEditing = false; drawing = null; }
+    if (!draft.regions.enabled) { regionEditing = false; cancelGesture(false); }
     for (const [key, [min, max]] of Object.entries(ranges)) {
       const input = byId(key);
       input.value = String(draft[key]);
@@ -131,6 +137,8 @@
     const selected = selectedRegion();
     byId('regions-enabled').checked = draft.regions.enabled;
     byId('region-count').textContent = `${draft.regions.items.length} / 8`;
+    if (JSON.stringify(draft.regions) !== templateSignature) activeTemplate = '';
+    byId('region-template').value = activeTemplate;
     const select = byId('region-select');
     const signature = JSON.stringify(draft.regions.items.map(region => [region.id, region.name]));
     if (select.dataset.signature !== signature) {
@@ -150,11 +158,19 @@
     byId('region-edit').setAttribute('aria-pressed', String(regionEditing));
     byId('region-drawing-tools').hidden = !regionEditing;
     byId('region-show-effects').checked = regionEffectsVisible;
+    byId('region-drawing-error').hidden = !drawingErrorKey;
+    byId('region-drawing-error').textContent = drawingErrorKey ? translate(drawingErrorKey) : '';
+    byId('region-drawing-help').textContent = translate({
+      select: '拖动选区可移动位置。方向键切换区域，Delete删除。',
+      rect: '拖动绘制矩形。方向键移动，空格选角，Enter完成。',
+      lasso: '按住拖动套索，松开闭合。Esc取消。',
+      polygon: '逐点点击，双击或Enter闭合；Backspace撤点，Esc取消。',
+    }[drawingTool]);
     for (const button of document.querySelectorAll('[data-region-tool]')) button.setAttribute('aria-pressed', String(button.dataset.regionTool === drawingTool));
     if (selected) {
       if (document.activeElement !== byId('region-name')) byId('region-name').value = selected.name;
-      for (const key of regionKeys) {
-        const [min, max] = ranges[key];
+      for (const key of regionPropertyKeys) {
+        const [min, max] = regionRanges[key];
         const input = byId(`region-${key}`);
         input.value = String(selected[key]);
         input.style.setProperty('--range-fill', `${(selected[key] - min) / (max - min) * 100}%`);
@@ -168,13 +184,13 @@
   function renderRegionAvailability() {
     const unavailable = state.busy || !state.media || !regionApi;
     byId('regions-enabled').disabled = unavailable;
-    for (const id of ['region-template', 'region-template-apply', 'region-edit']) byId(id).disabled = unavailable;
+    for (const id of ['region-template', 'region-edit']) byId(id).disabled = unavailable;
     byId('region-clear').disabled = unavailable || !draft.regions.items.length;
     for (const element of byId('region-properties').querySelectorAll('button, input, select')) element.disabled = unavailable || !draft.regions.enabled || !selectedRegion();
     for (const button of document.querySelectorAll('[data-region-tool]')) button.disabled = unavailable || (button.dataset.regionTool !== 'select' && draft.regions.items.length >= 8);
     byId('region-show-effects').disabled = unavailable;
     byId('region-finish').disabled = unavailable || !drawing || drawing.points.length < (drawing.kind === 'rect' ? 2 : 3);
-    byId('region-cancel').disabled = unavailable || !drawing;
+    byId('region-cancel').disabled = unavailable || (!drawing && !regionDrag);
     byId('region-done').disabled = Boolean(state.busy);
     byId('region-overlay').setAttribute('aria-disabled', String(Boolean(unavailable)));
   }
@@ -188,6 +204,8 @@
   function renderRegionOverlay() {
     const overlay = byId('region-overlay');
     overlay.toggleAttribute('hidden', !regionEditing);
+    overlay.dataset.tool = drawingTool;
+    overlay.classList.toggle('is-dragging', Boolean(regionDrag));
     if (!regionEditing) return;
     const bounds = regionBounds();
     overlay.setAttribute('viewBox', `0 0 ${byId('preview').clientWidth} ${byId('preview').clientHeight}`);
@@ -199,13 +217,17 @@
     const pointsText = points => points.map(([x, y]) => `${bounds.x + x * bounds.width},${bounds.y + y * bounds.height}`).join(' ');
     const children = [svg('rect', { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, class: 'source-outline' })];
     for (const region of draft.regions.items) {
-      const polygon = svg('polygon', { points: pointsText(region.points), 'data-region-id': region.id, class: region.id === selectedRegionId ? 'is-selected' : '' });
+      const points = regionDrag?.id === region.id ? regionDrag.currentPoints : region.points;
+      const polygon = svg('polygon', { points: pointsText(points), 'data-region-id': region.id, class: region.id === selectedRegionId ? 'is-selected' : '' });
       const title = svg('title', {}); title.textContent = region.name; polygon.append(title);
       children.push(polygon);
     }
     if (drawing) {
-      const points = drawing.kind === 'rect' ? rectanglePoints(drawing.points[0], drawing.points.at(-1)) : drawing.points;
-      children.push(svg('polyline', { points: pointsText(points.concat(points.length > 2 ? [points[0]] : [])), class: 'drawing-shape' }));
+      const points = drawing.kind === 'rect' ? rectanglePoints(drawing.points[0], drawing.points.at(-1)) : drawing.points.concat(drawing.hover ? [drawing.hover] : []);
+      children.push(svg('polyline', { points: pointsText(drawing.kind === 'rect' ? [...points, points[0]] : points), class: 'drawing-shape' }));
+      if (drawing.kind === 'polygon') for (const point of drawing.points) children.push(svg('circle', { cx: bounds.x + point[0] * bounds.width, cy: bounds.y + point[1] * bounds.height, r: 2.5, class: 'drawing-vertex' }));
+      const cursor = drawing.hover || drawing.points.at(-1);
+      if (cursor) children.push(svg('circle', { cx: bounds.x + cursor[0] * bounds.width, cy: bounds.y + cursor[1] * bounds.height, r: 3, class: 'drawing-cursor' }));
     }
     if (showKeyboardCursor) {
       const x = bounds.x + keyboardCursor[0] * bounds.width, y = bounds.y + keyboardCursor[1] * bounds.height;
@@ -215,17 +237,18 @@
     renderRegionAvailability();
   }
 
-  function updateSelectedRegion(values) {
-    if (!selectedRegion()) return;
-    draft.regions = normalizeRegions({ ...draft.regions, items: draft.regions.items.map(region => region.id === selectedRegionId ? { ...region, ...values } : region) });
+  function updateRegion(id, values) {
+    if (!draft.regions.items.some(region => region.id === id)) return;
+    draft.regions = normalizeRegions({ ...draft.regions, items: draft.regions.items.map(region => region.id === id ? { ...region, ...values } : region) });
     changed();
   }
+  function updateSelectedRegion(values) { updateRegion(selectedRegionId, values); }
 
   function addRegion(points, name) {
     if (draft.regions.items.length >= 8) return false;
     const id = `r-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
     const effects = Object.fromEntries(regionKeys.map(key => [key, draft[key]]));
-    const next = normalizeRegions({ enabled: true, items: [...draft.regions.items, { id, name: name || translate('区域 {number}', { number: draft.regions.items.length + 1 }), points, ...effects }] });
+    const next = normalizeRegions({ enabled: true, items: [...draft.regions.items, { id, name: name || translate('区域 {number}', { number: draft.regions.items.length + 1 }), points, ...effects, feather: 0.06 }] });
     if (next.items.length === draft.regions.items.length) return false;
     draft.regions = next;
     selectedRegionId = id;
@@ -233,16 +256,9 @@
     return true;
   }
 
-  function finishDrawing() {
-    if (!drawing) return;
-    const points = drawing.kind === 'rect' ? rectanglePoints(drawing.points[0], drawing.points.at(-1)) : drawing.points;
-    if (points.length >= 3 && addRegion(points)) { drawing = null; drawingTool = 'select'; }
-    renderRegionControls();
-  }
-
   function setRegionEditing(value) {
     regionEditing = Boolean(value && state.media && regionApi);
-    drawing = null; activePointer = null; showKeyboardCursor = false;
+    cancelGesture(false); drawingErrorKey = null;
     if (regionEditing && !draft.regions.enabled) { draft.regions = { ...draft.regions, enabled: true }; changed(); }
     else renderControls();
     if (regionEditing) byId('preview').scrollIntoView({ block: 'start' });
@@ -252,6 +268,7 @@
     const rect = (name, left, top, right, bottom, clear = false) => ({
       id: `template-${name}`, name: translate(name), points: rectanglePoints([left, top], [right, bottom]),
       ...Object.fromEntries(regionKeys.map(key => [key, draft[key]])),
+      feather: 0.06,
       ...(clear ? { blur: 0, opacity: 1, tintOpacity: 0 } : { blur: Math.max(14, draft.blur) }),
     });
     const templates = {
@@ -261,13 +278,19 @@
       grid: () => [rect('左上', 0, 0, 0.5, 0.5, true), rect('右上', 0.5, 0, 1, 0.5), rect('左下', 0, 0.5, 0.5, 1), rect('右下', 0.5, 0.5, 1, 1, true)],
       center: () => [rect('中央', 0.25, 0.2, 0.75, 0.8, true)],
     };
-    const create = templates[byId('region-template').value];
+    const selectedTemplate = byId('region-template').value;
+    const create = templates[selectedTemplate];
     if (!create) return;
     const items = create().map((region, index) => ({ ...region, id: `template-${index + 1}` }));
     draft.regions = normalizeRegions({ enabled: true, items });
+    activeTemplate = selectedTemplate;
+    templateSignature = JSON.stringify(draft.regions);
     selectedRegionId = draft.regions.items[0]?.id || '';
-    drawing = null;
+    cancelGesture(false); drawingErrorKey = null;
+    drawingTool = 'select';
+    regionEditing = true;
     changed();
+    byId('preview').scrollIntoView({ block: 'nearest' });
   }
 
   function syncPlayback() {
@@ -290,6 +313,7 @@
   function renderPreview() {
     byId('preview').style.backgroundColor = 'var(--vscode-editor-background, #111923)';
     byId('preview').classList.toggle('is-region-editing', regionEditing);
+    byId('preview').classList.toggle('show-region-effects', regionEffectsVisible);
     const mediaReady = currentMedia && !mediaFailed && (currentMedia.tagName === 'VIDEO' ? currentMedia.readyState >= 2 : currentMedia.complete && currentMedia.naturalWidth > 0);
     const useCanvas = Boolean(mediaReady && regionApi && draft.regions.enabled && draft.regions.items.length && (!regionEditing || regionEffectsVisible));
     byId('region-canvas').hidden = !useCanvas;
@@ -308,7 +332,7 @@
         compositor.update({
           ...draft, blur: draft.blur * 0.34,
           fit: regionEditing ? 'contain' : draft.fit, position: regionEditing ? 'center center' : draft.position,
-          regions: { ...draft.regions, items: draft.regions.items.map(region => ({ ...region, blur: region.blur * 0.34 })) },
+          regions: { ...draft.regions, items: draft.regions.items.map(region => ({ ...region, blur: region.blur * 0.34, points: regionDrag?.id === region.id ? regionDrag.currentPoints : region.points })) },
           tintColor: getComputedStyle(byId('preview')).backgroundColor,
         });
       }
@@ -333,7 +357,7 @@
     byId('region-canvas').width = 1; byId('region-canvas').height = 1;
     byId('region-canvas').hidden = true;
     mediaFailed = false;
-    drawing = null;
+    cancelGesture(false); drawingErrorKey = null;
     if (!valid) regionEditing = false;
     videoReady = false;
     if (currentMedia?.tagName === 'VIDEO') { currentMedia.pause(); currentMedia.removeAttribute('src'); currentMedia.load(); }
@@ -359,6 +383,7 @@
     }
     element.addEventListener('error', () => {
       if (element !== currentMedia) return;
+      cancelGesture(false);
       mediaFailed = true;
       previewErrorKey = media.kind === 'video' ? '此视频无法预览，请尝试 WebM 格式。' : '无法读取预览，请重新选择图片。';
       byId('preview-error').textContent = translate(previewErrorKey);
@@ -448,11 +473,13 @@
 
   function sendAction(message) {
     if (state.busy) return;
+    cancelGesture(false);
     // Keep a queued change while the picker is open: if choosing is canceled,
     // it still belongs to the existing background. A successful choice returns
     // matching config and clears the queue without a duplicate write.
     if (['apply', 'restore', 'reload'].includes(message.type)) clearQueuedConfig();
     state.busy = true;
+    renderPreview();
     renderActions();
     vscode.postMessage(message);
   }
@@ -475,28 +502,29 @@
     draft.regions = { ...draft.regions, enabled: event.target.checked };
     changed();
   });
-  byId('region-template-apply').addEventListener('click', useRegionTemplate);
+  byId('region-template').addEventListener('change', useRegionTemplate);
   byId('region-edit').addEventListener('click', () => setRegionEditing(!regionEditing));
   byId('region-done').addEventListener('click', () => setRegionEditing(false));
   byId('region-clear').addEventListener('click', () => {
-    draft.regions = { ...draft.regions, items: [] }; selectedRegionId = ''; drawing = null; changed();
+    draft.regions = { ...draft.regions, items: [] }; selectedRegionId = ''; cancelGesture(false); changed();
   });
-  byId('region-select').addEventListener('change', event => { selectedRegionId = event.target.value; renderRegionControls(); });
+  byId('region-select').addEventListener('change', event => { cancelGesture(false); selectedRegionId = event.target.value; renderPreview(); renderRegionControls(); });
   byId('region-name').addEventListener('input', event => updateSelectedRegion({ name: event.target.value }));
-  for (const key of regionKeys) byId(`region-${key}`).addEventListener('input', event => updateSelectedRegion({ [key]: Number(event.target.value) }));
+  for (const key of regionPropertyKeys) byId(`region-${key}`).addEventListener('input', event => updateSelectedRegion({ [key]: Number(event.target.value) }));
   byId('region-sharp').addEventListener('click', () => updateSelectedRegion({ blur: 0 }));
   function deleteSelectedRegion() {
     if (state.busy || !selectedRegion()) return;
+    cancelGesture(false);
     draft.regions = { ...draft.regions, items: draft.regions.items.filter(region => region.id !== selectedRegionId) };
     selectedRegionId = ''; changed();
   }
   byId('region-delete').addEventListener('click', deleteSelectedRegion);
   byId('region-show-effects').addEventListener('change', event => { regionEffectsVisible = event.target.checked; renderPreview(); });
   for (const button of document.querySelectorAll('[data-region-tool]')) button.addEventListener('click', () => {
-    drawingTool = button.dataset.regionTool; drawing = null; showKeyboardCursor = false; renderRegionControls();
+    cancelGesture(false); drawingErrorKey = null; drawingTool = button.dataset.regionTool; renderPreview(); renderRegionControls();
   });
   byId('region-finish').addEventListener('click', finishDrawing);
-  byId('region-cancel').addEventListener('click', () => { drawing = null; renderRegionControls(); });
+  byId('region-cancel').addEventListener('click', () => { drawingErrorKey = null; cancelGesture(); });
 
   function sourcePoint(event, clamp = false) {
     const rect = byId('region-overlay').getBoundingClientRect();
@@ -508,84 +536,211 @@
     return [Math.max(0, Math.min(1, x)), Math.max(0, Math.min(1, y))];
   }
   const overlay = byId('region-overlay');
-  function appendFreehandPoint(point, minimumDistance = 0.006) {
-    if (!drawing || drawing.kind !== 'polygon') return;
-    const last = drawing.points.at(-1);
-    if (last && Math.hypot(point[0] - last[0], point[1] - last[1]) <= minimumDistance) return;
-    // Keep sampling the entire gesture. Compact older vertices when full so a
-    // long lasso does not stop halfway and close with an unintended chord.
-    if (drawing.points.length >= 64) drawing.points = drawing.points.filter((_, index) => index % 2 === 0);
+  function releasePointer() {
+    const id = activePointer;
+    activePointer = null;
+    if (id !== null && overlay.hasPointerCapture(id)) overlay.releasePointerCapture(id);
+  }
+  function cancelGesture(render = true) {
+    releasePointer(); drawing = null; regionDrag = null; showKeyboardCursor = false;
+    if (render) { renderPreview(); renderRegionControls(); }
+  }
+  function pointDistance(a, b, bounds = regionBounds()) {
+    return Math.hypot((a[0] - b[0]) * bounds.width, (a[1] - b[1]) * bounds.height);
+  }
+  function segmentDistance(point, start, end) {
+    const dx = end[0] - start[0], dy = end[1] - start[1];
+    const amount = dx || dy ? Math.max(0, Math.min(1, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / (dx * dx + dy * dy))) : 0;
+    return Math.hypot(point[0] - start[0] - amount * dx, point[1] - start[1] - amount * dy);
+  }
+  function simplifyLasso(points, bounds) {
+    const pixels = points.map(([x, y]) => [x * bounds.width, y * bounds.height]);
+    if (pixels.length < 3) return null;
+    const closed = [...pixels, pixels[0]];
+    const keep = new Set([0, closed.length - 1]);
+    const pending = [[0, closed.length - 1]];
+    while (pending.length) {
+      const [start, end] = pending.pop();
+      let farthest = -1, distance = 0.8;
+      for (let index = start + 1; index < end; index++) {
+        const next = segmentDistance(closed[index], closed[start], closed[end]);
+        if (next > distance) { distance = next; farthest = index; }
+      }
+      if (farthest >= 0) { keep.add(farthest); pending.push([start, farthest], [farthest, end]); }
+    }
+    let result = [...keep].sort((a, b) => a - b).slice(0, -1).map(index => closed[index]);
+    if (result.length > 64) {
+      // Equal arc-length samples distribute the budget across the whole stroke,
+      // instead of repeatedly removing vertices from its beginning.
+      const lengths = closed.slice(1).map((point, index) => Math.hypot(point[0] - closed[index][0], point[1] - closed[index][1]));
+      const total = lengths.reduce((sum, length) => sum + length, 0);
+      result = []; let segment = 0, traversed = 0;
+      for (let index = 0; index < 64; index++) {
+        const target = total * index / 64;
+        while (segment < lengths.length - 1 && traversed + lengths[segment] < target) traversed += lengths[segment++];
+        const fraction = lengths[segment] ? (target - traversed) / lengths[segment] : 0;
+        result.push(closed[segment].map((value, axis) => value + (closed[segment + 1][axis] - value) * fraction));
+      }
+    }
+    // Reject exceptionally complex contours instead of silently changing them.
+    if (pixels.some(point => Math.min(...result.map((start, index) => segmentDistance(point, start, result[(index + 1) % result.length]))) > 2)) return null;
+    return result.map(([x, y]) => [x / bounds.width, y / bounds.height]);
+  }
+  function shapeIsLargeEnough(points, bounds) {
+    if (points.length < 3) return false;
+    const x = points.map(point => point[0]), y = points.map(point => point[1]);
+    const area = Math.abs(points.reduce((sum, point, index) => { const next = points[(index + 1) % points.length]; return sum + point[0] * next[1] - next[0] * point[1]; }, 0)) * bounds.width * bounds.height / 2;
+    return (Math.max(...x) - Math.min(...x)) * bounds.width >= 4 && (Math.max(...y) - Math.min(...y)) * bounds.height >= 4 && area >= 16;
+  }
+  function finishDrawing() {
+    if (state.busy || !drawing) return;
+    if (drawing.kind === 'polygon' && drawing.points.length < 3) {
+      drawingErrorKey = '多边形至少需要3个点。'; renderRegionControls(); return;
+    }
+    const kind = drawing.kind;
+    let points = kind === 'rect' ? rectanglePoints(drawing.points[0], drawing.points.at(-1)) : drawing.points;
+    const bounds = regionBounds();
+    if (!shapeIsLargeEnough(points, bounds)) {
+      cancelGesture(false); drawingErrorKey = '选区太小，请重新绘制更大的区域。'; renderRegionControls(); return;
+    }
+    if (kind === 'lasso') points = drawing.tooComplex ? null : simplifyLasso(points, bounds);
+    if (!points) {
+      cancelGesture(false); drawingErrorKey = '轮廓过于复杂，请拆成更简单的区域。'; renderRegionControls(); return;
+    }
+    if (!shapeIsLargeEnough(points, bounds)) {
+      cancelGesture(false); drawingErrorKey = '选区太小，请重新绘制更大的区域。'; renderRegionControls(); return;
+    }
+    cancelGesture(false); drawingErrorKey = null;
+    if (addRegion(points)) drawingTool = 'select';
+    renderRegionControls();
+  }
+  function appendLassoPoint(point, minimumDistance = 0.75) {
+    if (!drawing || drawing.kind !== 'lasso') return;
+    if (pointDistance(point, drawing.points.at(-1)) < minimumDistance) return;
+    if (drawing.points.length >= 8192) { drawing.tooComplex = true; return; }
     drawing.points.push(point);
   }
+  function appendPolygonPoint(point) {
+    if (!drawing) drawing = { kind: 'polygon', points: [], hover: null };
+    if (drawing.points.length && pointDistance(point, drawing.points.at(-1)) < 1) return;
+    if (drawing.points.length >= 64) { drawingErrorKey = '最多64个顶点，请完成选区或撤销一个点。'; return; }
+    drawing.points.push([...point]); drawing.hover = null; drawingErrorKey = null;
+  }
+  function moveRegion(point) {
+    if (!regionDrag) return;
+    const x = regionDrag.points.map(item => item[0]), y = regionDrag.points.map(item => item[1]);
+    const dx = Math.max(-Math.min(...x), Math.min(1 - Math.max(...x), point[0] - regionDrag.start[0]));
+    const dy = Math.max(-Math.min(...y), Math.min(1 - Math.max(...y), point[1] - regionDrag.start[1]));
+    regionDrag.currentPoints = regionDrag.points.map(([px, py]) => [px + dx, py + dy]);
+    regionDrag.moved = Math.abs(dx) + Math.abs(dy) > 0.00001;
+    renderPreview();
+  }
   overlay.addEventListener('pointerdown', event => {
-    if (state.busy || !regionEditing || event.button !== 0) return;
+    if (state.busy || !regionEditing || event.button !== 0 || event.isPrimary === false || activePointer !== null) return;
     const point = sourcePoint(event);
     if (!point) return;
     overlay.focus({ preventScroll: true });
     showKeyboardCursor = false;
     if (drawingTool === 'select') {
       const polygon = event.target.closest('[data-region-id]');
-      if (polygon) { selectedRegionId = polygon.getAttribute('data-region-id'); renderRegionControls(); }
+      if (polygon) {
+        selectedRegionId = polygon.getAttribute('data-region-id');
+        const region = selectedRegion();
+        regionDrag = { id: region.id, start: point, points: clone(region.points), currentPoints: clone(region.points), moved: false };
+        activePointer = event.pointerId; overlay.setPointerCapture(event.pointerId);
+        drawingErrorKey = null; renderRegionControls(); event.preventDefault();
+      }
       return;
     }
     if (draft.regions.items.length >= 8) return;
     event.preventDefault();
     activePointer = event.pointerId;
     overlay.setPointerCapture(event.pointerId);
+    drawingErrorKey = null;
     if (drawingTool === 'rect') drawing = { kind: 'rect', points: [point, point] };
-    else if (!drawing) drawing = { kind: 'polygon', points: [point] };
-    else if (drawing.points.length < 64) drawing.points.push(point);
-    renderRegionOverlay();
+    else if (drawingTool === 'lasso') drawing = { kind: 'lasso', points: [point] };
+    else appendPolygonPoint(point);
+    renderRegionControls();
   });
   overlay.addEventListener('pointermove', event => {
-    if (activePointer !== event.pointerId || !drawing) return;
+    if (state.busy || !regionEditing || event.isPrimary === false || (activePointer !== null && activePointer !== event.pointerId)) return;
     const point = sourcePoint(event, true);
     if (!point) return;
-    if (drawing.kind === 'rect') drawing.points[1] = point;
-    else appendFreehandPoint(point);
+    if (regionDrag && activePointer === event.pointerId) { moveRegion(point); return; }
+    if (!drawing) return;
+    if (drawing.kind === 'polygon') drawing.hover = point;
+    else if (activePointer !== event.pointerId) return;
+    else if (drawing.kind === 'rect') drawing.points[1] = point;
+    else appendLassoPoint(point);
     renderRegionOverlay();
   });
   overlay.addEventListener('pointerup', event => {
     if (activePointer !== event.pointerId) return;
+    if (state.busy || !regionEditing) { cancelGesture(); return; }
     const point = sourcePoint(event, true);
+    if (regionDrag) {
+      if (point) moveRegion(point);
+      const { id, moved, currentPoints: points } = regionDrag;
+      cancelGesture(false);
+      if (moved) updateRegion(id, { points });
+      else { renderPreview(); renderRegionControls(); }
+      return;
+    }
     if (point && drawing?.kind === 'rect') drawing.points[1] = point;
-    else if (point) appendFreehandPoint(point, 0.0001);
-    activePointer = null;
-    if (overlay.hasPointerCapture(event.pointerId)) overlay.releasePointerCapture(event.pointerId);
-    if (drawing?.kind === 'rect' || drawing?.points.length >= 3) finishDrawing();
+    else if (point && drawing?.kind === 'lasso') appendLassoPoint(point, 0.1);
+    releasePointer();
+    if (drawing?.kind === 'rect' || drawing?.kind === 'lasso') finishDrawing();
+    else renderRegionControls();
   });
-  overlay.addEventListener('pointercancel', () => { activePointer = null; drawing = null; renderRegionControls(); });
+  overlay.addEventListener('dblclick', event => {
+    if (state.busy || !regionEditing || drawingTool !== 'polygon') return;
+    event.preventDefault(); releasePointer(); finishDrawing();
+  });
+  for (const name of ['pointercancel', 'lostpointercapture']) overlay.addEventListener(name, event => { if (activePointer === event.pointerId) cancelGesture(); });
+  overlay.addEventListener('pointerleave', () => { if (activePointer === null && drawing?.kind === 'polygon') { drawing.hover = null; renderRegionOverlay(); } });
   overlay.addEventListener('keydown', event => {
     if (state.busy || !regionEditing) return;
-    if (event.key === 'Escape') { event.preventDefault(); drawing = null; renderRegionControls(); return; }
+    if (event.key === 'Escape') { event.preventDefault(); drawingErrorKey = null; cancelGesture(); return; }
+    if (event.key === 'Backspace' && drawing?.kind === 'polygon') {
+      event.preventDefault(); drawing.points.pop(); drawing.hover = null; drawingErrorKey = null;
+      if (!drawing.points.length) drawing = null;
+      renderRegionControls(); return;
+    }
     if (event.key === 'Delete' && drawingTool === 'select') { event.preventDefault(); deleteSelectedRegion(); return; }
     if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) {
       event.preventDefault();
       if (drawingTool === 'select') {
+        cancelGesture(false);
         const items = draft.regions.items;
         const direction = ['ArrowLeft', 'ArrowUp'].includes(event.key) ? -1 : 1;
         if (items.length) selectedRegionId = items[(Math.max(0, items.findIndex(region => region.id === selectedRegionId)) + direction + items.length) % items.length].id;
-        renderRegionControls(); return;
+        renderPreview(); renderRegionControls(); return;
       }
       const step = event.shiftKey ? 0.1 : 0.02;
       const axis = ['ArrowLeft', 'ArrowRight'].includes(event.key) ? 0 : 1;
       keyboardCursor[axis] = Math.max(0, Math.min(1, keyboardCursor[axis] + (['ArrowLeft', 'ArrowUp'].includes(event.key) ? -step : step)));
       showKeyboardCursor = true;
       if (drawing?.kind === 'rect') drawing.points[1] = [...keyboardCursor];
+      else if (drawing?.kind === 'polygon') drawing.hover = [...keyboardCursor];
       renderRegionOverlay(); return;
     }
-    if ((event.key === ' ' || event.key === 'Enter') && drawingTool !== 'select' && draft.regions.items.length < 8) {
+    if ((event.key === ' ' || event.key === 'Enter') && ['rect', 'polygon'].includes(drawingTool) && draft.regions.items.length < 8) {
       event.preventDefault(); showKeyboardCursor = true;
       if (event.key === 'Enter' && drawing) { finishDrawing(); return; }
       if (drawingTool === 'rect') {
         if (drawing) finishDrawing();
         else drawing = { kind: 'rect', points: [[...keyboardCursor], [...keyboardCursor]] };
-      } else if (!drawing) drawing = { kind: 'polygon', points: [[...keyboardCursor]] };
-      else if (drawing.points.length < 64) drawing.points.push([...keyboardCursor]);
-      renderRegionOverlay();
+      } else appendPolygonPoint(keyboardCursor);
+      renderRegionControls();
     }
   });
-  new ResizeObserver(renderRegionOverlay).observe(byId('preview'));
+  let previewSize = [byId('preview').clientWidth, byId('preview').clientHeight];
+  new ResizeObserver(() => {
+    const next = [byId('preview').clientWidth, byId('preview').clientHeight];
+    if (next.some((value, index) => value !== previewSize[index])) cancelGesture(false);
+    previewSize = next;
+    renderPreview();
+  }).observe(byId('preview'));
   const themeObserver = new MutationObserver(renderPreview);
   for (const element of [document.documentElement, document.body]) themeObserver.observe(element, { attributes: true, attributeFilter: ['class', 'style'] });
   byId('choose-image').addEventListener('click', () => sendAction({ type: 'chooseMedia', kind: 'image', config: clone(draft) }));
@@ -597,7 +752,7 @@
   byId('restore').addEventListener('click', () => sendAction({ type: 'restore' }));
   // Closing is a view-only action: do not acquire the operation lock or modify
   // saved drafts, the selected media, or the background's enabled state.
-  byId('close-panel').addEventListener('click', () => vscode.postMessage({ type: 'closePanel' }));
+  byId('close-panel').addEventListener('click', () => { cancelGesture(); vscode.postMessage({ type: 'closePanel' }); });
   byId('language').addEventListener('change', event => {
     language = normalizeLanguage(event.target.value);
     renderLanguage();
@@ -613,6 +768,7 @@
     // Ignore an older acknowledgement snapshot rather than rolling controls
     // back after a newer request has already completed.
     if (ack && ack < lastLiveAck) return;
+    if (message.busy) cancelGesture(false);
     lastLiveAck = Math.max(lastLiveAck, ack);
     requestSequence = Math.max(requestSequence, ack);
     const request = liveRequest;
@@ -623,9 +779,11 @@
     language = normalizeLanguage(message.language);
     applied = normalize(message.config);
     defaults = normalize(message.defaults);
+    const shouldReplaceDraft = canReset || (!dirty && !request && queuedRevision === null);
+    if ((drawing || regionDrag) && shouldReplaceDraft && JSON.stringify(applied.regions) !== JSON.stringify(draft.regions)) cancelGesture(false);
     // Host settings may change outside this panel. Follow them whenever there
     // is no unsaved local draft, while preserving deliberate local edits.
-    if (canReset || (!dirty && !request && queuedRevision === null)) draft = { ...applied };
+    if (shouldReplaceDraft) draft = { ...applied };
     if (acknowledged) liveRequest = null;
     state = {
       config: applied, enabled: Boolean(message.enabled), media: message.media || null,
@@ -640,9 +798,9 @@
     flushLiveConfig();
   });
   reducedMotion.addEventListener('change', syncPlayback);
-  document.addEventListener('visibilitychange', syncPlayback);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) cancelGesture(); syncPlayback(); });
   window.addEventListener('focus', syncPlayback);
-  window.addEventListener('blur', syncPlayback);
+  window.addEventListener('blur', () => { cancelGesture(); syncPlayback(); });
   window.addEventListener('pagehide', () => { if (debounceTimer) clearTimeout(debounceTimer); if (currentMedia?.tagName === 'VIDEO') currentMedia.pause(); });
   renderLanguage();
   vscode.postMessage({ type: 'ready' });
