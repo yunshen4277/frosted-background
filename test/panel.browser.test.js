@@ -14,7 +14,7 @@ test('panel localization catalog covers markup and defaults to English without a
   assert.equal(normalizeLanguage('es'), 'es');
   assert.equal(normalizeLanguage('zh-CN'), 'zh-CN');
   for (const value of [undefined, null, 'fr', 'EN', {}, '__proto__']) assert.equal(normalizeLanguage(value), 'en');
-  const options = { cspSource: 'file:', nonce: 'test', scriptUri: 'panel.js', styleUri: 'panel.css', i18nUri: 'i18n.js' };
+  const options = { cspSource: 'file:', nonce: 'test', scriptUri: 'panel.js', styleUri: 'panel.css', i18nUri: 'i18n.js', regionsUri: 'regions.js' };
   const html = renderPanelHtml(options);
   assert.match(html, /<html lang="en">/);
   assert.match(html, /<title[^>]*>Frosted Background<\/title>/);
@@ -48,6 +48,7 @@ test('live controls coalesce edits, preserve newer drafts across acknowledgement
     scriptUri: pathToFileURL(path.resolve(__dirname, '../media/panel.js')).href,
     styleUri: pathToFileURL(path.resolve(__dirname, '../media/panel.css')).href,
     i18nUri: pathToFileURL(path.resolve(__dirname, '../media/i18n.js')).href,
+    regionsUri: pathToFileURL(path.resolve(__dirname, '../media/regions.js')).href,
   }));
   let browser;
   try {
@@ -114,7 +115,7 @@ test('live controls coalesce edits, preserve newer drafts across acknowledgement
     assert.equal(await page.locator('#blur').inputValue(), '31', 'a repeated older acknowledgement cannot reset the in-flight draft');
     await sendState({ liveAck: second.requestId, config: second.config, resetDraft: true });
     assert.equal(await page.evaluate(() => window.__saved.dirty), false);
-    assert.equal(await page.locator('#draft-label').textContent(), dictionaries['zh-CN']['效果调整会自动生效，无需点击应用。']);
+    assert.equal(await page.locator('#draft-label').isVisible(), false, 'idle live state has no repeated success instructions');
     await sendState({ liveAck: first.requestId, config: first.config, resetDraft: true });
     assert.equal(await page.locator('#blur').inputValue(), '31', 'late snapshots cannot roll back an already-acknowledged draft');
     await sendState({ liveAck: second.requestId, config: second.config, resetDraft: false });
@@ -192,6 +193,221 @@ test('live controls coalesce edits, preserve newer drafts across acknowledgement
   }
 });
 
+test('regions preview independent effects, keep source coordinates, and support templates, drawing and video', {
+  skip: !process.env.PLAYWRIGHT_MODULE,
+  timeout: 45000,
+}, async () => {
+  const { chromium } = require(process.env.PLAYWRIGHT_MODULE);
+  const executablePath = process.env.BROWSER_EXECUTABLE || ['C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'].find(value => fs.existsSync(value));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'frosted-regions-panel-'));
+  const fixtureFile = path.join(directory, 'regions.html');
+  fs.writeFileSync(fixtureFile, renderPanelHtml({
+    cspSource: 'file:', nonce: 'regions-test',
+    scriptUri: pathToFileURL(path.resolve(__dirname, '../media/panel.js')).href,
+    styleUri: pathToFileURL(path.resolve(__dirname, '../media/panel.css')).href,
+    i18nUri: pathToFileURL(path.resolve(__dirname, '../media/i18n.js')).href,
+    regionsUri: pathToFileURL(path.resolve(__dirname, '../media/regions.js')).href,
+  }));
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true, executablePath });
+    const page = await browser.newPage({ viewport: { width: 280, height: 900 } });
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.addInitScript(() => {
+      window.__messages = []; window.__violations = [];
+      window.acquireVsCodeApi = () => ({ getState: () => window.__saved, setState: value => { window.__saved = value; }, postMessage: message => window.__messages.push(message) });
+      document.addEventListener('securitypolicyviolation', event => window.__violations.push(event.violatedDirective));
+    });
+    await page.goto(pathToFileURL(fixtureFile).href);
+    await page.clock.install({ time: new Date('2030-01-01T00:00:00Z') });
+    await page.clock.pauseAt(new Date('2030-01-01T00:01:00Z'));
+    const imageUri = await page.evaluate(() => {
+      const canvas = document.createElement('canvas'); canvas.width = 320; canvas.height = 180;
+      const context = canvas.getContext('2d');
+      for (let x = 0; x < 320; x += 4) { context.fillStyle = (x / 4) % 2 ? '#fff' : '#000'; context.fillRect(x, 0, 4, 180); }
+      return canvas.toDataURL();
+    });
+    let state = { type: 'state', language: 'en', config: { ...DEFAULTS, fit: 'fill', blur: 24, opacity: 1, tintOpacity: 0 }, defaults: DEFAULTS, media: { kind: 'image', name: 'stripes.png', uri: imageUri }, enabled: true, busy: false, needsReload: false, liveEnabled: true, liveApplying: false, liveAck: 0, resetDraft: false, error: null, notice: null, update: { currentVersion: '0.8.0', status: 'idle', mode: 'automatic', message: 'Already up to date.' } };
+    const sendState = async changes => {
+      state = { ...state, resetDraft: false, ...changes };
+      await page.evaluate(message => window.dispatchEvent(new MessageEvent('message', { data: message })), state);
+    };
+    const acknowledge = async () => {
+      await page.clock.runFor(250);
+      const message = await page.evaluate(() => window.__messages.filter(item => item.type === 'liveConfig').at(-1));
+      assert.ok(message, 'regional edits use the live config channel');
+      await sendState({ config: message.config, liveAck: message.requestId, resetDraft: true });
+      return message.config;
+    };
+    await sendState();
+    await page.locator('#preview-media img').evaluate(image => image.decode());
+    assert.equal(await page.locator('#notice').isVisible(), false, 'routine background success is silent');
+    assert.equal(await page.locator('#draft-label').isVisible(), false);
+    assert.equal(await page.locator('.panel-footnote').count(), 0);
+    assert.equal(await page.locator('#update-message').isVisible(), false, 'idle updater feedback is quiet');
+    await sendState({ notice: 'Effects applied, but preferences could not be saved.' });
+    assert.equal(await page.locator('#notice').isVisible(), true, 'a useful settings-save warning remains visible without reload');
+    await sendState({ notice: null });
+    await page.locator('#regions-section summary').click();
+    await page.locator('#region-template-apply').click();
+    const initial = await acknowledge();
+    assert.equal(initial.regions.enabled, true);
+    assert.equal(initial.regions.items.length, 2);
+    assert.equal(await page.evaluate(() => window.__saved.dirty), false, 'structurally equal acknowledged region objects are clean');
+    assert.equal(await page.locator('#region-canvas').isVisible(), true);
+    const contrast = await page.locator('#region-canvas').evaluate(canvas => {
+      const context = canvas.getContext('2d');
+      const variation = (start, end) => {
+        const values = []; for (let x = Math.floor(start * canvas.width); x < end * canvas.width; x++) values.push(context.getImageData(x, Math.floor(canvas.height * 0.6), 1, 1).data[0]);
+        const average = values.reduce((sum, value) => sum + value, 0) / values.length;
+        return Math.sqrt(values.reduce((sum, value) => sum + (value - average) ** 2, 0) / values.length);
+      };
+      return { clear: variation(0.1, 0.4), blurred: variation(0.6, 0.9) };
+    });
+    assert.ok(contrast.clear > 70 && contrast.blurred < 30, `canvas visibly preserves a sharp region beside blur: ${JSON.stringify(contrast)}`);
+    for (const [template, count] of [['horizontal', 2], ['columns', 3], ['grid', 4], ['center', 1]]) {
+      await page.locator('#region-template').selectOption(template);
+      await page.locator('#region-template-apply').click();
+      const config = await acknowledge();
+      assert.equal(config.regions.items.length, count);
+      assert.ok(config.regions.items.every(region => region.points.every(point => point.every(value => value >= 0 && value <= 1))));
+    }
+    await page.locator('#region-name').fill('<b>My focus</b>');
+    await page.locator('#region-name').dispatchEvent('input');
+    for (const [key, value] of Object.entries({ blur: 17, opacity: 0.7, tintOpacity: 0.2, brightness: 1.3, saturation: 0.6 })) {
+      await page.locator(`#region-${key}`).fill(String(value));
+      await page.locator(`#region-${key}`).dispatchEvent('input');
+    }
+    let config = await acknowledge();
+    assert.equal(config.regions.items[0].name, '<b>My focus</b>');
+    assert.equal(config.regions.items[0].blur, 17);
+    assert.equal(config.regions.items[0].opacity, 0.7);
+    assert.equal(config.regions.items[0].tintOpacity, 0.2);
+    assert.equal(config.regions.items[0].brightness, 1.3);
+    assert.equal(config.regions.items[0].saturation, 0.6);
+    assert.equal(await page.locator('#region-select b').count(), 0, 'region names are text, never markup');
+    await page.locator('#region-sharp').click();
+    config = await acknowledge();
+    assert.equal(config.regions.items[0].blur, 0);
+    assert.equal(config.blur, 24, 'regional sliders never overwrite the global effect');
+
+    const portrait = await page.evaluate(() => {
+      const canvas = document.createElement('canvas'); canvas.width = 180; canvas.height = 320;
+      const context = canvas.getContext('2d'); context.fillStyle = '#537a9a'; context.fillRect(0, 0, 180, 320);
+      context.fillStyle = '#f9c760'; context.fillRect(10, 10, 160, 300); return canvas.toDataURL();
+    });
+    await sendState({ config: { ...config, fit: 'cover', regions: { enabled: true, items: [] } }, media: { kind: 'image', name: 'portrait.png', uri: portrait }, resetDraft: true });
+    await page.locator('#preview-media img').evaluate(image => image.decode());
+    await page.locator('#region-edit').click();
+    assert.equal(await page.locator('.preview-code').isVisible(), false);
+    assert.equal(await page.locator('#preview-media img').evaluate(image => getComputedStyle(image).objectFit), 'contain');
+    await page.locator('[data-region-tool="rect"]').click();
+    await page.locator('#region-overlay').scrollIntoViewIfNeeded();
+    async function displayBounds() {
+      return page.locator('#region-overlay').evaluate(svg => {
+        const rect = svg.getBoundingClientRect();
+        const media = document.querySelector('#preview-media > *');
+        const width = media.naturalWidth || media.videoWidth, height = media.naturalHeight || media.videoHeight;
+        const scale = Math.min(rect.width / width, rect.height / height);
+        return { left: rect.left, top: rect.top, x: (rect.width - width * scale) / 2, y: (rect.height - height * scale) / 2, width: width * scale, height: height * scale };
+      });
+    }
+    let bounds = await displayBounds();
+    await page.mouse.move(bounds.left + 3, bounds.top + 30); await page.mouse.down(); await page.mouse.up();
+    assert.equal(await page.evaluate(() => window.__saved.draft.regions.items.length), 0, 'portrait letterbox margins cannot start a region');
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.1, bounds.top + bounds.y + bounds.height * 0.2);
+    await page.mouse.down();
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.9, bounds.top + bounds.y + bounds.height * 0.8, { steps: 8 });
+    await page.mouse.up();
+    config = await acknowledge();
+    const rectangle = config.regions.items[0];
+    assert.ok(Math.abs(rectangle.points[0][0] - 0.1) < 0.01 && Math.abs(rectangle.points[0][1] - 0.2) < 0.01);
+    assert.ok(Math.abs(rectangle.points[2][0] - 0.9) < 0.01 && Math.abs(rectangle.points[2][1] - 0.8) < 0.01);
+    await page.evaluate(() => document.documentElement.style.setProperty('--vscode-editor-background', '#f7f6f4'));
+    assert.deepEqual(await page.locator('#region-canvas').evaluate(canvas => Array.from(canvas.getContext('2d').getImageData(2, Math.floor(canvas.height / 2), 1, 1).data).slice(0, 3)), [247, 246, 244], 'theme changes redraw the canvas tint immediately');
+    await page.evaluate(() => document.documentElement.style.removeProperty('--vscode-editor-background'));
+    await page.setViewportSize({ width: 360, height: 900 });
+    bounds = await displayBounds();
+    const projected = await page.locator('#region-overlay polygon').evaluate(polygon => ({ x: polygon.points.getItem(0).x, y: polygon.points.getItem(0).y }));
+    assert.ok(Math.abs(projected.x - (bounds.x + rectangle.points[0][0] * bounds.width)) < 1);
+    assert.ok(Math.abs(projected.y - (bounds.y + rectangle.points[0][1] * bounds.height)) < 1);
+    assert.deepEqual(await page.evaluate(() => window.__saved.draft.regions.items[0].points), rectangle.points, 'resizing does not alter source anchors');
+
+    await page.locator('[data-region-tool="polygon"]').click();
+    await page.locator('#region-overlay').scrollIntoViewIfNeeded();
+    bounds = await displayBounds();
+    const circlePoint = angle => [bounds.left + bounds.x + bounds.width * (0.5 + 0.4 * Math.cos(angle)), bounds.top + bounds.y + bounds.height * (0.5 + 0.4 * Math.sin(angle))];
+    await page.mouse.move(...circlePoint(0)); await page.mouse.down();
+    for (let index = 1; index <= 130; index++) await page.mouse.move(...circlePoint(index * Math.PI * 2 / 130));
+    await page.mouse.up();
+    config = await acknowledge();
+    const freehand = config.regions.items[1];
+    assert.ok(freehand.points.length >= 8 && freehand.points.length <= 64);
+    assert.ok(Math.min(...freehand.points.map(point => point[0])) < 0.13 && Math.max(...freehand.points.map(point => point[0])) > 0.87);
+    assert.ok(Math.min(...freehand.points.map(point => point[1])) < 0.13 && Math.max(...freehand.points.map(point => point[1])) > 0.87, 'a long lasso preserves the late half of the stroke');
+    await page.locator('[data-region-tool="rect"]').click();
+    await page.locator('#region-overlay').focus();
+    await page.keyboard.press('Space'); await page.keyboard.press('Shift+ArrowRight'); await page.keyboard.press('Shift+ArrowDown'); await page.keyboard.press('Enter');
+    config = await acknowledge();
+    assert.equal(config.regions.items.length, 3, 'a rectangle can be created with the keyboard alone');
+    assert.equal(await page.locator('#region-canvas').isVisible(), true, 'editing can show the actual regional effects');
+    await page.locator('#region-show-effects').uncheck();
+    assert.equal(await page.locator('#region-canvas').isVisible(), false);
+    assert.equal(await page.locator('#preview-media img').evaluate(image => getComputedStyle(image).filter), 'none');
+    await page.locator('#region-show-effects').check();
+    await page.locator('#region-done').click();
+    assert.equal(await page.locator('#region-overlay').isVisible(), false);
+    assert.equal(await page.locator('#preview-media img').evaluate(image => getComputedStyle(image).objectFit), 'cover');
+    await page.locator('input[name="fit"][value="fill"]').check();
+    config = await acknowledge();
+    assert.deepEqual(config.regions.items[0].points, rectangle.points, 'switching cover to fill keeps source coordinates');
+
+    const many = Array.from({ length: 8 }, (_, index) => ({ ...rectangle, id: `limit-${index}`, name: `Area ${index + 1}` }));
+    await sendState({ config: { ...config, regions: { enabled: true, items: many } }, resetDraft: true });
+    await page.locator('#region-edit').click();
+    assert.equal(await page.locator('[data-region-tool="rect"]').isEnabled(), false);
+    assert.equal(await page.locator('#region-limit').isVisible(), true);
+    await page.locator('#region-delete').click();
+    config = await acknowledge();
+    assert.equal(config.regions.items.length, 7);
+    assert.equal(await page.locator('[data-region-tool="rect"]').isEnabled(), true);
+    for (const language of ['zh-CN', 'es', 'en']) {
+      await page.locator('#language').selectOption(language);
+      assert.equal(await page.locator('#region-template-apply').textContent(), dictionaries[language]['套用模板']);
+      assert.equal(await page.locator('#region-overlay').getAttribute('aria-label'), dictionaries[language]['区域绘制画布']);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    }
+    await page.clock.resume();
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    const video = { kind: 'video', name: 'edges.webm', uri: pathToFileURL(path.resolve(__dirname, 'fixtures/edges.webm')).href };
+    await sendState({ media: video, language: 'en' });
+    await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2);
+    await page.locator('video').evaluate(video => { window.__regionVideo = video; });
+    await page.locator('#region-edit').click();
+    await page.locator('#region-edit').click();
+    assert.equal(await page.locator('video').count(), 1, 'regional video preview uses one decoder');
+    assert.equal(await page.locator('video').evaluate(video => video === window.__regionVideo), true, 'opening and closing the editor preserves the media element');
+    await sendState({ media: { kind: 'image', name: 'missing.png', uri: 'data:image/png;base64,AA==' } });
+    await page.waitForFunction(() => !document.querySelector('#preview-error').hidden);
+    assert.equal(await page.locator('#region-canvas').isVisible(), false, 'a failed new media source cannot display the previous canvas bitmap');
+    assert.equal(await page.locator('#region-canvas').evaluate(canvas => canvas.width), 1);
+    await sendState({ media: { kind: 'image', name: 'portrait.png', uri: portrait }, error: 'A real error remains visible.' });
+    await page.locator('#preview-media img').evaluate(image => image.decode());
+    assert.equal(await page.locator('#error').isVisible(), true);
+    await page.setViewportSize({ width: 280, height: 620 });
+    await page.locator('#region-saturation').scrollIntoViewIfNeeded();
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    const sliderBox = await page.locator('#region-saturation').boundingBox(), footerBox = await page.locator('.action-bar').boundingBox();
+    assert.ok(sliderBox.y >= 0 && sliderBox.y + sliderBox.height <= footerBox.y, 'all five regional controls are reachable above the sticky footer');
+    assert.deepEqual(await page.evaluate(() => window.__violations), []);
+    assert.deepEqual(errors, []);
+  } finally {
+    if (browser) await browser.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('sidebar previews drafts, sends explicit actions, and stays usable across widths and themes', {
   skip: !process.env.PLAYWRIGHT_MODULE,
   timeout: 30000,
@@ -208,6 +424,7 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     scriptUri: pathToFileURL(path.resolve(__dirname, '../media/panel.js')).href,
     styleUri: pathToFileURL(path.resolve(__dirname, '../media/panel.css')).href,
     i18nUri: pathToFileURL(path.resolve(__dirname, '../media/i18n.js')).href,
+    regionsUri: pathToFileURL(path.resolve(__dirname, '../media/regions.js')).href,
   }));
   let browser;
   try {
@@ -420,6 +637,7 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
       scriptUri: pathToFileURL(path.resolve(__dirname, '../media/panel.js')).href,
       styleUri: pathToFileURL(path.resolve(__dirname, '../media/panel.css')).href,
       i18nUri: pathToFileURL(path.resolve(__dirname, '../media/i18n.js')).href,
+    regionsUri: pathToFileURL(path.resolve(__dirname, '../media/regions.js')).href,
     }));
     const reopened = await browser.newPage({ viewport: { width: 280, height: 620 } });
     await reopened.addInitScript(saved => {

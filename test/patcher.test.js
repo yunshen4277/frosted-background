@@ -7,6 +7,7 @@ const nativeFs = require('node:fs');
 const crypto = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
+const vm = require('node:vm');
 const patcher = require('../src/patcher');
 const { DEFAULTS } = require('../src/config');
 
@@ -20,6 +21,7 @@ async function fixture(t, variant = 'electron-browser') {
   await fs.writeFile(workbenchPath, ORIGINAL);
   const rendererPath = path.join(appRoot, 'renderer.js');
   const mediaPath = path.join(appRoot, '壁纸 & image.jpg');
+  await fs.writeFile(path.join(appRoot, 'regions.js'), '(function(root) { root.FrostedRegions = { version: 1 }; })(globalThis);');
   await fs.writeFile(rendererPath, '(() => { /* renderer fixture */ })();');
   await fs.writeFile(path.join(appRoot, 'video-player.js'), '(() => { /* video player fixture */ })();');
   await fs.writeFile(mediaPath, Buffer.from([0xff, 0xd8, 0xff, 1, 2, 3, 4]));
@@ -129,7 +131,7 @@ test('video uses an owned standalone player without altering the workbench CSP',
   assert.doesNotMatch(page, /unsafe-eval|srcdoc|https:/);
   const player = /src="\.\/(video-player-[a-f0-9]{64}\.js)"/.exec(page)[1];
   const directory = path.join(path.dirname(data.workbenchPath), patcher.ASSET_DIRECTORY);
-  assert.equal(await fs.readFile(path.join(directory, player), 'utf8'), await fs.readFile(path.join(data.appRoot, 'video-player.js'), 'utf8'));
+  assert.equal(await fs.readFile(path.join(directory, player), 'utf8'), (await fs.readFile(path.join(data.appRoot, 'regions.js'), 'utf8')) + '\n;\n' + (await fs.readFile(path.join(data.appRoot, 'video-player.js'), 'utf8')));
   await fs.writeFile(path.join(directory, 'video-host-not-owned.html'), 'keep');
   await patcher.restore(data);
   assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
@@ -652,4 +654,106 @@ test('a corrupt or nonregular stable state file is never overwritten or followed
   await assert.rejects(patcher.restore(data), /不是有效的普通文件/);
   assert.equal(await fs.readFile(livePath(data), 'utf8'), live);
   assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), html);
+});
+
+test('cached scripts execute the shared regions module first and both hashes include its bytes', async t => {
+  const data = await fixture(t);
+  const video = path.join(data.appRoot, 'clip.webm');
+  const playerPath = path.join(data.appRoot, 'video-player.js');
+  const regionsPath = path.join(data.appRoot, 'regions.js');
+  await fs.writeFile(video, 'cached video fixture');
+  await fs.writeFile(data.rendererPath, 'globalThis.rendererRegionVersion = globalThis.FrostedRegions.version;');
+  await fs.writeFile(playerPath, 'globalThis.playerRegionVersion = globalThis.FrostedRegions.version;');
+  await patcher.apply({ ...data, mediaPath: video });
+
+  const inspect = async () => {
+    const html = await fs.readFile(data.workbenchPath, 'utf8');
+    assert.equal(patcher.stripInjection(html), ORIGINAL, 'the workbench CSP and all original bytes stay unchanged');
+    assert.equal((html.match(/data-frosted-config=/g) || []).length, 1, 'the workbench still has a single injected script');
+    const rendererName = /src="\.\/frosted-background-assets\/(renderer-[a-f0-9]{64}\.js)"/.exec(html)[1];
+    const payload = decodeConfig(html);
+    const page = await fs.readFile(path.join(path.dirname(data.workbenchPath), payload.videoPlayer), 'utf8');
+    const playerName = /src="\.\/(video-player-[a-f0-9]{64}\.js)"/.exec(page)[1];
+    assert.equal((page.match(/<script /g) || []).length, 1, 'the video page still loads one script under its original CSP');
+    const renderer = await fs.readFile(path.join(assetDirectory(data), rendererName));
+    const player = await fs.readFile(path.join(assetDirectory(data), playerName));
+    const shared = await fs.readFile(regionsPath);
+    assert.deepEqual(renderer, Buffer.concat([shared, Buffer.from('\n;\n'), await fs.readFile(data.rendererPath)]));
+    assert.deepEqual(player, Buffer.concat([shared, Buffer.from('\n;\n'), await fs.readFile(playerPath)]));
+    assert.equal(rendererName, `renderer-${crypto.createHash('sha256').update(renderer).digest('hex')}.js`);
+    assert.equal(playerName, `video-player-${crypto.createHash('sha256').update(player).digest('hex')}.js`);
+    const rendererScope = {};
+    const playerScope = {};
+    vm.runInNewContext(renderer.toString('utf8'), rendererScope);
+    vm.runInNewContext(player.toString('utf8'), playerScope);
+    return { rendererName, playerName, payload, rendererVersion: rendererScope.rendererRegionVersion, playerVersion: playerScope.playerRegionVersion };
+  };
+  const first = await inspect();
+  assert.equal(first.rendererVersion, 1);
+  assert.equal(first.playerVersion, 1);
+  await fs.unlink(video);
+  await fs.writeFile(regionsPath, '(function(root) { root.FrostedRegions = { version: 2 }; })(globalThis);');
+  await patcher.reapply({ appRoot: data.appRoot, rendererPath: data.rendererPath });
+  const second = await inspect();
+  assert.equal(second.rendererVersion, 2);
+  assert.equal(second.playerVersion, 2);
+  assert.notEqual(second.rendererName, first.rendererName, 'changing only regions.js invalidates the renderer cache');
+  assert.notEqual(second.playerName, first.playerName, 'changing only regions.js invalidates the video-player cache');
+  assert.notEqual(second.payload.videoPlayer, first.payload.videoPlayer, 'the video host follows the newly hashed bundled player');
+  assert.equal(second.payload.source, first.payload.source, 'the existing cached media is retained');
+  assert.equal((await patcher.status(data)).liveProtocol, 1, 'the existing injection parser accepts bundled scripts');
+});
+
+test('missing, empty, oversized or nonregular regions modules fail before any workbench or asset writes', async t => {
+  for (const kind of ['missing', 'empty', 'oversized', 'directory']) {
+    await t.test(kind, async child => {
+      const data = await fixture(child);
+      const filename = path.join(data.appRoot, 'regions.js');
+      await fs.unlink(filename);
+      if (kind === 'directory') await fs.mkdir(filename);
+      if (kind === 'empty') await fs.writeFile(filename, '');
+      if (kind === 'oversized') {
+        const handle = await fs.open(filename, 'w');
+        await handle.truncate(512 * 1024 + 1);
+        await handle.close();
+      }
+      await assert.rejects(patcher.apply(data), /区域效果文件无效或缺失/);
+      assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
+      await assert.rejects(fs.access(assetDirectory(data)), { code: 'ENOENT' });
+    });
+  }
+});
+
+test('all bundled runtime sources reject symbolic links without reading their target', async t => {
+  for (const sourceName of ['regions.js', 'renderer.js', 'video-player.js']) {
+    await t.test(sourceName, async child => {
+      const data = await fixture(child);
+      const video = path.join(data.appRoot, 'clip.webm');
+      await fs.writeFile(video, 'video fixture');
+      const blockedPath = path.join(data.appRoot, sourceName);
+      const lstat = fs.lstat;
+      const open = fs.open;
+      child.mock.method(fs, 'lstat', async filename => {
+        const info = await lstat(filename);
+        return filename === blockedPath ? { ...info, isFile: () => true, isSymbolicLink: () => true } : info;
+      });
+      child.mock.method(fs, 'open', async (filename, ...args) => {
+        assert.notEqual(filename, blockedPath, 'the symlink target must not be opened');
+        return open(filename, ...args);
+      });
+      await assert.rejects(patcher.apply({ ...data, mediaPath: video }), /重新安装插件/);
+      assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
+      await assert.rejects(fs.access(assetDirectory(data)), { code: 'ENOENT' });
+    });
+  }
+});
+
+test('the combined runtime bundle size is bounded before staging', async t => {
+  const data = await fixture(t);
+  const handle = await fs.open(data.rendererPath, 'w');
+  await handle.truncate(2 * 1024 * 1024);
+  await handle.close();
+  await assert.rejects(patcher.apply(data), /插件运行文件无效或过大/);
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
+  await assert.rejects(fs.access(assetDirectory(data)), { code: 'ENOENT' });
 });

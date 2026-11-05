@@ -7,6 +7,10 @@ const path = require('node:path');
 const os = require('node:os');
 const { pathToFileURL } = require('node:url');
 const { randomUUID } = require('node:crypto');
+const bundledRuntime = name => Buffer.concat([
+  fs.readFileSync(path.join(__dirname, '../media/regions.js')), Buffer.from('\n;\n'),
+  fs.readFileSync(path.join(__dirname, '../media', name)),
+]);
 
 // Optional integration suite: PLAYWRIGHT_MODULE=/path/to/playwright node --test test/renderer.browser.test.js
 // No Playwright dependency is shipped in the extension.
@@ -19,8 +23,8 @@ test('renderer fits the editor, preserves interaction and manages image/video li
     'C:/Program Files/Google/Chrome/Application/chrome.exe',
     'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
   ].find(value => fs.existsSync(value));
-  const renderer = fs.readFileSync(path.join(__dirname, '../media/renderer.js'));
-  const playerScript = fs.readFileSync(path.join(__dirname, '../media/video-player.js'));
+  const renderer = bundledRuntime('renderer.js');
+  const playerScript = bundledRuntime('video-player.js');
   const mediaName = `media-${'a'.repeat(64)}.webm`;
   const playerName = `video-host-${'b'.repeat(64)}.html`;
   const playerHtml = '<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'self\'; connect-src \'self\'; media-src blob:; style-src \'unsafe-inline\';"><body><script src="./video-player.js" defer></script></body>';
@@ -419,8 +423,8 @@ test('live state swaps media without reload, preserves video settings updates an
     'C:/Program Files/Google/Chrome/Application/chrome.exe',
     'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
   ].find(value => fs.existsSync(value));
-  const renderer = fs.readFileSync(path.join(__dirname, '../media/renderer.js'));
-  const playerScript = fs.readFileSync(path.join(__dirname, '../media/video-player.js'));
+  const renderer = bundledRuntime('renderer.js');
+  const playerScript = bundledRuntime('video-player.js');
   const imageName = `media-${'1'.repeat(64)}.png`;
   const imageName2 = `media-${'2'.repeat(64)}.png`;
   const videoName = `media-${'3'.repeat(64)}.webm`;
@@ -464,6 +468,13 @@ test('live state swaps media without reload, preserves video settings updates an
   const localDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'frosted-live-test-'));
   try {
     const page = await browser.newPage({ viewport: { width: 700, height: 480 } });
+    const stripePNG = await page.evaluate(() => {
+      const canvas = document.createElement('canvas'); canvas.width = 320; canvas.height = 180;
+      const context = canvas.getContext('2d');
+      for (let x = 0; x < 320; x += 8) { context.fillStyle = (x / 8) % 2 ? '#fff' : '#000'; context.fillRect(x, 0, 8, 180); }
+      return canvas.toDataURL('image/png').split(',')[1];
+    });
+    files.set(`/frosted-background-assets/${imageName}`, ['image/png', Buffer.from(stripePNG, 'base64')]);
     page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(() => {
       window.__cspViolations = [];
@@ -510,6 +521,38 @@ test('live state swaps media without reload, preserves video settings updates an
     publish({ ...initial, fit: 'fill', blur: 3, opacity: 0.6 });
     await page.waitForFunction(() => document.querySelector('img').style.objectFit === 'fill' && document.querySelector('img').style.opacity === '0.6');
     assert.equal(await page.locator('.frosted-background-layer').evaluate(el => el.getBoundingClientRect().top), 52, 'live fill excludes the opaque title');
+    const clearRegion = { id: 'clear', name: 'Clear', points: [[0.05, 0.15], [0.55, 0.15], [0.55, 0.85], [0.05, 0.85]], blur: 0, opacity: 1, tintOpacity: 0, brightness: 1, saturation: 1 };
+    const overlapRegion = { ...clearRegion, id: 'overlap', name: 'Overlap', points: [[0.25, 0.25], [0.42, 0.25], [0.42, 0.75], [0.25, 0.75]], brightness: 0.2 };
+    const regionalImage = { ...initial, blur: 14, opacity: 1, tintOpacity: 0, fit: 'fill', regions: { enabled: true, items: [clearRegion, overlapRegion] } };
+    async function regionPixels(fit) {
+      const box = await page.locator('.frosted-background-layer').boundingBox();
+      const bytes = await page.screenshot();
+      return page.evaluate(async ({ bytes, box, fit }) => {
+        const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: 'image/png' }));
+        const canvas = document.createElement('canvas'); canvas.width = bitmap.width; canvas.height = bitmap.height;
+        const context = canvas.getContext('2d'); context.drawImage(bitmap, 0, 0); bitmap.close();
+        let width = box.width, height = box.height;
+        if (fit !== 'fill') { const scale = (fit === 'cover' ? Math.max : Math.min)(box.width / 320, box.height / 180); width = 320 * scale; height = 180 * scale; }
+        const read = sourceX => [...context.getImageData(Math.floor(box.x + (box.width - width) / 2 + sourceX / 320 * width), Math.floor(box.y + box.height / 2), 1, 1).data].slice(0, 3);
+        return { clear: read(170), overlap: read(110), base: read(186) };
+      }, { bytes: [...bytes], box, fit });
+    }
+    for (const fit of ['fill', 'contain', 'cover']) {
+      publish({ ...regionalImage, fit });
+      await page.waitForFunction(fit => document.querySelector('.frosted-background-canvas') && document.querySelector('img').style.objectFit === fit, fit);
+      await page.setViewportSize({ width: fit === 'fill' ? 700 : 300, height: 500 });
+      await page.waitForTimeout(100);
+      const pixels = await regionPixels(fit);
+      assert.ok(pixels.clear.every(value => value > 230), `zero-blur polygon stays sharp over a blurred base after ${fit} resize: ${JSON.stringify(pixels)}`);
+      assert.ok(pixels.overlap.every(value => value >= 40 && value <= 65), `later region independently overrides brightness in overlap: ${JSON.stringify(pixels)}`);
+      assert.ok(pixels.base.every(value => value > 80 && value < 180), `outside polygon retains global blur: ${JSON.stringify(pixels)}`);
+    }
+    publish({ ...regionalImage, fit: 'fill', regions: { enabled: true, items: [clearRegion, { ...overlapRegion, opacity: 0.05, tintOpacity: 0.9 }] } });
+    await nextPoll();
+    await page.evaluate(() => document.documentElement.style.setProperty('--vscode-editor-background', '#e0e8f0'));
+    await page.waitForTimeout(100);
+    assert.ok((await regionPixels('fill')).overlap.every(value => value > 210), 'regional theme tint updates without recreating media');
+    await page.evaluate(() => document.documentElement.style.setProperty('--vscode-editor-background', '#181818'));
     publish(video);
     await page.waitForSelector('iframe.frosted-background-media');
     const frame = page.frames().find(value => value.url().includes(playerName));
@@ -527,8 +570,41 @@ test('live state swaps media without reload, preserves video settings updates an
     assert.equal(await frame.locator('video').evaluate(element => element.currentTime), videoTime, 'settings-only changes preserve playback position');
     assert.match(await page.locator('iframe').getAttribute('style'), /blur\(22px\)/);
     assert.equal(await page.locator('.frosted-background-tint').evaluate(el => el.style.opacity), '0.4');
+    const videoRegions = { enabled: true, items: [{ ...clearRegion, id: 'left', points: [[0, 0], [0.5, 0], [0.5, 1], [0, 1]], brightness: 0.2 }] };
+    publish({ ...video, fit: 'fill', blur: 0, opacity: 1, tintOpacity: 0, regions: videoRegions });
+    await frame.waitForFunction(() => document.querySelector('canvas')?.width > 0);
+    const videoPixels = await frame.locator('canvas').evaluate(canvas => {
+      const ctx = canvas.getContext('2d');
+      return { left: [...ctx.getImageData(Math.floor(canvas.width / 4), Math.floor(canvas.height / 2), 1, 1).data].slice(0, 3), right: [...ctx.getImageData(Math.floor(canvas.width * 3 / 4), Math.floor(canvas.height / 2), 1, 1).data].slice(0, 3) };
+    });
+    assert.ok(Math.max(...videoPixels.left) < Math.max(...videoPixels.right) * 0.4, `single decoded video is composited with independent regional effects: ${JSON.stringify(videoPixels)}`);
+    assert.equal(await frame.locator('video').count(), 1);
+    assert.equal(await frame.evaluate(() => document.querySelector('video') === window.__originalVideo), true);
+    assert.equal(await frame.locator('video').evaluate(element => element.currentTime), videoTime);
+    assert.equal(await page.locator('iframe').evaluate(el => el.style.filter), 'none', 'parent does not apply global effects twice');
+    assert.equal(await page.locator('.frosted-background-tint').evaluate(el => el.style.opacity), '0');
+    publish({ ...video, fit: 'fill', blur: 0, opacity: 1, tintOpacity: 0, regions: { enabled: true, items: [{ ...videoRegions.items[0], opacity: 0.05, tintOpacity: 0.9 }] } });
+    await nextPoll();
+    await page.evaluate(() => document.documentElement.style.setProperty('--vscode-editor-background', '#dc2020'));
+    await frame.waitForFunction(() => {
+      const canvas = document.querySelector('canvas');
+      const pixel = canvas.getContext('2d').getImageData(Math.floor(canvas.width / 4), Math.floor(canvas.height / 2), 1, 1).data;
+      return pixel[0] > 180 && pixel[1] < 60;
+    });
+    assert.equal(await frame.evaluate(() => document.querySelector('video') === window.__originalVideo), true, 'theme changes do not recreate the decoder');
+    await page.evaluate(() => document.documentElement.style.setProperty('--vscode-editor-background', '#181818'));
+    const beforePlayback = await frame.locator('canvas').evaluate(canvas => [...canvas.getContext('2d').getImageData(Math.floor(canvas.width * 3 / 4), Math.floor(canvas.height / 2), 1, 1).data].join(','));
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    await frame.waitForFunction(previous => {
+      const canvas = document.querySelector('canvas');
+      const pixel = [...canvas.getContext('2d').getImageData(Math.floor(canvas.width * 3 / 4), Math.floor(canvas.height / 2), 1, 1).data].join(',');
+      return !document.querySelector('video').paused && pixel !== previous;
+    }, beforePlayback);
+    assert.equal(await frame.locator('video').evaluate(element => element.style.visibility), 'hidden', 'canvas receives fresh video pixels while the raw video element is hidden');
     publish({ ...video, fit: 'fill', blur: 0 });
     await frame.waitForFunction(() => document.querySelector('video').style.objectFit === 'fill');
+    await frame.waitForFunction(() => !document.querySelector('canvas'));
+    assert.equal(await frame.evaluate(() => document.querySelector('video') === window.__originalVideo), true, 'disabling regions preserves the decoder too');
     await page.setViewportSize({ width: 410, height: 300 });
     assert.equal(await page.locator('.frosted-background-layer').evaluate(el => el.getBoundingClientRect().top), 52);
     await page.emulateMedia({ reducedMotion: 'no-preference' });
@@ -646,8 +722,8 @@ test('complete compression keeps all four image and video edges visible in small
     'C:/Program Files/Google/Chrome/Application/chrome.exe',
     'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
   ].find(value => fs.existsSync(value));
-  const renderer = fs.readFileSync(path.join(__dirname, '../media/renderer.js'));
-  const playerScript = fs.readFileSync(path.join(__dirname, '../media/video-player.js'));
+  const renderer = bundledRuntime('renderer.js');
+  const playerScript = bundledRuntime('video-player.js');
   const mediaName = `media-${'c'.repeat(64)}.webm`;
   const playerName = `video-host-${'d'.repeat(64)}.html`;
   const playerHtml = '<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'self\'; connect-src \'self\'; media-src blob:; style-src \'unsafe-inline\';"><body><script src="./video-player.js" defer></script></body>';
