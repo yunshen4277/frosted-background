@@ -2,11 +2,11 @@
 
 为 VS Code 的整个代码编辑区设置本地图片或视频背景。背景单独模糊，代码文字保持清晰；窗口缩放、侧栏展开、面板调整和编辑器分屏时，背景自动跟随编辑区大小。
 
-## 安装和使用（0.5.0）
+## 安装和使用（0.6.0）
 
 1. 在 VS Code 中按 `Ctrl+Shift+P`（macOS：`Cmd+Shift+P`），运行 **Extensions: Install from VSIX… / 扩展: 从 VSIX 安装…**。
-2. 选择 `frosted-background-0.5.0.vsix`。如果安装过旧版，覆盖安装后重载窗口。
-3. 点击状态栏右下角的 **毛玻璃**，或者左侧活动栏的背景图标，打开统一控制面板。也可以运行命令 **毛玻璃背景: 打开控制面板**。
+2. 选择 `frosted-background-0.6.0.vsix`。如果安装过旧版，覆盖安装后重载窗口。
+3. 点击状态栏右下角的 **Frosted**，或者左侧活动栏的背景图标，打开控制面板。也可以运行 **Frosted Background: Open Control Panel**（中文 VS Code 中为 **毛玻璃背景: 打开控制面板**）。界面默认英文；在顶部 **Language** 下拉框选择 **简体中文** 后，可按下面的中文按钮操作。
 4. 在面板里点击 **选择图片** 或 **选择视频**，选择本机文件。拖动滑块即可查看面板内预览，代码文字不会被模糊。
 5. 调整满意后点击 **应用到编辑区**。首次启用时阅读界面修改说明，再点击 **启用背景**。
 6. 点击面板里的 **重载窗口**，背景就会出现在代码区。后续调整窗口大小时自动适应。
@@ -20,6 +20,18 @@
 想把小面板放到右侧，可以在 VS Code 中把“毛玻璃背景”视图容器拖到辅助侧栏。插件的关闭按钮收起默认的主侧栏；移动到辅助侧栏后，请使用 VS Code 自带的关闭辅助侧栏入口。面板使用当前主题配色，支持窄侧栏和键盘操作。
 
 原有命令仍保留供快捷键或脚本调用；命令面板主要显示统一入口，以及应用和恢复命令，减少零散选项。
+
+## 语言 / Language / Idioma
+
+面板顶部的语言菜单支持 **English**、**简体中文**、**Español**。首次使用和首次升级到 0.6.0 时默认英语；选择会保存在本机，重新打开面板或重启 VS Code 后继续使用。
+
+切换立即更新面板、状态栏、更新状态和后续操作提示，无需点击应用或重载。未应用的参数、所选媒体和视频播放进度会保留；正在应用背景或检查更新时也能切换。语言选择只改变插件自身的界面，不修改工作区和 VS Code 的显示语言。
+
+VS Code 命令面板、活动栏名称及系统设置中的扩展说明使用 VS Code 自己的显示语言，支持英／中／西，其他语言回退英语。它们与面板顶部的语言选择独立；已经弹出的系统通知保留弹出时的语言。
+
+**English:** Use **Language → English / 简体中文 / Español** at the top of the controls. English is the default. Changes apply immediately and are saved locally; no reload is needed for a language change.
+
+**Español:** Usa **Idioma → English / 简体中文 / Español** en la parte superior del panel. El inglés es el idioma predeterminado. El cambio es inmediato y se guarda en este equipo; no necesitas recargar la ventana para cambiar el idioma.
 
 ## GitHub 自动更新
 
