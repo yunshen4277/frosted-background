@@ -1,4 +1,5 @@
 {
+  "setting.paused.description": "Manually pause background video or live playback. Resume with the Play button in the controls.",
   "extension.displayName": "Frosted Background",
   "setting.regions.description": "Region effects edited in the control panel. Up to 8 areas can independently control blur, opacity, tint, brightness and saturation, with adjustable feathered transitions. Coordinates follow the original image or video; later areas take priority where they overlap.",
   "extension.description": "Choose an image or muted video background for your code editor, with adjustable frosted glass and automatic resizing.",

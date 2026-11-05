@@ -2,7 +2,7 @@
   "name": "frosted-background",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "frostedBackgroundUpdates": {
     "repository": "yunshen4277/frosted-background"
   },
@@ -138,6 +138,12 @@
     "configuration": {
       "title": "%extension.category%",
       "properties": {
+        "frostedBackground.paused": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "description": "%setting.paused.description%"
+        },
         "frostedBackground.regions": {
           "type": "object",
           "default": {
