@@ -13,6 +13,7 @@
 
   // Reinstallation must never accumulate observers, video decoders or styles.
   window.__frostedBackgroundCleanup?.();
+  const regionTools = window.FrostedRegions;
   const number = (value, fallback, min, max) => {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
@@ -29,6 +30,7 @@
     position: typeof settings.position === 'string' && settings.position.length < 80 ? settings.position : 'center center',
     pauseWhenUnfocused: settings.pauseWhenUnfocused !== false,
     respectReducedMotion: settings.respectReducedMotion !== false,
+    regions: regionTools?.normalizeRegions(settings.regions) || { enabled: false, items: [] },
   });
   const origin = new URL(document.baseURI);
   const ownedDirectory = new URL('./frosted-background-assets/', origin);
@@ -147,6 +149,7 @@
   let pollRequest;
   let revision;
   let pollSequence = 0;
+  let themeFrame = 0;
 
   const listen = (target, name, callback, options) => {
     target.addEventListener(name, callback, options);
@@ -156,6 +159,10 @@
   function mount(host) {
     const { source, videoPlayer } = active;
     let config = active.config;
+    let compositor;
+    let regionCanvas;
+    const hasRegions = () => Boolean(regionTools && config.regions.enabled && config.regions.items.length);
+    const tintColor = () => getComputedStyle(tint).backgroundColor || '#1e1e1e';
     const layer = document.createElement('div');
     layer.className = 'frosted-background-layer';
     layer.setAttribute('aria-hidden', 'true');
@@ -168,15 +175,33 @@
     const tint = document.createElement('div');
     tint.className = 'frosted-background-tint';
     function applyMediaStyles() {
-      const overscan = config.fit === 'cover' ? config.blur * 3 : 0;
+      const regional = hasRegions();
+      const overscan = !regional && config.fit === 'cover' ? config.blur * 3 : 0;
       Object.assign(media.style, {
         left: `${-overscan}px`, top: `${-overscan}px`,
         width: `calc(100% + ${overscan * 2}px)`, height: `calc(100% + ${overscan * 2}px)`,
         objectFit: config.fit, objectPosition: config.position,
-        filter: `blur(${config.blur}px) saturate(${config.saturation}) brightness(${config.brightness})`,
-        opacity: String(config.opacity), border: '0',
+        filter: regional ? 'none' : `blur(${config.blur}px) saturate(${config.saturation}) brightness(${config.brightness})`,
+        opacity: regional ? '1' : String(config.opacity), border: '0',
+        visibility: regional && !framedVideo ? 'hidden' : '',
       });
-      tint.style.opacity = String(config.tintOpacity);
+      tint.style.opacity = regional ? '0' : String(config.tintOpacity);
+    }
+    function updateImageRegions() {
+      if (framedVideo) return;
+      if (hasRegions()) {
+        if (!compositor) {
+          regionCanvas = document.createElement('canvas');
+          regionCanvas.className = 'frosted-background-canvas';
+          Object.assign(regionCanvas.style, { position: 'absolute', inset: '0', width: '100%', height: '100%', pointerEvents: 'none' });
+          layer.insertBefore(regionCanvas, tint);
+          compositor = regionTools.createCompositor({ source: media, canvas: regionCanvas });
+        }
+        compositor.update({ ...config, tintColor: tintColor() });
+      } else {
+        compositor?.dispose(); compositor = undefined;
+        regionCanvas?.remove(); regionCanvas = undefined;
+      }
     }
     applyMediaStyles();
     layer.append(media, tint);
@@ -248,7 +273,7 @@
     const initializePlayer = () => {
       if (stopped || failed) return;
       playerBooted = true;
-      postPlayer({ action: 'initialize', source: source.href, fit: config.fit, position: config.position, playbackRate: config.playbackRate, playing: shouldPlay() });
+      postPlayer({ action: 'initialize', source: source.href, ...config, tintColor: tintColor(), playing: shouldPlay() });
       updatePlayback();
     };
     const receivePlayer = event => {
@@ -292,6 +317,7 @@
       media.decoding = 'async';
     }
     if (!framedVideo) media.src = source.href;
+    updateImageRegions();
 
     // Complete compression must fit the pixels the user can actually see.
     // The workbench part also includes opaque tabs/breadcrumbs, and Monaco's
@@ -390,9 +416,15 @@
         config = next;
         applyMediaStyles();
         observeLayout();
-        if (framedVideo && playerBooted) postPlayer({ action: 'settings', fit: config.fit, position: config.position, playbackRate: config.playbackRate });
+        updateImageRegions();
+        if (framedVideo && playerBooted) postPlayer({ action: 'settings', ...config, tintColor: tintColor() });
         else if (config.kind === 'video' && !framedVideo) media.playbackRate = config.playbackRate;
         updatePlayback();
+      },
+      updateTheme() {
+        if (!hasRegions()) return;
+        updateImageRegions();
+        if (framedVideo && playerBooted) postPlayer({ action: 'settings', ...config, tintColor: tintColor() });
       },
       retryPlayback() {
         playbackBlocked = false;
@@ -401,6 +433,7 @@
       },
       dispose() {
         stopped = true;
+        compositor?.dispose();
         cancelAnimationFrame(geometryFrame);
         layoutObserver?.disconnect();
         resize.disconnect();
@@ -533,6 +566,15 @@
     }
   });
   observer.observe(document.documentElement, { childList: true, subtree: true });
+  const themeObserver = new MutationObserver(() => {
+    if (!themeFrame && !disposed) themeFrame = requestAnimationFrame(() => {
+      themeFrame = 0;
+      for (const state of hosts.values()) state.updateTheme();
+    });
+  });
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['style', 'class'] });
+  if (document.body) themeObserver.observe(document.body, { attributes: true, attributeFilter: ['style', 'class'] });
+  themeObserver.observe(document.head, { childList: true, subtree: true, characterData: true });
 
   const updateAll = () => { for (const state of hosts.values()) state.updatePlayback(); };
   const retryAll = () => { for (const state of hosts.values()) state.retryPlayback(); };
@@ -548,6 +590,8 @@
     clearTimeout(pollTimer);
     pollRequest?.abort();
     cancelAnimationFrame(pendingFrame);
+    cancelAnimationFrame(themeFrame);
+    themeObserver.disconnect();
     observer.disconnect();
     for (const remove of removers) remove();
     for (const state of hosts.values()) state.dispose();

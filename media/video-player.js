@@ -21,6 +21,9 @@
   let playPending = false;
   let playbackBlocked = false;
   let objectURL;
+  let compositor;
+  let regionCanvas;
+  const regionTools = window.FrostedRegions;
   const video = document.createElement('video');
   video.muted = video.defaultMuted = true;
   video.loop = video.playsInline = true;
@@ -72,6 +75,22 @@
     video.style.objectFit = ['cover', 'contain', 'fill'].includes(data.fit) ? data.fit : 'cover';
     video.style.objectPosition = typeof data.position === 'string' && data.position.length < 80 ? data.position : 'center center';
     video.playbackRate = typeof data.playbackRate === 'number' && Number.isFinite(data.playbackRate) ? Math.max(0.25, Math.min(2, data.playbackRate)) : 1;
+    const regions = regionTools?.normalizeRegions(data.regions);
+    const active = Boolean(regions?.enabled && regions.items.length);
+    video.style.visibility = active ? 'hidden' : '';
+    if (active) {
+      if (!compositor) {
+        regionCanvas = document.createElement('canvas');
+        regionCanvas.className = 'frosted-background-canvas';
+        Object.assign(regionCanvas.style, { position: 'absolute', inset: '0', width: '100%', height: '100%', pointerEvents: 'none' });
+        document.body.appendChild(regionCanvas);
+        compositor = regionTools.createCompositor({ source: video, canvas: regionCanvas });
+      }
+      compositor.update({ ...data, regions });
+    } else {
+      compositor?.dispose(); compositor = undefined;
+      regionCanvas?.remove(); regionCanvas = undefined;
+    }
   }
 
   async function initialize(data) {
@@ -123,6 +142,8 @@
   function cleanup() {
     if (disposed) return;
     disposed = true;
+    compositor?.dispose(); compositor = undefined;
+    regionCanvas?.remove(); regionCanvas = undefined;
     controller.abort();
     video.pause();
     video.removeEventListener('loadeddata', markReady);

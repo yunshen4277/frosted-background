@@ -3,12 +3,16 @@
 
   const vscode = acquireVsCodeApi();
   const { normalizeLanguage, t } = window.FrostedI18n;
+  const regionApi = window.FrostedRegions;
+  const normalizeRegions = value => regionApi ? regionApi.normalizeRegions(value) : { enabled: false, items: [] };
+  const clone = value => JSON.parse(JSON.stringify(value));
   let language = normalizeLanguage(document.documentElement.lang);
   const translate = (key, params) => t(language, key, params);
   const fallback = {
     blur: 14, opacity: 0.35, tintOpacity: 0.18, saturation: 1, brightness: 1,
     fit: 'cover', position: 'center center', playbackRate: 1,
     pauseWhenUnfocused: true, respectReducedMotion: true,
+    regions: { enabled: false, items: [] },
   };
   const ranges = { blur: [0, 60], opacity: [0.05, 1], tintOpacity: [0, 0.9], brightness: [0.2, 2], saturation: [0, 2], playbackRate: [0.25, 2] };
   const presets = {
@@ -18,7 +22,7 @@
   };
   const byId = id => document.getElementById(id);
   const normalize = values => {
-    const result = { ...fallback };
+    const result = { ...fallback, regions: normalizeRegions(values?.regions) };
     if (!values || typeof values !== 'object') return result;
     for (const [key, [min, max]] of Object.entries(ranges)) {
       if (typeof values[key] === 'number' && Number.isFinite(values[key])) result[key] = Math.min(max, Math.max(min, values[key]));
@@ -45,11 +49,22 @@
   let mediaIdentity = '';
   let videoReady = false;
   let previewErrorKey = null;
+  let mediaFailed = false;
+  let compositor = null;
+  let regionEditing = false;
+  let regionEffectsVisible = true;
+  let selectedRegionId = '';
+  let drawingTool = 'select';
+  let drawing = null;
+  let activePointer = null;
+  let keyboardCursor = [0.5, 0.5];
+  let showKeyboardCursor = false;
+  const regionKeys = ['blur', 'opacity', 'tintOpacity', 'brightness', 'saturation'];
   const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 
   function persistDraft() {
-    dirty = Object.keys(fallback).some(key => draft[key] !== applied[key]);
-    vscode.setState({ draft: { ...draft }, dirty, liveRequestId: requestSequence });
+    dirty = JSON.stringify(draft) !== JSON.stringify(applied);
+    vscode.setState({ draft: clone(draft), dirty, liveRequestId: requestSequence });
   }
 
   function formatValue(key, value) {
@@ -77,6 +92,7 @@
   }
 
   function renderControls() {
+    if (!draft.regions.enabled) { regionEditing = false; drawing = null; }
     for (const [key, [min, max]] of Object.entries(ranges)) {
       const input = byId(key);
       input.value = String(draft[key]);
@@ -97,7 +113,161 @@
       button.setAttribute('aria-pressed', String(active));
     }
     renderPreview();
+    renderRegionControls();
     renderActions();
+  }
+
+  function selectedRegion() { return draft.regions.items.find(region => region.id === selectedRegionId); }
+
+  function regionBounds() {
+    const width = currentMedia?.videoWidth || currentMedia?.naturalWidth || 0;
+    const height = currentMedia?.videoHeight || currentMedia?.naturalHeight || 0;
+    return regionApi?.getImageBounds(width, height, byId('preview').clientWidth, byId('preview').clientHeight, 'contain', 'center center')
+      || { x: 0, y: 0, width: 0, height: 0 };
+  }
+
+  function renderRegionControls() {
+    if (!selectedRegion()) selectedRegionId = draft.regions.items[0]?.id || '';
+    const selected = selectedRegion();
+    byId('regions-enabled').checked = draft.regions.enabled;
+    byId('region-count').textContent = `${draft.regions.items.length} / 8`;
+    const select = byId('region-select');
+    const signature = JSON.stringify(draft.regions.items.map(region => [region.id, region.name]));
+    if (select.dataset.signature !== signature) {
+      select.replaceChildren(...draft.regions.items.map((region, index) => {
+        const option = document.createElement('option');
+        option.value = region.id;
+        option.textContent = region.name || translate('区域 {number}', { number: index + 1 });
+        return option;
+      }));
+      select.dataset.signature = signature;
+    }
+    select.value = selectedRegionId;
+    byId('region-properties').hidden = !selected;
+    byId('region-empty').hidden = Boolean(selected);
+    byId('region-limit').hidden = draft.regions.items.length < 8;
+    byId('region-edit').textContent = translate(regionEditing ? '完成编辑' : '编辑选区');
+    byId('region-edit').setAttribute('aria-pressed', String(regionEditing));
+    byId('region-drawing-tools').hidden = !regionEditing;
+    byId('region-show-effects').checked = regionEffectsVisible;
+    for (const button of document.querySelectorAll('[data-region-tool]')) button.setAttribute('aria-pressed', String(button.dataset.regionTool === drawingTool));
+    if (selected) {
+      if (document.activeElement !== byId('region-name')) byId('region-name').value = selected.name;
+      for (const key of regionKeys) {
+        const [min, max] = ranges[key];
+        const input = byId(`region-${key}`);
+        input.value = String(selected[key]);
+        input.style.setProperty('--range-fill', `${(selected[key] - min) / (max - min) * 100}%`);
+        input.setAttribute('aria-valuetext', formatValue(key, selected[key]));
+        byId(`region-${key}-value`).textContent = formatValue(key, selected[key]);
+      }
+    }
+    renderRegionOverlay();
+  }
+
+  function renderRegionAvailability() {
+    const unavailable = state.busy || !state.media || !regionApi;
+    byId('regions-enabled').disabled = unavailable;
+    for (const id of ['region-template', 'region-template-apply', 'region-edit']) byId(id).disabled = unavailable;
+    byId('region-clear').disabled = unavailable || !draft.regions.items.length;
+    for (const element of byId('region-properties').querySelectorAll('button, input, select')) element.disabled = unavailable || !draft.regions.enabled || !selectedRegion();
+    for (const button of document.querySelectorAll('[data-region-tool]')) button.disabled = unavailable || (button.dataset.regionTool !== 'select' && draft.regions.items.length >= 8);
+    byId('region-show-effects').disabled = unavailable;
+    byId('region-finish').disabled = unavailable || !drawing || drawing.points.length < (drawing.kind === 'rect' ? 2 : 3);
+    byId('region-cancel').disabled = unavailable || !drawing;
+    byId('region-done').disabled = Boolean(state.busy);
+    byId('region-overlay').setAttribute('aria-disabled', String(Boolean(unavailable)));
+  }
+
+  function rectanglePoints(start, end) {
+    const [left, right] = [Math.min(start[0], end[0]), Math.max(start[0], end[0])];
+    const [top, bottom] = [Math.min(start[1], end[1]), Math.max(start[1], end[1])];
+    return [[left, top], [right, top], [right, bottom], [left, bottom]];
+  }
+
+  function renderRegionOverlay() {
+    const overlay = byId('region-overlay');
+    overlay.toggleAttribute('hidden', !regionEditing);
+    if (!regionEditing) return;
+    const bounds = regionBounds();
+    overlay.setAttribute('viewBox', `0 0 ${byId('preview').clientWidth} ${byId('preview').clientHeight}`);
+    const svg = (tag, attributes) => {
+      const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+      for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
+      return node;
+    };
+    const pointsText = points => points.map(([x, y]) => `${bounds.x + x * bounds.width},${bounds.y + y * bounds.height}`).join(' ');
+    const children = [svg('rect', { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, class: 'source-outline' })];
+    for (const region of draft.regions.items) {
+      const polygon = svg('polygon', { points: pointsText(region.points), 'data-region-id': region.id, class: region.id === selectedRegionId ? 'is-selected' : '' });
+      const title = svg('title', {}); title.textContent = region.name; polygon.append(title);
+      children.push(polygon);
+    }
+    if (drawing) {
+      const points = drawing.kind === 'rect' ? rectanglePoints(drawing.points[0], drawing.points.at(-1)) : drawing.points;
+      children.push(svg('polyline', { points: pointsText(points.concat(points.length > 2 ? [points[0]] : [])), class: 'drawing-shape' }));
+    }
+    if (showKeyboardCursor) {
+      const x = bounds.x + keyboardCursor[0] * bounds.width, y = bounds.y + keyboardCursor[1] * bounds.height;
+      children.push(svg('path', { d: `M${x - 5} ${y}h10M${x} ${y - 5}v10`, class: 'keyboard-cursor' }));
+    }
+    overlay.replaceChildren(...children);
+    renderRegionAvailability();
+  }
+
+  function updateSelectedRegion(values) {
+    if (!selectedRegion()) return;
+    draft.regions = normalizeRegions({ ...draft.regions, items: draft.regions.items.map(region => region.id === selectedRegionId ? { ...region, ...values } : region) });
+    changed();
+  }
+
+  function addRegion(points, name) {
+    if (draft.regions.items.length >= 8) return false;
+    const id = `r-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    const effects = Object.fromEntries(regionKeys.map(key => [key, draft[key]]));
+    const next = normalizeRegions({ enabled: true, items: [...draft.regions.items, { id, name: name || translate('区域 {number}', { number: draft.regions.items.length + 1 }), points, ...effects }] });
+    if (next.items.length === draft.regions.items.length) return false;
+    draft.regions = next;
+    selectedRegionId = id;
+    changed();
+    return true;
+  }
+
+  function finishDrawing() {
+    if (!drawing) return;
+    const points = drawing.kind === 'rect' ? rectanglePoints(drawing.points[0], drawing.points.at(-1)) : drawing.points;
+    if (points.length >= 3 && addRegion(points)) { drawing = null; drawingTool = 'select'; }
+    renderRegionControls();
+  }
+
+  function setRegionEditing(value) {
+    regionEditing = Boolean(value && state.media && regionApi);
+    drawing = null; activePointer = null; showKeyboardCursor = false;
+    if (regionEditing && !draft.regions.enabled) { draft.regions = { ...draft.regions, enabled: true }; changed(); }
+    else renderControls();
+    if (regionEditing) byId('preview').scrollIntoView({ block: 'start' });
+  }
+
+  function useRegionTemplate() {
+    const rect = (name, left, top, right, bottom, clear = false) => ({
+      id: `template-${name}`, name: translate(name), points: rectanglePoints([left, top], [right, bottom]),
+      ...Object.fromEntries(regionKeys.map(key => [key, draft[key]])),
+      ...(clear ? { blur: 0, opacity: 1, tintOpacity: 0 } : { blur: Math.max(14, draft.blur) }),
+    });
+    const templates = {
+      vertical: () => [rect('左侧', 0, 0, 0.5, 1, true), rect('右侧', 0.5, 0, 1, 1)],
+      horizontal: () => [rect('上方', 0, 0, 1, 0.5, true), rect('下方', 0, 0.5, 1, 1)],
+      columns: () => [rect('左侧', 0, 0, 1 / 3, 1), rect('中央', 1 / 3, 0, 2 / 3, 1, true), rect('右侧', 2 / 3, 0, 1, 1)],
+      grid: () => [rect('左上', 0, 0, 0.5, 0.5, true), rect('右上', 0.5, 0, 1, 0.5), rect('左下', 0, 0.5, 0.5, 1), rect('右下', 0.5, 0.5, 1, 1, true)],
+      center: () => [rect('中央', 0.25, 0.2, 0.75, 0.8, true)],
+    };
+    const create = templates[byId('region-template').value];
+    if (!create) return;
+    const items = create().map((region, index) => ({ ...region, id: `template-${index + 1}` }));
+    draft.regions = normalizeRegions({ enabled: true, items });
+    selectedRegionId = draft.regions.items[0]?.id || '';
+    drawing = null;
+    changed();
   }
 
   function syncPlayback() {
@@ -119,16 +289,31 @@
 
   function renderPreview() {
     byId('preview').style.backgroundColor = 'var(--vscode-editor-background, #111923)';
-    document.querySelector('.preview-tint').style.opacity = String(draft.tintOpacity);
+    byId('preview').classList.toggle('is-region-editing', regionEditing);
+    const mediaReady = currentMedia && !mediaFailed && (currentMedia.tagName === 'VIDEO' ? currentMedia.readyState >= 2 : currentMedia.complete && currentMedia.naturalWidth > 0);
+    const useCanvas = Boolean(mediaReady && regionApi && draft.regions.enabled && draft.regions.items.length && (!regionEditing || regionEffectsVisible));
+    byId('region-canvas').hidden = !useCanvas;
+    document.querySelector('.preview-tint').style.opacity = String(useCanvas || regionEditing ? 0 : draft.tintOpacity);
+    if (!useCanvas && compositor) { compositor.dispose(); compositor = null; }
     if (currentMedia) {
-      currentMedia.style.objectFit = draft.fit;
-      currentMedia.style.objectPosition = draft.position;
-      currentMedia.style.opacity = String(draft.opacity);
+      currentMedia.style.objectFit = regionEditing ? 'contain' : draft.fit;
+      currentMedia.style.objectPosition = regionEditing ? 'center center' : draft.position;
+      currentMedia.style.opacity = String(useCanvas ? 0 : regionEditing ? 1 : draft.opacity);
       // Preview pixels are scaled down to represent the editor's visual texture.
-      currentMedia.style.filter = `blur(${draft.blur * 0.34}px) brightness(${draft.brightness}) saturate(${draft.saturation})`;
-      currentMedia.style.transform = draft.fit === 'cover' ? 'scale(1.08)' : 'none';
+      currentMedia.style.filter = regionEditing ? 'none' : `blur(${draft.blur * 0.34}px) brightness(${draft.brightness}) saturate(${draft.saturation})`;
+      currentMedia.style.transform = !regionEditing && !useCanvas && draft.fit === 'cover' ? 'scale(1.08)' : 'none';
       if (currentMedia.tagName === 'VIDEO') currentMedia.playbackRate = draft.playbackRate;
+      if (useCanvas) {
+        compositor ||= regionApi.createCompositor({ source: currentMedia, canvas: byId('region-canvas') });
+        compositor.update({
+          ...draft, blur: draft.blur * 0.34,
+          fit: regionEditing ? 'contain' : draft.fit, position: regionEditing ? 'center center' : draft.position,
+          regions: { ...draft.regions, items: draft.regions.items.map(region => ({ ...region, blur: region.blur * 0.34 })) },
+          tintColor: getComputedStyle(byId('preview')).backgroundColor,
+        });
+      }
     }
+    renderRegionOverlay();
     syncPlayback();
   }
 
@@ -144,6 +329,12 @@
     byId('preview').classList.toggle('has-media', Boolean(valid));
     if (identity === mediaIdentity) return;
     mediaIdentity = identity;
+    if (compositor) { compositor.dispose(); compositor = null; }
+    byId('region-canvas').width = 1; byId('region-canvas').height = 1;
+    byId('region-canvas').hidden = true;
+    mediaFailed = false;
+    drawing = null;
+    if (!valid) regionEditing = false;
     videoReady = false;
     if (currentMedia?.tagName === 'VIDEO') { currentMedia.pause(); currentMedia.removeAttribute('src'); currentMedia.load(); }
     byId('preview-media').replaceChildren();
@@ -159,16 +350,20 @@
       element.loop = true;
       element.playsInline = true;
       element.preload = 'auto';
-      element.addEventListener('loadedmetadata', () => { videoReady = true; syncPlayback(); });
+      element.addEventListener('loadedmetadata', () => { videoReady = true; renderPreview(); });
+      element.addEventListener('loadeddata', renderPreview);
     } else {
       element.alt = '';
       element.draggable = false;
+      element.addEventListener('load', renderPreview);
     }
     element.addEventListener('error', () => {
       if (element !== currentMedia) return;
+      mediaFailed = true;
       previewErrorKey = media.kind === 'video' ? '此视频无法预览，请尝试 WebM 格式。' : '无法读取预览，请重新选择图片。';
       byId('preview-error').textContent = translate(previewErrorKey);
       byId('preview-error').hidden = false;
+      renderPreview();
     });
     element.src = media.uri;
     byId('preview-media').append(element);
@@ -193,6 +388,7 @@
       byId('available-version').textContent = pendingVersion ? translate('v{version} · 待重载', { version: pendingVersion }) : availableVersion ? translate('发现 v{version}', { version: availableVersion }) : '';
       byId('available-version').hidden = !pendingVersion && !availableVersion;
       byId('update-message').textContent = typeof update.message === 'string' ? update.message : '';
+      byId('update-message').hidden = !['checking', 'installing', 'error', 'available', 'unconfigured'].includes(update.status) && !pendingVersion;
       byId('update-message').classList.toggle('is-error', update.status === 'error');
     }
     byId('apply-label').textContent = translate('应用');
@@ -203,9 +399,9 @@
       : liveApplying ? '正在自动应用最新效果…'
         : state.liveEnabled && dirty && state.error ? '自动应用失败，请点击应用重试。'
           : dirty ? (state.liveEnabled ? '效果调整将自动应用…' : '效果已调整，点击应用使其生效。')
-            : state.liveEnabled ? '效果调整会自动生效，无需点击应用。'
-              : state.media ? '点击应用启用背景；首次设置需要重载一次。' : '选择图片或视频，即可应用背景。';
-    byId('draft-label').textContent = translate(feedbackKey);
+            : '';
+    byId('draft-label').textContent = feedbackKey ? translate(feedbackKey) : '';
+    byId('draft-label').hidden = !feedbackKey;
     byId('draft-label').classList.toggle('is-dirty', dirty);
     byId('draft-label').classList.toggle('requires-reload', state.needsReload);
     for (const key of ['error', 'notice']) {
@@ -213,6 +409,7 @@
       byId(key).textContent = message;
       byId(key).hidden = !message;
     }
+    renderRegionAvailability();
   }
 
   function changed() {
@@ -246,7 +443,7 @@
     renderActions();
     // This operation intentionally does not acquire the ordinary UI busy lock:
     // subsequent edits stay responsive and are sent after this request's ack.
-    vscode.postMessage({ type: 'liveConfig', config: { ...draft }, requestId });
+    vscode.postMessage({ type: 'liveConfig', config: clone(draft), requestId });
   }
 
   function sendAction(message) {
@@ -274,11 +471,128 @@
     button.addEventListener('click', () => { draft = { ...draft, ...presets[button.dataset.preset] }; changed(); });
   }
   byId('reset').addEventListener('click', () => { draft = { ...defaults }; changed(); });
-  byId('choose-image').addEventListener('click', () => sendAction({ type: 'chooseMedia', kind: 'image', config: { ...draft } }));
-  byId('choose-video').addEventListener('click', () => sendAction({ type: 'chooseMedia', kind: 'video', config: { ...draft } }));
+  byId('regions-enabled').addEventListener('change', event => {
+    draft.regions = { ...draft.regions, enabled: event.target.checked };
+    changed();
+  });
+  byId('region-template-apply').addEventListener('click', useRegionTemplate);
+  byId('region-edit').addEventListener('click', () => setRegionEditing(!regionEditing));
+  byId('region-done').addEventListener('click', () => setRegionEditing(false));
+  byId('region-clear').addEventListener('click', () => {
+    draft.regions = { ...draft.regions, items: [] }; selectedRegionId = ''; drawing = null; changed();
+  });
+  byId('region-select').addEventListener('change', event => { selectedRegionId = event.target.value; renderRegionControls(); });
+  byId('region-name').addEventListener('input', event => updateSelectedRegion({ name: event.target.value }));
+  for (const key of regionKeys) byId(`region-${key}`).addEventListener('input', event => updateSelectedRegion({ [key]: Number(event.target.value) }));
+  byId('region-sharp').addEventListener('click', () => updateSelectedRegion({ blur: 0 }));
+  function deleteSelectedRegion() {
+    if (state.busy || !selectedRegion()) return;
+    draft.regions = { ...draft.regions, items: draft.regions.items.filter(region => region.id !== selectedRegionId) };
+    selectedRegionId = ''; changed();
+  }
+  byId('region-delete').addEventListener('click', deleteSelectedRegion);
+  byId('region-show-effects').addEventListener('change', event => { regionEffectsVisible = event.target.checked; renderPreview(); });
+  for (const button of document.querySelectorAll('[data-region-tool]')) button.addEventListener('click', () => {
+    drawingTool = button.dataset.regionTool; drawing = null; showKeyboardCursor = false; renderRegionControls();
+  });
+  byId('region-finish').addEventListener('click', finishDrawing);
+  byId('region-cancel').addEventListener('click', () => { drawing = null; renderRegionControls(); });
+
+  function sourcePoint(event, clamp = false) {
+    const rect = byId('region-overlay').getBoundingClientRect();
+    const bounds = regionBounds();
+    if (!bounds.width || !bounds.height) return null;
+    const x = (event.clientX - rect.left - bounds.x) / bounds.width;
+    const y = (event.clientY - rect.top - bounds.y) / bounds.height;
+    if (!clamp && (x < 0 || x > 1 || y < 0 || y > 1)) return null;
+    return [Math.max(0, Math.min(1, x)), Math.max(0, Math.min(1, y))];
+  }
+  const overlay = byId('region-overlay');
+  function appendFreehandPoint(point, minimumDistance = 0.006) {
+    if (!drawing || drawing.kind !== 'polygon') return;
+    const last = drawing.points.at(-1);
+    if (last && Math.hypot(point[0] - last[0], point[1] - last[1]) <= minimumDistance) return;
+    // Keep sampling the entire gesture. Compact older vertices when full so a
+    // long lasso does not stop halfway and close with an unintended chord.
+    if (drawing.points.length >= 64) drawing.points = drawing.points.filter((_, index) => index % 2 === 0);
+    drawing.points.push(point);
+  }
+  overlay.addEventListener('pointerdown', event => {
+    if (state.busy || !regionEditing || event.button !== 0) return;
+    const point = sourcePoint(event);
+    if (!point) return;
+    overlay.focus({ preventScroll: true });
+    showKeyboardCursor = false;
+    if (drawingTool === 'select') {
+      const polygon = event.target.closest('[data-region-id]');
+      if (polygon) { selectedRegionId = polygon.getAttribute('data-region-id'); renderRegionControls(); }
+      return;
+    }
+    if (draft.regions.items.length >= 8) return;
+    event.preventDefault();
+    activePointer = event.pointerId;
+    overlay.setPointerCapture(event.pointerId);
+    if (drawingTool === 'rect') drawing = { kind: 'rect', points: [point, point] };
+    else if (!drawing) drawing = { kind: 'polygon', points: [point] };
+    else if (drawing.points.length < 64) drawing.points.push(point);
+    renderRegionOverlay();
+  });
+  overlay.addEventListener('pointermove', event => {
+    if (activePointer !== event.pointerId || !drawing) return;
+    const point = sourcePoint(event, true);
+    if (!point) return;
+    if (drawing.kind === 'rect') drawing.points[1] = point;
+    else appendFreehandPoint(point);
+    renderRegionOverlay();
+  });
+  overlay.addEventListener('pointerup', event => {
+    if (activePointer !== event.pointerId) return;
+    const point = sourcePoint(event, true);
+    if (point && drawing?.kind === 'rect') drawing.points[1] = point;
+    else if (point) appendFreehandPoint(point, 0.0001);
+    activePointer = null;
+    if (overlay.hasPointerCapture(event.pointerId)) overlay.releasePointerCapture(event.pointerId);
+    if (drawing?.kind === 'rect' || drawing?.points.length >= 3) finishDrawing();
+  });
+  overlay.addEventListener('pointercancel', () => { activePointer = null; drawing = null; renderRegionControls(); });
+  overlay.addEventListener('keydown', event => {
+    if (state.busy || !regionEditing) return;
+    if (event.key === 'Escape') { event.preventDefault(); drawing = null; renderRegionControls(); return; }
+    if (event.key === 'Delete' && drawingTool === 'select') { event.preventDefault(); deleteSelectedRegion(); return; }
+    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) {
+      event.preventDefault();
+      if (drawingTool === 'select') {
+        const items = draft.regions.items;
+        const direction = ['ArrowLeft', 'ArrowUp'].includes(event.key) ? -1 : 1;
+        if (items.length) selectedRegionId = items[(Math.max(0, items.findIndex(region => region.id === selectedRegionId)) + direction + items.length) % items.length].id;
+        renderRegionControls(); return;
+      }
+      const step = event.shiftKey ? 0.1 : 0.02;
+      const axis = ['ArrowLeft', 'ArrowRight'].includes(event.key) ? 0 : 1;
+      keyboardCursor[axis] = Math.max(0, Math.min(1, keyboardCursor[axis] + (['ArrowLeft', 'ArrowUp'].includes(event.key) ? -step : step)));
+      showKeyboardCursor = true;
+      if (drawing?.kind === 'rect') drawing.points[1] = [...keyboardCursor];
+      renderRegionOverlay(); return;
+    }
+    if ((event.key === ' ' || event.key === 'Enter') && drawingTool !== 'select' && draft.regions.items.length < 8) {
+      event.preventDefault(); showKeyboardCursor = true;
+      if (event.key === 'Enter' && drawing) { finishDrawing(); return; }
+      if (drawingTool === 'rect') {
+        if (drawing) finishDrawing();
+        else drawing = { kind: 'rect', points: [[...keyboardCursor], [...keyboardCursor]] };
+      } else if (!drawing) drawing = { kind: 'polygon', points: [[...keyboardCursor]] };
+      else if (drawing.points.length < 64) drawing.points.push([...keyboardCursor]);
+      renderRegionOverlay();
+    }
+  });
+  new ResizeObserver(renderRegionOverlay).observe(byId('preview'));
+  const themeObserver = new MutationObserver(renderPreview);
+  for (const element of [document.documentElement, document.body]) themeObserver.observe(element, { attributes: true, attributeFilter: ['class', 'style'] });
+  byId('choose-image').addEventListener('click', () => sendAction({ type: 'chooseMedia', kind: 'image', config: clone(draft) }));
+  byId('choose-video').addEventListener('click', () => sendAction({ type: 'chooseMedia', kind: 'video', config: clone(draft) }));
   byId('apply').addEventListener('click', () => {
     if (state.needsReload && (!dirty || !state.media)) sendAction({ type: 'reload' });
-    else sendAction({ type: 'apply', config: { ...draft }, reloadAfterApply: true });
+    else sendAction({ type: 'apply', config: clone(draft), reloadAfterApply: true });
   });
   byId('restore').addEventListener('click', () => sendAction({ type: 'restore' }));
   // Closing is a view-only action: do not acquire the operation lock or modify
