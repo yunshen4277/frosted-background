@@ -21,7 +21,7 @@ function activate(context) {
   let runtimeReady = false;
   let panel;
   let updater;
-  const extensionVersion = context.extension?.packageJSON?.version || '0.8.0';
+  const extensionVersion = context.extension?.packageJSON?.version || '0.9.0';
   const windowSession = typeof vscode.env.sessionId === 'string' && vscode.env.sessionId !== 'someValue.sessionId' ? vscode.env.sessionId : '';
   const bootstrapKey = windowSession ? 'bootstrapRequired:' + windowSession : undefined;
   const markBootstrapRequired = async () => {

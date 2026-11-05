@@ -48,10 +48,11 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, 
         <span class="preview-error" id="preview-error" hidden></span>
       </div>
       <div class="region-drawing-tools" id="region-drawing-tools" hidden>
-        <div class="region-tool-buttons" role="group" data-i18n-aria-label="绘制工具" aria-label="${text("绘制工具")}"><button type="button" data-region-tool="select" aria-pressed="true">${label("选择")}</button><button type="button" data-region-tool="rect" aria-pressed="false">${label("矩形")}</button><button type="button" data-region-tool="polygon" aria-pressed="false">${label("自由多边形")}</button></div>
+        <div class="region-tool-buttons" role="group" data-i18n-aria-label="绘制工具" aria-label="${text("绘制工具")}"><button type="button" data-region-tool="select" aria-pressed="true">${label("选择")}</button><button type="button" data-region-tool="rect" aria-pressed="false">${label("矩形")}</button><button type="button" data-region-tool="lasso" aria-pressed="false">${label("套索")}</button><button type="button" data-region-tool="polygon" aria-pressed="false">${label("多边形")}</button></div>
         <label class="region-preview-switch"><input type="checkbox" id="region-show-effects" checked>${label("显示效果")}</label>
         <div class="region-draw-actions"><button type="button" class="text-button" id="region-finish">${label("完成选区")}</button><button type="button" class="text-button" id="region-cancel">${label("取消绘制")}</button><button type="button" class="text-button" id="region-done">${label("完成编辑")}</button></div>
-        <p class="region-help" id="region-drawing-help">${label("拖动绘制；也可用方向键移动，空格选点，Enter完成，Esc取消。")}</p>
+        <p class="region-help" id="region-drawing-help">${label("拖动选区可移动位置。方向键切换区域，Delete删除。")}</p>
+        <p class="region-drawing-error" id="region-drawing-error" role="alert" hidden></p>
       </div>
       <div class="media-caption"><span class="media-kind" id="media-kind">${label("未选择背景")}</span><span class="media-name" id="media-name">${label("从本机选择文件")}</span></div>
       <div class="media-actions">
@@ -63,14 +64,15 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, 
     <details class="regions-section" id="regions-section">
       <summary><span>${label("区域效果")}</span><span class="region-count" id="region-count"></span></summary>
       <label class="switch-control" for="regions-enabled"><span>${label("启用独立区域")}</span><input type="checkbox" role="switch" id="regions-enabled"><span class="switch-track" aria-hidden="true"></span></label>
-      <div class="region-template-row"><select id="region-template" data-i18n-aria-label="区域模板" aria-label="${text("区域模板")}"><option value="vertical" data-i18n="左右分区">${text("左右分区")}</option><option value="horizontal" data-i18n="上下分区">${text("上下分区")}</option><option value="columns" data-i18n="三列">${text("三列")}</option><option value="grid" data-i18n="四宫格">${text("四宫格")}</option><option value="center" data-i18n="中心清晰">${text("中心清晰")}</option></select><button type="button" class="secondary-button" id="region-template-apply" data-i18n-title="替换当前区域" title="${text("替换当前区域")}">${label("套用模板")}</button></div>
+      <div class="region-template-row"><select id="region-template" data-i18n-aria-label="区域模板" aria-label="${text("区域模板")}" data-i18n-title="选择模板立即替换当前区域" title="${text("选择模板立即替换当前区域")}"><option value="" data-i18n="选择模板">${text("选择模板")}</option><option value="vertical" data-i18n="左右分区">${text("左右分区")}</option><option value="horizontal" data-i18n="上下分区">${text("上下分区")}</option><option value="columns" data-i18n="三列">${text("三列")}</option><option value="grid" data-i18n="四宫格">${text("四宫格")}</option><option value="center" data-i18n="中心清晰">${text("中心清晰")}</option></select></div>
       <div class="region-edit-actions"><button type="button" class="secondary-button" id="region-edit" aria-pressed="false">${label("编辑选区")}</button><button type="button" class="text-button" id="region-clear">${label("清空区域")}</button></div>
       <p class="region-help" id="region-empty">${label("先套用模板，或在预览中绘制。最多8个区域；重叠时后面的区域优先。")}</p>
       <div id="region-properties" hidden>
         <div class="select-control"><label for="region-select">${label("当前区域")}</label><select id="region-select"></select></div>
         <label class="region-name-label" for="region-name">${label("区域名称")}</label><input type="text" class="region-name-input" id="region-name" maxlength="40">
         <div class="region-property-actions"><button type="button" class="text-button" id="region-sharp">${label("设为清晰")}</button><button type="button" class="text-button" id="region-delete">${label("删除区域")}</button></div>
-        ${[['blur', '模糊程度', 0, 60, 1, 14], ['opacity', '背景浓度', 0.05, 1, 0.01, 0.35], ['tintOpacity', '玻璃蒙层', 0, 0.9, 0.01, 0.18], ['brightness', '亮度', 0.2, 2, 0.05, 1], ['saturation', '饱和度', 0, 2, 0.05, 1]].map(([key, name, min, max, step, value]) => `<div class="range-control"><div class="control-label"><label for="region-${key}">${label(name)}</label><output for="region-${key}" id="region-${key}-value"></output></div><input type="range" id="region-${key}" min="${min}" max="${max}" step="${step}" value="${value}"></div>`).join('')}
+        ${[['blur', '模糊程度', 0, 60, 1, 14], ['opacity', '背景浓度', 0.05, 1, 0.01, 0.35], ['tintOpacity', '玻璃蒙层', 0, 0.9, 0.01, 0.18], ['brightness', '亮度', 0.2, 2, 0.05, 1], ['saturation', '饱和度', 0, 2, 0.05, 1], ['feather', '渐变过渡', 0, 0.3, 0.01, 0.06]].map(([key, name, min, max, step, value]) => `<div class="range-control"><div class="control-label"><label for="region-${key}">${label(name)}</label><output for="region-${key}" id="region-${key}-value"></output></div><input type="range" id="region-${key}" min="${min}" max="${max}" step="${step}" value="${value}"></div>`).join('')}
+        <p class="region-help">${label("按画面短边计算，0%为清晰边界。")}</p>
       </div>
       <p class="region-help" id="region-limit" role="status" hidden>${label("已达到8个区域，请先删除一个区域。")}</p>
     </details>
