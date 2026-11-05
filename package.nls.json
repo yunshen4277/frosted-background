@@ -1,5 +1,6 @@
 {
   "extension.displayName": "Frosted Background",
+  "setting.regions.description": "Region effects edited in the control panel. Up to 8 areas can independently control blur, opacity, tint, brightness and saturation. Coordinates follow the original image or video; later areas take priority where they overlap.",
   "extension.description": "Choose an image or muted video background for your code editor, with adjustable frosted glass and automatic resizing.",
   "extension.category": "Frosted Background",
   "command.openPanel": "Open Control Panel",
@@ -13,7 +14,7 @@
   "command.status": "Show Status",
   "view.controls": "Background Controls",
   "setting.updateMode.description": "Get updates from the extension’s configured public GitHub repository. Checks about 30 seconds after startup, then every 6 hours. The window never reloads automatically.",
-  "setting.blur.description": "Background blur radius in pixels. Blurs only the image or video; code stays sharp. After changing this setting, run “Frosted Background: Apply Settings / Repair After Update”.",
+  "setting.blur.description": "Default background blur radius in pixels. Code stays sharp. Region effects can override this value; changes apply live after initial setup.",
   "setting.opacity.description": "Background opacity. Higher values make the background more visible. Suggested range: 0.2–0.5.",
   "setting.tintOpacity.description": "Opacity of the frosted overlay, using the current theme’s color. Higher values make code easier to read.",
   "setting.saturation.description": "Background saturation: 1 preserves the original colors; 0 uses grayscale.",

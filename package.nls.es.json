@@ -1,4 +1,5 @@
 {
+  "setting.regions.description": "Efectos por zonas editados en el panel. Hasta 8 zonas controlan por separado el desenfoque, la opacidad, el tinte, el brillo y la saturación. Las coordenadas siguen la imagen o el vídeo original; las zonas posteriores tienen prioridad al superponerse.",
   "extension.displayName": "Frosted Background",
   "extension.description": "Elige una imagen o un vídeo sin sonido como fondo del editor, con efecto de cristal esmerilado ajustable y tamaño adaptable.",
   "extension.category": "Fondo esmerilado",
@@ -13,7 +14,7 @@
   "command.status": "Mostrar estado",
   "view.controls": "Controles del fondo",
   "setting.updateMode.description": "Obtiene actualizaciones del repositorio público de GitHub configurado para la extensión. Busca unos 30 segundos después del inicio y luego cada 6 horas. La ventana nunca se recarga automáticamente.",
-  "setting.blur.description": "Radio de desenfoque del fondo en píxeles. Solo desenfoca la imagen o el vídeo; el código permanece nítido. Después de cambiarlo, ejecuta «Fondo esmerilado: Aplicar ajustes / Reparar tras actualizar».",
+  "setting.blur.description": "Radio de desenfoque predeterminado en píxeles. El código permanece nítido. Cada zona puede usar otro valor; los cambios se aplican al instante tras la configuración inicial.",
   "setting.opacity.description": "Opacidad del fondo. Los valores más altos hacen que el fondo se vea más. Intervalo sugerido: 0,2–0,5.",
   "setting.tintOpacity.description": "Opacidad de la capa esmerilada, que usa el color del tema actual. Los valores más altos facilitan la lectura del código.",
   "setting.saturation.description": "Saturación del fondo: 1 conserva los colores originales; 0 usa escala de grises.",

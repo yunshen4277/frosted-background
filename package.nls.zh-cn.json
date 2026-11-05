@@ -1,4 +1,5 @@
 {
+  "setting.regions.description": "在控制面板中编辑区域效果。最多 8 个区域可独立调整模糊、浓度、蒙层、亮度和饱和度。区域跟随原始图片或视频内容，重叠处以后添加的区域为准。",
   "extension.displayName": "Frosted Background · 毛玻璃背景",
   "extension.description": "为整个代码区选择图片或静音视频背景，带可调毛玻璃效果与自适应缩放。",
   "extension.category": "毛玻璃背景",
@@ -13,7 +14,7 @@
   "command.status": "查看状态",
   "view.controls": "背景控制面板",
   "setting.updateMode.description": "从插件绑定的公开 GitHub 仓库获取更新。首次启动后约 30 秒检查，此后每 6 小时检查；不会自动重载窗口。",
-  "setting.blur.description": "背景模糊半径（像素），只模糊图片或视频，不模糊代码。修改后执行“毛玻璃背景: 应用设置”。",
+  "setting.blur.description": "默认背景模糊半径（像素），代码保持清晰。区域效果可单独覆盖此数值；首次设置后调整实时生效。",
   "setting.opacity.description": "背景浓度，越大越明显。建议 0.2–0.5。",
   "setting.tintOpacity.description": "毛玻璃蒙层浓度，自动使用当前主题颜色；越大代码越容易阅读。",
   "setting.saturation.description": "背景饱和度，1 为原色，0 为灰度。",
