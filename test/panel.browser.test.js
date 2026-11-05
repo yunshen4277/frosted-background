@@ -329,6 +329,21 @@ test('regions preview independent effects, keep source coordinates, and support 
         return { left: rect.left, top: rect.top, x: (rect.width - width * scale) / 2, y: (rect.height - height * scale) / 2, width: width * scale, height: height * scale };
       });
     }
+    async function waitForRegionLayout() {
+      // CSS layout changes before ResizeObserver reprojects the SVG. Poll from
+      // Node because this scenario intentionally pauses the page's clock.
+      const deadline = Date.now() + 5000;
+      let dimensions;
+      do {
+        dimensions = await page.locator('#region-overlay').evaluate(svg => {
+          const preview = document.getElementById('preview');
+          return { width: preview.clientWidth, height: preview.clientHeight, svgWidth: svg.viewBox.baseVal.width, svgHeight: svg.viewBox.baseVal.height };
+        });
+        if (dimensions.svgWidth === dimensions.width && dimensions.svgHeight === dimensions.height) return;
+        await new Promise(resolve => setTimeout(resolve, 20));
+      } while (Date.now() < deadline);
+      assert.fail(`Region projection did not receive the new layout: ${JSON.stringify(dimensions)}`);
+    }
     let bounds = await displayBounds();
     await page.mouse.move(bounds.left + 3, bounds.top + 30); await page.mouse.down(); await page.mouse.up();
     assert.equal(await page.evaluate(() => window.__saved.draft.regions.items.length), 0, 'portrait letterbox margins cannot start a region');
@@ -344,6 +359,7 @@ test('regions preview independent effects, keep source coordinates, and support 
     assert.deepEqual(await page.locator('#region-canvas').evaluate(canvas => Array.from(canvas.getContext('2d').getImageData(2, Math.floor(canvas.height / 2), 1, 1).data).slice(0, 3)), [247, 246, 244], 'theme changes redraw the canvas tint immediately');
     await page.evaluate(() => document.documentElement.style.removeProperty('--vscode-editor-background'));
     await page.setViewportSize({ width: 360, height: 900 });
+    await waitForRegionLayout();
     bounds = await displayBounds();
     const projected = await page.locator('#region-overlay polygon').evaluate(polygon => ({ x: polygon.points.getItem(0).x, y: polygon.points.getItem(0).y }));
     assert.ok(Math.abs(projected.x - (bounds.x + rectangle.points[0][0] * bounds.width)) < 1);
