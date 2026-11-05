@@ -17,9 +17,34 @@ function activate(context) {
   let changeTimer;
   let disposed = false;
   let savingConfig = false;
+  let liveConfigBusy = false;
+  let runtimeReady = false;
   let panel;
   let updater;
-  const extensionVersion = context.extension?.packageJSON?.version || '0.6.0';
+  const extensionVersion = context.extension?.packageJSON?.version || '0.7.0';
+  const windowSession = typeof vscode.env.sessionId === 'string' && vscode.env.sessionId !== 'someValue.sessionId' ? vscode.env.sessionId : '';
+  const bootstrapKey = windowSession ? 'bootstrapRequired:' + windowSession : undefined;
+  const markBootstrapRequired = async () => {
+    if (!disposed && bootstrapKey && !runtimeReady) await context.globalState.update(bootstrapKey, true);
+  };
+  // Snapshot the renderer that this window loaded. Publishing new files does
+  // not load a bootstrap into an already-running window.
+  const appliedVersionAtActivation = context.globalState.get('lastAppliedExtensionVersion');
+  const initialStatus = vscode.env.uiKind === vscode.UIKind.Desktop && context.globalState.get('enabled', false)
+    ? patcher.status({ appRoot: vscode.env.appRoot }).then(async state => {
+      if (disposed) return state;
+      // The workbench session survives extension-host restarts, unlike activate().
+      // Keep a same-session bootstrap requirement until the actual window reloads.
+      runtimeReady = Boolean(windowSession) && !context.globalState.get(bootstrapKey, false)
+        && state.installed && state.liveProtocol === 1 && appliedVersionAtActivation === extensionVersion;
+      if (!runtimeReady) await markBootstrapRequired();
+      panel?.refresh();
+      return state;
+    }) : Promise.resolve().then(async () => {
+      if (vscode.env.uiKind === vscode.UIKind.Desktop) await markBootstrapRequired();
+      return { installed: false };
+    });
+  initialStatus.catch(() => {});
 
   const readConfig = () => {
     const config = vscode.workspace.getConfiguration('frostedBackground');
@@ -97,6 +122,8 @@ function activate(context) {
 
   async function applyMedia(mediaPath, configOverride, fromPanel = false) {
     if (!(await confirmFirstUse())) return { cancelled: true };
+    await initialStatus.catch(() => {});
+    await markBootstrapRequired();
     const config = configOverride ? normalizeConfig(configOverride) : readConfig();
     let settingsError;
     await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: text('正在应用毛玻璃背景…'), cancellable: false }, async () => {
@@ -124,12 +151,28 @@ function activate(context) {
     });
     if (!fromPanel) {
       panel?.refresh({ syncMedia: true, resetDraft: true });
-      offerReload(text('背景已准备好。'));
+      if (!runtimeReady) offerReload(text('背景已准备好。'));
     }
-    const noticeKey = settingsError ? '背景已应用，重载窗口后生效。但设置保存失败，可稍后重试：{error}' : '背景已应用，重载窗口后生效。其他已打开窗口也需重载。';
+    const noticeKey = runtimeReady
+      ? (settingsError ? '背景已实时应用，但设置保存失败，可稍后重试：{error}' : '背景已实时应用，无需重载。')
+      : (settingsError ? '背景已应用，重载窗口后生效。但设置保存失败，可稍后重试：{error}' : '首次启用或升级后需要重载一次，之后更换背景和调整效果将自动生效。');
     const noticeParams = { error: settingsError };
-    return { needsReload: true, resetDraft: !settingsError,
+    return { needsReload: !runtimeReady, resetDraft: !settingsError,
       noticeKey, noticeParams, notice: text(noticeKey, noticeParams) };
+  }
+
+  async function applyLiveConfig(configOverride) {
+    if (!runtimeReady || !context.globalState.get('enabled', false)) throw localizedError('请先应用背景并重载一次，以启用实时调整。');
+    liveConfigBusy = true;
+    try {
+      return await runExclusive(async () => {
+        const config = normalizeConfig(configOverride);
+        await patcher.updateConfig({ appRoot: vscode.env.appRoot, config });
+        try { await saveConfig(config); }
+        catch (error) { throw localizedError('背景已实时应用，但设置保存失败，可稍后重试：{error}', { error: describeError(error) }); }
+        return { needsReload: false, resetDraft: true, noticeKey: '背景已实时应用，无需重载。' };
+      });
+    } finally { liveConfigBusy = false; }
   }
 
   async function chooseMediaFile(kind) {
@@ -159,10 +202,10 @@ function activate(context) {
     const notice = text(baseNoticeKey);
     if (!fromPanel) {
       panel?.refresh();
-      offerReload(notice);
+      if (!runtimeReady) offerReload(notice);
     }
-    const noticeKey = baseNoticeKey + ' 重载窗口后生效。';
-    return { needsReload: true, noticeKey, notice: text(noticeKey) };
+    const noticeKey = runtimeReady ? baseNoticeKey : baseNoticeKey + ' 重载窗口后生效。';
+    return { needsReload: !runtimeReady, noticeKey, notice: text(noticeKey) };
   }
 
   // Hiding the controls is a layout action, so it does not acquire the
@@ -171,7 +214,10 @@ function activate(context) {
   context.subscriptions.push(vscode.commands.registerCommand('frostedBackground.closePanel', closePanel));
   panel = new BackgroundPanel(vscode, context, {
     readConfig,
-    isBusy: () => busy,
+    isBusy: () => busy && !liveConfigBusy,
+    isLiveEnabled: () => runtimeReady && context.globalState.get('enabled', false),
+    needsBootstrap: () => context.globalState.get('enabled', false) && !runtimeReady,
+    liveConfig: applyLiveConfig,
     chooseMedia: kind => runExclusive(() => chooseMediaFile(kind)),
     apply: (mediaPath, config) => runExclusive(() => applyMedia(mediaPath, config, true)),
     restore: () => runExclusive(() => restoreBackground(true)),
@@ -242,25 +288,36 @@ function activate(context) {
     if (!Object.keys(DEFAULTS).some(key => event.affectsConfiguration('frostedBackground.' + key))) return;
     if (!context.globalState.get('enabled', false)) return;
     clearTimeout(changeTimer);
-    changeTimer = setTimeout(async () => {
-      if (disposed) return;
+    const applyChangedConfig = async () => {
+      if (disposed || !context.globalState.get('enabled', false)) return;
+      if (runtimeReady) {
+        if (busy || panel.pending || panel.liveApplying) {
+          changeTimer = setTimeout(applyChangedConfig, 300);
+          return;
+        }
+        try { await applyLiveConfig(readConfig()); panel.refresh({ resetDraft: true }); }
+        catch (error) { panel.error = error; panel.refresh(); output.appendLine(describeError(error)); }
+        return;
+      }
       const action = text('应用设置');
       const choice = await vscode.window.showInformationMessage(text('毛玻璃效果设置已修改，应用后重载窗口即可生效。'), action);
       if (choice === action && !disposed) await vscode.commands.executeCommand('frostedBackground.apply');
-    }, 1200);
+    };
+    changeTimer = setTimeout(applyChangedConfig, 300);
   }));
   context.subscriptions.push({ dispose: () => { disposed = true; clearTimeout(changeTimer); } });
 
   // An extension update can refresh an already-enabled, consented background.
   // A missing patch (such as after VS Code itself updates) always needs manual apply.
   if (vscode.env.uiKind === vscode.UIKind.Desktop && context.globalState.get('enabled', false)) {
-    patcher.status({ appRoot: vscode.env.appRoot }).then(async state => {
+    initialStatus.then(async state => {
       if (disposed || busy || !context.globalState.get('enabled', false)) return;
       const upgraded = context.globalState.get('lastAppliedExtensionVersion') !== extensionVersion;
       if (state.installed && !upgraded) return;
       if (state.installed && upgraded && context.globalState.get('injectionConsent', false) && updater.readMode() === 'automatic') {
         try {
           await runExclusive(async () => {
+            await markBootstrapRequired();
             await patcher.reapply({ appRoot: vscode.env.appRoot, rendererPath: context.asAbsolutePath('media/renderer.js') });
             await context.globalState.update('lastAppliedExtensionVersion', extensionVersion);
           });

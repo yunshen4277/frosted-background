@@ -3,6 +3,17 @@
 // Native VS Code messages use the persisted panel language, independently of
 // VS Code's own display language. Unknown diagnostics remain intact for support.
 const messages = {
+  '实时背景配置地址无效，已停止操作。': ['The live background settings address is invalid. The operation was stopped.', 'La dirección de los ajustes del fondo en tiempo real no es válida. Se detuvo la operación.'],
+  '视频播放器缓存地址无效，已停止操作。': ['The cached video player address is invalid. The operation was stopped.', 'La dirección del reproductor de vídeo en caché no es válida. Se detuvo la operación.'],
+  '实时背景配置不是有效的普通文件，已停止操作。': ['Live background settings are not a valid regular file. The operation was stopped.', 'Los ajustes del fondo en tiempo real no son un archivo normal válido. Se detuvo la operación.'],
+  '实时背景配置无效，已停止操作。': ['Live background settings are invalid. The operation was stopped.', 'Los ajustes del fondo en tiempo real no son válidos. Se detuvo la operación.'],
+  '实时背景配置过大，已停止操作。': ['Live background settings are too large. The operation was stopped.', 'Los ajustes del fondo en tiempo real son demasiado grandes. Se detuvo la operación.'],
+  '当前背景尚不支持实时调整，请重新应用背景。': ['This background does not support live adjustments yet. Apply the background again.', 'Este fondo todavía no admite ajustes en tiempo real. Vuelve a aplicar el fondo.'],
+  '实时背景配置与界面文件不一致，请重新应用背景。': ['Live settings and the interface file do not match. Apply the background again.', 'Los ajustes en tiempo real y el archivo de interfaz no coinciden. Vuelve a aplicar el fondo.'],
+  '背景已实时应用，无需重载。': ['Background applied live. No reload needed.', 'Fondo aplicado al instante. No hace falta recargar.'],
+  '背景已实时应用，但设置保存失败，可稍后重试：{error}': ['Background applied live, but settings could not be saved. Retry later: {error}', 'El fondo se aplicó al instante, pero no se guardaron los ajustes. Inténtalo de nuevo: {error}'],
+  '首次启用或升级后需要重载一次，之后更换背景和调整效果将自动生效。': ['Reload once after first enabling or upgrading. Future background and effect changes apply automatically.', 'Recarga una vez al activar o actualizar. Después, los cambios de fondo y efectos se aplicarán automáticamente.'],
+  '请先应用背景并重载一次，以启用实时调整。': ['Apply the background and reload once to enable live adjustments.', 'Aplica el fondo y recarga una vez para activar los ajustes en tiempo real.'],
   '毛玻璃背景': ['Frosted Background', 'Fondo esmerilado'],
   '毛玻璃': ['Frosted', 'Fondo'],
   '背景控制面板': ['Background Controls', 'Controles de fondo'],

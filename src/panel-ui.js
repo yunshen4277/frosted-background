@@ -87,12 +87,12 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, nonce, langu
 
     <div class="feedback" id="error" role="alert" hidden></div>
     <div class="notice" id="notice" role="status" hidden></div>
-    <div class="panel-footnote">${label("预览即时更新，编辑区效果应用后重载生效。")}</div>
+    <div class="panel-footnote">${label("选择素材即应用。首次设置完成后，调整效果会自动生效，无需重载。")}</div>
   </main>
   <footer class="action-bar">
-    <div class="draft-label" id="draft-label" aria-live="polite">${label("把喜欢的风景，放进代码里")}</div>
-    <button type="button" class="primary-button" id="apply" disabled><span id="apply-label">${label("应用到编辑区")}</span><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8h10m-4-4 4 4-4 4"/></svg></button>
-    <div class="footer-secondary"><button type="button" class="text-button" id="restore" disabled>${label("关闭背景并恢复")}</button><button type="button" class="reload-button" id="reload" hidden>${label("重载窗口 ↗")}</button></div>
+    <div class="draft-label" id="draft-label" aria-live="polite">${label("选择图片或视频，即可应用背景。")}</div>
+    <button type="button" class="primary-button" id="apply" aria-describedby="draft-label" disabled><span id="apply-label">${label("应用")}</span><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8h10m-4-4 4 4-4 4"/></svg></button>
+    <div class="footer-secondary"><button type="button" class="text-button" id="restore" disabled>${label("关闭背景并恢复")}</button></div>
   </footer>
   <script nonce="${token}" src="${escapeAttribute(i18nUri)}"></script>
   <script nonce="${token}" src="${escapeAttribute(scriptUri)}"></script>
