@@ -15,11 +15,12 @@ function harness(options = {}) {
   const state = new Map(Object.entries({ language: 'zh-CN', lastAppliedExtensionVersion: '0.2.0', ...(options.state || {}) }));
   const configuration = { ...(options.config || {}) };
   const timers = new Map();
-  const calls = { apply: [], reapply: [], updateConfig: [], restore: [], status: [], open: [], warning: [], info: [], error: [], command: [], state: [], progress: [], log: [], configurationWrites: [], providers: [], statusBars: [] };
+  const calls = { apply: [], reapply: [], updateConfig: [], restore: [], status: [], open: [], warning: [], info: [], error: [], command: [], state: [], progress: [], log: [], configurationWrites: [], providers: [], statusBars: [], external: [], remote: [] };
   const uri = file => ({ scheme: 'file', fsPath: file, path: file.replace(/\\/g, '/'), toString: () => 'file:///' + file.replace(/\\/g, '/') });
   const context = {
     subscriptions: [],
     extensionUri: uri(path.resolve(path.dirname(extensionFile), '..')),
+    globalStorageUri: uri(path.resolve(process.env.FROSTED_TEST_TMP || require('node:os').tmpdir(), 'frosted-host-test-cache')),
     extension: { packageJSON: { version: options.version || '0.2.0' } },
     asAbsolutePath: name => path.resolve(path.dirname(extensionFile), '..', name),
     globalState: {
@@ -60,8 +61,8 @@ function harness(options = {}) {
     StatusBarAlignment: { Left: 1, Right: 2 },
     ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
     version: '1.144.1',
-    env: { uiKind: options.web ? 2 : 1, appRoot: 'test/app-root', sessionId: options.sessionId || 'test-window-session' },
-    Uri: { file: uri, joinPath: (base, ...segments) => uri(path.join(base.fsPath, ...segments)) },
+    env: { uiKind: options.web ? 2 : 1, appRoot: 'test/app-root', sessionId: options.sessionId || 'test-window-session', openExternal: async value => { calls.external.push(value.toString()); return options.external !== false; } },
+    Uri: { file: uri, parse: value => ({ toString: () => value }), joinPath: (base, ...segments) => uri(path.join(base.fsPath, ...segments)) },
     commands: {
       registerCommand: (name, callback) => { handlers.set(name, callback); return { dispose() {} }; },
       executeCommand: async (name, ...args) => {
@@ -113,6 +114,8 @@ function harness(options = {}) {
       if (name === './panel') return require('../src/panel');
       if (name === './updater') return require('../src/updater');
       if (name === './localization') return require('../src/localization');
+      if (name === '../media/source') return require('../media/source');
+      if (name === './remote-media') return { resolveMediaLink: async (...args) => { calls.remote.push(args.slice(0, 2)); if (options.resolveMediaLink) return options.resolveMediaLink(...args); return options.remoteMedia; } };
       return require(name);
     },
     setTimeout: options.captureTimers ? (callback, delay) => {
@@ -121,7 +124,7 @@ function harness(options = {}) {
       return timer;
     } : setTimeout,
     clearTimeout: options.captureTimers ? timer => timers.delete(timer) : clearTimeout,
-    Error
+    Error, AbortController
   };
   vm.runInNewContext(extensionSource, sandbox, { filename: extensionFile });
   sandbox.module.exports.activate(context);
@@ -133,6 +136,80 @@ function harness(options = {}) {
 }
 
 async function settle() { for (let index = 0; index < 5; index++) await new Promise(resolve => setImmediate(resolve)); }
+
+test('platform links open only the official page without changing or applying the background', async t => {
+  const env = harness({ state: { mediaPath: 'D:/existing.png', language: 'en' } });
+  t.after(() => env.dispose());
+  const panel = attachPanel(env); await settle();
+  await panel.send({ type: 'chooseUrl', kind: 'auto', url: 'https://youtu.be/dQw4w9WgXcQ?si=tracking', config: DEFAULTS });
+  assert.deepEqual(env.calls.external, ['https://www.youtube.com/watch?v=dQw4w9WgXcQ']);
+  assert.equal(env.calls.apply.length, 0);
+  assert.equal(env.calls.warning.length, 0);
+  assert.equal(env.calls.remote.length, 0);
+  assert.equal(env.state.get('mediaPath'), 'D:/existing.png');
+  assert.match(panel.latest().notice, /official player/);
+  await panel.send({ type: 'chooseUrl', kind: 'auto', url: 'https://account:secret@www.twitch.tv/nasa', config: DEFAULTS });
+  assert.equal(env.calls.external.length, 1);
+  assert.doesNotMatch(panel.latest().error, /secret/);
+});
+
+test('HLS selection persists separately, live pause keeps the source, and local selection clears it', async t => {
+  const source = { type: 'hls', kind: 'video', url: 'https://cdn.example.com/live.m3u8?sig=private' };
+  const env = harness({ version: '0.10.0', liveProtocol: 1, remoteMedia: source,
+    files: [{ scheme: 'file', fsPath: 'D:/new.webm' }],
+    state: { enabled: true, mediaPath: 'D:/old.png', injectionConsent: true, lastAppliedExtensionVersion: '0.10.0' }
+  });
+  t.after(() => env.dispose());
+  const panel = attachPanel(env); await settle();
+  await panel.send({ type: 'chooseUrl', kind: 'hls', url: source.url, config: DEFAULTS });
+  assert.deepEqual(env.calls.apply[0].mediaSource, source);
+  assert.equal(env.calls.apply[0].mediaPath, undefined);
+  assert.deepEqual(env.state.get('mediaSource'), source);
+  assert.equal(env.state.get('mediaPath'), undefined);
+  assert.equal(panel.latest().media.type, 'hls');
+  assert.doesNotMatch(panel.latest().media.name, /private/);
+  assert.equal(panel.latest().liveEnabled, true);
+  await panel.send({ type: 'liveConfig', requestId: 1, config: { ...DEFAULTS, paused: true } });
+  assert.equal(env.calls.updateConfig[0].config.paused, true);
+  assert.equal(env.configuration.paused, true);
+  assert.equal(env.calls.apply.length, 1);
+  assert.deepEqual(env.state.get('mediaSource'), source);
+  await panel.send({ type: 'chooseMedia', kind: 'video', config: { ...DEFAULTS, paused: true } });
+  assert.equal(env.state.get('mediaSource'), undefined);
+  assert.equal(env.state.get('mediaPath'), 'D:/new.webm');
+  assert.equal(env.calls.command.length, 0);
+});
+
+test('failed external download retains the current background and does not reload', async t => {
+  const env = harness({ version: '0.10.0', liveProtocol: 1,
+    resolveMediaLink: async () => { throw new Error('无法下载媒体，请检查网络、链接或站点访问限制。'); },
+    state: { enabled: true, mediaPath: 'D:/old.png', injectionConsent: true, lastAppliedExtensionVersion: '0.10.0' }
+  });
+  t.after(() => env.dispose());
+  const panel = attachPanel(env); await settle();
+  await panel.send({ type: 'chooseUrl', kind: 'image', url: 'https://cdn.example.com/a.png?sig=private', config: DEFAULTS });
+  assert.equal(env.calls.apply.length, 0);
+  assert.equal(env.calls.command.length, 0);
+  assert.equal(env.state.get('mediaPath'), 'D:/old.png');
+  assert.equal(panel.latest().liveEnabled, true);
+  assert.equal(panel.latest().busy, false);
+  assert.ok(panel.latest().error);
+});
+
+test('extension disposal cancels an active link download and cannot apply its late result', async () => {
+  let finish, signal;
+  const env = harness({ resolveMediaLink: async (_url, _kind, options) => {
+    signal = options.signal; return new Promise(resolve => { finish = resolve; });
+  }, state: { mediaPath: 'D:/old.png', injectionConsent: true } });
+  const panel = attachPanel(env); await settle();
+  const work = panel.send({ type: 'chooseUrl', kind: 'image', url: 'https://cdn.example.com/a.png', config: DEFAULTS });
+  await settle();
+  assert.ok(signal);
+  env.dispose(); assert.equal(signal.aborted, true);
+  finish('D:/late.png'); await work;
+  assert.equal(env.calls.apply.length, 0);
+  assert.equal(env.state.get('mediaPath'), 'D:/old.png');
+});
 
 test('a loaded live renderer applies new media and settings without reload or repeated media copies', async () => {
   const env = harness({ version: '0.7.0', liveProtocol: 1, captureTimers: true,

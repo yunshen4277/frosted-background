@@ -7,8 +7,20 @@ const path = require('node:path');
 const os = require('node:os');
 const { pathToFileURL } = require('node:url');
 const { randomUUID } = require('node:crypto');
-const bundledRuntime = name => Buffer.concat([
+const bundledRuntime = (name, streaming = false) => Buffer.concat([
   fs.readFileSync(path.join(__dirname, '../media/regions.js')), Buffer.from('\n;\n'),
+  fs.readFileSync(path.join(__dirname, '../media/source.js')), Buffer.from('\n;\n'),
+  ...(streaming ? [fs.readFileSync(path.join(__dirname, '../media/vendor/hls.min.js')), Buffer.from(`\n;\n
+    // Keep the real Hls implementation; record lifetime and configuration only.
+    window.__hlsInstances = [];
+    const NativeHls = window.Hls;
+    window.Hls = class extends NativeHls {
+      constructor(config) { super(config); this.fixtureConfig = config; this.fixtureLoads = 0; this.fixtureRecoveries = 0; window.__hlsInstances.push(this); }
+      loadSource(...args) { this.fixtureLoads++; return super.loadSource(...args); }
+      recoverMediaError(...args) { this.fixtureRecoveries++; return super.recoverMediaError(...args); }
+      destroy() { top.__hlsDestroyed = (top.__hlsDestroyed || 0) + 1; return super.destroy(); }
+    };
+  `)] : []),
   fs.readFileSync(path.join(__dirname, '../media', name)),
 ]);
 
@@ -35,7 +47,7 @@ test('renderer fits the editor, preserves interaction and manages image/video li
       enabled: true, kind: params.get('kind') || 'image',
       source: params.get('source') || './wallpaper.png', fit: params.get('fit') || 'cover',
       opacity: 0.7, blur: params.has('blur') ? Number(params.get('blur')) : 10, tintOpacity: 0.15,
-      pauseWhenUnfocused: true, respectReducedMotion: true,
+      pauseWhenUnfocused: true, respectReducedMotion: true, paused: params.has('paused'),
     };
     if (params.has('player')) {
       config.source = `./frosted-background-assets/${mediaName}`;
@@ -243,6 +255,12 @@ test('renderer fits the editor, preserves interaction and manages image/video li
     const webm = fs.readFileSync(path.join(__dirname, 'fixtures/colors.webm'));
     fs.writeFileSync(path.join(fixtureDirectory, 'video.webm'), webm);
     if (process.env.RENDERER_ARTIFACT_DIR) fs.writeFileSync(path.join(process.env.RENDERER_ARTIFACT_DIR, 'sample.webm'), webm);
+    await openFixture('kind=video&source=./video.webm&paused=1');
+    await page.waitForSelector('.frosted-background-ready');
+    assert.equal(await page.locator('video').evaluate(video => video.paused && video.readyState >= 2), true, 'legacy direct video respects a paused start');
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await page.waitForTimeout(100);
+    assert.equal(await page.locator('video').evaluate(video => video.paused), true);
     await openFixture('kind=video&source=./video.webm&sticky=1');
     await page.waitForSelector('.frosted-background-ready', { timeout: 5000 }).catch(async error => {
       assert.fail(error.message + '\nVideo state: ' + JSON.stringify(await page.locator('video').evaluate(el => ({ source: el.currentSrc, error: el.error?.message, readyState: el.readyState, networkState: el.networkState }))));
@@ -556,9 +574,15 @@ test('live state swaps media without reload, preserves video settings updates an
     await page.waitForTimeout(100);
     assert.ok((await regionPixels('fill')).overlap.every(value => value > 210), 'regional theme tint updates without recreating media');
     await page.evaluate(() => document.documentElement.style.setProperty('--vscode-editor-background', '#181818'));
-    publish(video);
+    publish({ ...video, paused: true });
     await page.waitForSelector('iframe.frosted-background-media');
     const frame = page.frames().find(value => value.url().includes(playerName));
+    await frame.waitForFunction(() => document.querySelector('video').readyState >= 2);
+    assert.equal(await frame.locator('video').evaluate(element => element.paused), true, 'manual pause still decodes the first frame of a local video');
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await page.waitForTimeout(100);
+    assert.equal(await frame.locator('video').evaluate(element => element.paused), true, 'focus cannot override manual pause');
+    publish(video);
     await frame.waitForFunction(() => document.querySelector('video').readyState >= 2 && !document.querySelector('video').paused);
     await page.emulateMedia({ reducedMotion: 'reduce' });
     await frame.waitForFunction(() => document.querySelector('video').paused);
@@ -718,6 +742,186 @@ test('live state swaps media without reload, preserves video settings updates an
     await browser.close();
     fs.rmSync(localDirectory, { recursive: true, force: true });
   }
+});
+
+test('isolated HLS decodes real segments, preserves manual pause and disposes bounded recovery', {
+  skip: !process.env.PLAYWRIGHT_MODULE,
+  timeout: 60000,
+}, async () => {
+  const { chromium } = require(process.env.PLAYWRIGHT_MODULE);
+  const executablePath = process.env.BROWSER_EXECUTABLE || [
+    'C:/Program Files/Google/Chrome/Application/chrome.exe',
+    'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+  ].find(value => fs.existsSync(value));
+  const assets = './frosted-background-assets/';
+  const playerName = `video-host-${'a'.repeat(64)}.html`;
+  const imageName = `media-${'b'.repeat(64)}.png`;
+  const initial = {
+    enabled: true, kind: 'video', sourceType: 'hls',
+    source: 'https://stream-media.test/hls-playlist.m3u8?signature=private-fixture-token',
+    videoPlayer: assets + playerName, liveState: assets + 'live-state.json',
+    blur: 8, opacity: 0.5, tintOpacity: 0.1, saturation: 1, brightness: 1,
+    fit: 'fill', position: 'center center', playbackRate: 1,
+    pauseWhenUnfocused: true, respectReducedMotion: true, paused: true,
+  };
+  let state = { protocol: 1, revision: randomUUID(), settings: initial };
+  const publish = settings => { state = { protocol: 1, revision: randomUUID(), settings }; };
+  const playerHtml = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; connect-src 'self' https:; media-src blob: https:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none';"><body><script src="./player.js" defer></script></body>`;
+  const fixture = `<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self'; media-src 'self'; frame-src 'self'; connect-src 'self';"><style>:root{--vscode-editor-background:#181818}body{margin:0}.part.editor{position:absolute;inset:20px}.content,.editor-group-container,.editor-container,.editor-instance,.monaco-editor{width:100%;height:100%}</style><main class="part editor"><div class="content"><div class="editor-group-container"><div class="editor-container"><div class="editor-instance"><div class="monaco-editor">code stays sharp</div></div></div></div></div></main><script src="./renderer.js" data-frosted-config="${JSON.stringify(initial).replace(/&/g, '&amp;').replace(/"/g, '&quot;')}"></script>`;
+  const files = new Map([
+    ['/index.html', ['text/html', fixture]],
+    ['/renderer.js', ['text/javascript', bundledRuntime('renderer.js')]],
+    [`/frosted-background-assets/${playerName}`, ['text/html', playerHtml]],
+    ['/frosted-background-assets/player.js', ['text/javascript', bundledRuntime('video-player.js', true)]],
+    [`/frosted-background-assets/${imageName}`, ['image/png', fs.readFileSync(path.join(__dirname, 'fixtures/edges.png'))]],
+  ]);
+  let livePlaylist = false;
+  const streamRequests = [], errors = [], consoleMessages = [];
+  const browser = await chromium.launch({ headless: true, executablePath });
+  try {
+    const page = await browser.newPage({ viewport: { width: 580, height: 350 } });
+    page.on('pageerror', error => errors.push(error.message));
+    page.on('console', message => { if (['warning', 'error'].includes(message.type())) consoleMessages.push(message.text()); });
+    await page.context().addCookies([{ name: 'do-not-send', value: 'private-fixture-cookie', domain: 'stream-media.test', path: '/', secure: true, sameSite: 'None' }]);
+    await page.addInitScript(() => {
+      window.__csp = []; window.__playerErrors = [];
+      document.addEventListener('securitypolicyviolation', event => window.__csp.push({ directive: event.effectiveDirective, blocked: event.blockedURI }));
+      window.addEventListener('message', event => { if (event.data?.type === 'frosted-background-player' && event.data.event === 'error') window.__playerErrors.push(event.data.detail); });
+    });
+    await page.route('https://stream-workbench.test/**', async route => {
+      const url = new URL(route.request().url());
+      if (url.pathname === '/frosted-background-assets/live-state.json') return route.fulfill({ contentType: 'application/json', body: JSON.stringify(state) });
+      const file = files.get(url.pathname);
+      return route.fulfill(file ? { contentType: file[0], body: file[1] } : { status: 404, body: '' });
+    });
+    await page.route('https://stream-media.test/**', async route => {
+      const request = route.request(), url = new URL(request.url());
+      streamRequests.push({ path: url.pathname, headers: await request.allHeaders() });
+      assert.match(url.pathname, /^\/hls-(?:playlist\.m3u8|init\.mp4|segment-\d\.m4s)$/);
+      // These six 160x90 H264/fMP4 segments were generated from FFmpeg's
+      // testsrc2 filter, with no user media or external stream dependency.
+      const fixtureBody = fs.readFileSync(path.join(__dirname, 'fixtures', url.pathname.slice(1)));
+      return route.fulfill({
+        contentType: url.pathname.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp4',
+        headers: { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' },
+        body: livePlaylist && url.pathname.endsWith('.m3u8') ? fixtureBody.toString().replace('#EXT-X-ENDLIST', '') : fixtureBody,
+      }).catch(() => {});
+    });
+    await page.goto('https://stream-workbench.test/index.html');
+    await page.waitForSelector('iframe.frosted-background-media');
+    let frame = page.frames().find(value => value.url().includes(playerName));
+    try { await page.waitForSelector('.frosted-background-ready', { timeout: 15000 }); }
+    catch (error) {
+      const diagnostic = await frame.evaluate(() => ({
+        supported: Hls.isSupported(), instances: window.__hlsInstances.length,
+        video: { state: document.querySelector('video').readyState, error: document.querySelector('video').error?.message, src: document.querySelector('video').currentSrc },
+        csp: window.__csp,
+      }));
+      assert.fail(`${error.message}\nHLS diagnostics: ${JSON.stringify({ diagnostic, requests: streamRequests.map(item => item.path), errors, consoleMessages })}`);
+    }
+    assert.equal(await frame.locator('video').evaluate(video => video.paused && video.videoWidth === 160 && video.muted && !video.loop), true, 'paused stream still decodes an actual first frame');
+    assert.equal(await frame.evaluate(() => window.__hlsInstances.length), 1);
+    assert.equal(await frame.evaluate(() => window.__hlsInstances[0].fixtureConfig.enableWorker), false);
+    assert.equal(await frame.evaluate(() => {
+      const config = window.__hlsInstances[0].fixtureConfig, xhr = { withCredentials: true };
+      config.xhrSetup(xhr, 'https://stream-media.test/hls-init.mp4');
+      const request = config.fetchSetup({ url: 'https://stream-media.test/hls-init.mp4' }, {});
+      let rejected = 0;
+      for (const url of ['http://stream-media.test/a', 'https://127.0.0.1/a', 'https://name:secret@stream-media.test/a']) {
+        try { config.xhrSetup(xhr, url); } catch { rejected++; }
+      }
+      return xhr.withCredentials === false && request.credentials === 'omit' && rejected === 3;
+    }), true, 'segment requests omit credentials and enforce public HTTPS URLs');
+    await frame.locator('video').evaluate(video => { window.__originalVideo = video; });
+    await page.locator('iframe').evaluate(iframe => { window.__originalFrame = iframe; });
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await page.waitForTimeout(150);
+    assert.equal(await frame.locator('video').evaluate(video => video.paused), true, 'manual pause overrides focus and reduced-motion transitions');
+    const region = { id: 'left', name: 'Left', points: [[0, 0], [0.5, 0], [0.5, 1], [0, 1]], blur: 0, opacity: 1, tintOpacity: 0, brightness: 0.5, saturation: 1, feather: 0.06 };
+    const regional = { ...initial, blur: 0, opacity: 1, tintOpacity: 0, regions: { enabled: true, items: [region] } };
+    publish(regional);
+    await frame.waitForFunction(() => document.querySelector('canvas')?.width > 0);
+    const pixels = await frame.locator('canvas').evaluate(canvas => [...canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data].filter((_value, index) => index % 19 === 0).join(','));
+    const loads = await frame.evaluate(() => window.__hlsInstances[0].fixtureLoads);
+    publish({ ...regional, paused: false });
+    await frame.waitForFunction(previous => {
+      const video = document.querySelector('video'), canvas = document.querySelector('canvas');
+      const current = [...canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data].filter((_value, index) => index % 19 === 0).join(',');
+      return !video.paused && video.currentTime > 0.1 && current !== previous;
+    }, pixels);
+    publish({ ...regional, paused: true, fit: 'contain', brightness: 0.7, playbackRate: 1.25 });
+    await frame.waitForFunction(() => document.querySelector('video').paused && document.querySelector('video').style.objectFit === 'contain');
+    const pausedTime = await frame.locator('video').evaluate(video => video.currentTime);
+    await page.waitForTimeout(200);
+    assert.equal(await frame.locator('video').evaluate(video => video.currentTime), pausedTime);
+    assert.equal(await frame.evaluate(() => document.querySelector('video') === window.__originalVideo && window.__hlsInstances.length === 1 && window.__hlsInstances[0].fixtureLoads === 1), true, 'pause, effects and fit preserve the HLS instance and decoder');
+    assert.equal(loads, 1);
+    assert.equal(await page.evaluate(() => document.querySelector('iframe') === window.__originalFrame), true);
+    assert.equal(await page.locator('.monaco-editor').evaluate(element => getComputedStyle(element).filter), 'none');
+    for (const source of ['http://stream-media.test/a.m3u8', 'https://127.0.0.1/a.m3u8', 'https://user:pass@stream-media.test/a.m3u8', 'https://www.youtube.com/watch?v=abcdefghijk']) {
+      publish({ ...initial, source });
+      await page.waitForResponse(response => response.url().includes('/live-state.json'));
+      await page.waitForTimeout(25);
+      assert.equal(await page.evaluate(() => document.querySelector('iframe') === window.__originalFrame), true, 'invalid remote state cannot replace the active stream');
+    }
+    assert.deepEqual(await page.evaluate(() => window.__csp), []);
+    assert.deepEqual(await frame.evaluate(() => window.__csp), [], 'real HLS segments load under the isolated streaming CSP');
+    assert.ok(streamRequests.some(request => request.path.endsWith('.m4s')), 'test uses real fragmented MP4 segments');
+    assert.ok(streamRequests.every(request => !request.headers.cookie && !request.headers.authorization), 'even an existing remote cookie is not sent');
+
+    // Return to a valid publication before exercising failure; subsequent polls
+    // of that same revision must not restart the exhausted player.
+    publish({ ...regional, paused: true });
+    await page.waitForResponse(response => response.url().includes('/live-state.json'));
+    await page.waitForTimeout(25);
+    // Trigger the real library's fatal-error events to exercise bounded recovery
+    // deterministically, without waiting on network timeouts or live services.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      await frame.evaluate(() => window.__hlsInstances[0].trigger(Hls.Events.ERROR, { type: Hls.ErrorTypes.NETWORK_ERROR, details: Hls.ErrorDetails.MANIFEST_LOAD_ERROR, fatal: true, error: new Error('fixture network error') }));
+      await frame.waitForFunction(expected => window.__hlsInstances[0].fixtureLoads === expected, attempt + 1);
+    }
+    await frame.evaluate(() => window.__hlsInstances[0].trigger(Hls.Events.ERROR, { type: Hls.ErrorTypes.NETWORK_ERROR, details: Hls.ErrorDetails.MANIFEST_LOAD_ERROR, fatal: true, error: new Error('fixture network error') }));
+    await page.waitForFunction(() => document.querySelector('.frosted-background-layer')?.dataset.state === 'error');
+    assert.equal(await page.evaluate(() => window.__hlsDestroyed), 1, 'exhausted network recovery destroys the stream');
+    assert.ok((await page.evaluate(() => window.__playerErrors)).every(message => !message.includes('private-fixture-token')), 'signed URLs are not included in player error details');
+    const requestsAfterFailure = streamRequests.length;
+    await page.waitForTimeout(1100);
+    assert.equal(streamRequests.length, requestsAfterFailure, 'unchanged state revisions cannot restart an exhausted stream');
+    assert.equal(await page.evaluate(() => document.querySelector('iframe') === window.__originalFrame), true);
+    publish(initial);
+    await page.waitForSelector('.frosted-background-ready');
+    assert.equal(await page.evaluate(() => document.querySelector('iframe') === window.__originalFrame), false, 'an explicit new publication retries the same failed URL');
+    frame = page.frames().find(value => value.url().includes(playerName));
+    await frame.evaluate(() => window.__hlsInstances[0].trigger(Hls.Events.ERROR, { type: Hls.ErrorTypes.MEDIA_ERROR, details: Hls.ErrorDetails.BUFFER_APPEND_ERROR, fatal: true, error: new Error('fixture decoder error') }));
+    await frame.waitForFunction(() => window.__hlsInstances[0].fixtureRecoveries === 1);
+    await frame.evaluate(() => window.__hlsInstances[0].trigger(Hls.Events.ERROR, { type: Hls.ErrorTypes.MEDIA_ERROR, details: Hls.ErrorDetails.BUFFER_APPEND_ERROR, fatal: true, error: new Error('fixture decoder error') }));
+    await page.waitForFunction(() => document.querySelector('.frosted-background-layer')?.dataset.state === 'error');
+    assert.equal(await page.evaluate(() => window.__hlsDestroyed), 2, 'media recovery is also bounded');
+
+    livePlaylist = true;
+    const playlistsBeforeLive = streamRequests.filter(request => request.path.endsWith('.m3u8')).length;
+    publish(initial);
+    await page.waitForSelector('.frosted-background-ready');
+    frame = page.frames().find(value => value.url().includes(playerName));
+    await frame.waitForFunction(() => window.__hlsInstances[0].levels[0]?.details?.live === true);
+    await page.waitForResponse(response => response.url().includes('stream-media.test/hls-playlist.m3u8'));
+    assert.ok(streamRequests.filter(request => request.path.endsWith('.m3u8')).length > playlistsBeforeLive + 1, 'a live playlist refreshes through the real HLS loader');
+    await frame.evaluate(() => window.__hlsInstances[0].trigger(Hls.Events.ERROR, { type: Hls.ErrorTypes.NETWORK_ERROR, details: Hls.ErrorDetails.MANIFEST_LOAD_ERROR, fatal: true, error: new Error('fixture pending recovery') }));
+    const image = { ...initial, kind: 'image', sourceType: undefined, videoPlayer: undefined, source: assets + imageName };
+    publish(image);
+    await page.waitForSelector('img.frosted-background-media');
+    await page.waitForSelector('.frosted-background-ready');
+    assert.equal(await page.evaluate(() => window.__hlsDestroyed), 3, 'replacing a stream destroys its HLS instance before removing the iframe');
+    const requestsAfterDispose = streamRequests.length;
+    await page.waitForTimeout(1200);
+    assert.equal(streamRequests.length, requestsAfterDispose, 'a disposed stream cannot run its queued recovery');
+    assert.equal(await page.locator('iframe').count(), 0);
+    publish({ enabled: false });
+    await page.waitForFunction(() => !document.querySelector('.frosted-background-layer'));
+    assert.deepEqual(errors, [], 'streaming and recovery cause no uncaught browser errors');
+  } finally { await browser.close(); }
 });
 
 test('feather masks blend real pixels without seams and reuse cached geometry', {

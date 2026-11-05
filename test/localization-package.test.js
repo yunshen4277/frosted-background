@@ -55,7 +55,7 @@ test('VSIX metadata resolves default catalog strings and escapes the translated 
 });
 
 test('packaging requires all localization catalogs, translators and the shared regions runtime', () => {
-  const localization = ['package.nls.json', 'package.nls.zh-cn.json', 'package.nls.es.json', 'src/localization.js', 'media/i18n.js', 'media/regions.js'];
+  const localization = ['package.nls.json', 'package.nls.zh-cn.json', 'package.nls.es.json', 'src/localization.js', 'media/i18n.js', 'media/regions.js', 'src/remote-media.js', 'media/source.js', 'media/vendor/hls.min.js', 'media/vendor/HLS-LICENSE.txt'];
   const files = ['package.json', 'README.md', 'LICENSE', 'CHANGELOG.md', 'src/extension.js', 'src/patcher.js',
     'src/panel.js', 'src/panel-ui.js', 'src/updater.js', 'src/github-update.js', 'media/renderer.js', 'media/video-player.js',
     'media/panel.js', 'media/panel.css', 'media/background-icon.svg', ...localization,

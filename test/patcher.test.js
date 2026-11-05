@@ -22,6 +22,9 @@ async function fixture(t, variant = 'electron-browser') {
   const rendererPath = path.join(appRoot, 'renderer.js');
   const mediaPath = path.join(appRoot, '壁纸 & image.jpg');
   await fs.writeFile(path.join(appRoot, 'regions.js'), '(function(root) { root.FrostedRegions = { version: 1 }; })(globalThis);');
+  await fs.writeFile(path.join(appRoot, 'source.js'), '(function(root) { root.FrostedSource = { version: 1 }; })(globalThis);');
+  await fs.mkdir(path.join(appRoot, 'vendor'));
+  await fs.writeFile(path.join(appRoot, 'vendor', 'hls.min.js'), 'globalThis.Hls = { version: 1 };');
   await fs.writeFile(rendererPath, '(() => { /* renderer fixture */ })();');
   await fs.writeFile(path.join(appRoot, 'video-player.js'), '(() => { /* video player fixture */ })();');
   await fs.writeFile(mediaPath, Buffer.from([0xff, 0xd8, 0xff, 1, 2, 3, 4]));
@@ -31,6 +34,10 @@ async function fixture(t, variant = 'electron-browser') {
 function decodeConfig(html) {
   const encoded = /data-frosted-config="([^"]+)"/.exec(html)[1];
   return JSON.parse(encoded.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'));
+}
+
+function hlsOptions(data, url = 'https://media.example.com/live/main.m3u8?token=a%26b&quality=high') {
+  return { ...data, mediaPath: undefined, mediaSource: { type: 'hls', kind: 'video', url } };
 }
 
 test('apply injects a self-hosted external script without changing CSP; restore is byte-exact', async t => {
@@ -131,7 +138,7 @@ test('video uses an owned standalone player without altering the workbench CSP',
   assert.doesNotMatch(page, /unsafe-eval|srcdoc|https:/);
   const player = /src="\.\/(video-player-[a-f0-9]{64}\.js)"/.exec(page)[1];
   const directory = path.join(path.dirname(data.workbenchPath), patcher.ASSET_DIRECTORY);
-  assert.equal(await fs.readFile(path.join(directory, player), 'utf8'), (await fs.readFile(path.join(data.appRoot, 'regions.js'), 'utf8')) + '\n;\n' + (await fs.readFile(path.join(data.appRoot, 'video-player.js'), 'utf8')));
+  assert.equal(await fs.readFile(path.join(directory, player), 'utf8'), (await fs.readFile(path.join(data.appRoot, 'regions.js'), 'utf8')) + '\n;\n' + (await fs.readFile(path.join(data.appRoot, 'source.js'), 'utf8')) + '\n;\n' + (await fs.readFile(path.join(data.appRoot, 'video-player.js'), 'utf8')));
   await fs.writeFile(path.join(directory, 'video-host-not-owned.html'), 'keep');
   await patcher.restore(data);
   assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
@@ -678,8 +685,9 @@ test('cached scripts execute the shared regions module first and both hashes inc
     const renderer = await fs.readFile(path.join(assetDirectory(data), rendererName));
     const player = await fs.readFile(path.join(assetDirectory(data), playerName));
     const shared = await fs.readFile(regionsPath);
-    assert.deepEqual(renderer, Buffer.concat([shared, Buffer.from('\n;\n'), await fs.readFile(data.rendererPath)]));
-    assert.deepEqual(player, Buffer.concat([shared, Buffer.from('\n;\n'), await fs.readFile(playerPath)]));
+    const prefix = Buffer.concat([shared, Buffer.from('\n;\n'), await fs.readFile(path.join(data.appRoot, 'source.js')), Buffer.from('\n;\n')]);
+    assert.deepEqual(renderer, Buffer.concat([prefix, await fs.readFile(data.rendererPath)]));
+    assert.deepEqual(player, Buffer.concat([prefix, await fs.readFile(playerPath)]));
     assert.equal(rendererName, `renderer-${crypto.createHash('sha256').update(renderer).digest('hex')}.js`);
     assert.equal(playerName, `video-player-${crypto.createHash('sha256').update(player).digest('hex')}.js`);
     const rendererScope = {};
@@ -725,7 +733,7 @@ test('missing, empty, oversized or nonregular regions modules fail before any wo
 });
 
 test('all bundled runtime sources reject symbolic links without reading their target', async t => {
-  for (const sourceName of ['regions.js', 'renderer.js', 'video-player.js']) {
+  for (const sourceName of ['regions.js', 'source.js', 'renderer.js', 'video-player.js', 'vendor/hls.min.js']) {
     await t.test(sourceName, async child => {
       const data = await fixture(child);
       const video = path.join(data.appRoot, 'clip.webm');
@@ -741,7 +749,8 @@ test('all bundled runtime sources reject symbolic links without reading their ta
         assert.notEqual(filename, blockedPath, 'the symlink target must not be opened');
         return open(filename, ...args);
       });
-      await assert.rejects(patcher.apply({ ...data, mediaPath: video }), /重新安装插件/);
+      const options = sourceName === 'vendor/hls.min.js' ? hlsOptions(data) : { ...data, mediaPath: video };
+      await assert.rejects(patcher.apply(options), /重新安装插件/);
       assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
       await assert.rejects(fs.access(assetDirectory(data)), { code: 'ENOENT' });
     });
@@ -751,9 +760,229 @@ test('all bundled runtime sources reject symbolic links without reading their ta
 test('the combined runtime bundle size is bounded before staging', async t => {
   const data = await fixture(t);
   const handle = await fs.open(data.rendererPath, 'w');
-  await handle.truncate(2 * 1024 * 1024);
+  await handle.truncate(3 * 1024 * 1024);
   await handle.close();
   await assert.rejects(patcher.apply(data), /插件运行文件无效或过大/);
   assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
   await assert.rejects(fs.access(assetDirectory(data)), { code: 'ENOENT' });
+});
+
+test('HLS applies an owned bundled player without downloading media or changing the workbench CSP', async t => {
+  const data = await fixture(t);
+  const options = hlsOptions(data);
+  const https = require('node:https');
+  const noNetwork = () => { throw new Error('patcher must not perform network requests'); };
+  t.mock.method(https, 'get', noNetwork);
+  t.mock.method(https, 'request', noNetwork);
+  t.mock.method(globalThis, 'fetch', noNetwork);
+  await patcher.apply(options);
+  const html = await fs.readFile(data.workbenchPath, 'utf8');
+  const payload = decodeConfig(html);
+  assert.equal(patcher.stripInjection(html), ORIGINAL);
+  assert.equal(payload.source, options.mediaSource.url);
+  assert.equal(payload.sourceType, 'hls');
+  assert.equal(payload.kind, 'video');
+  assert.deepEqual((await liveState(data)).settings, payload);
+  assert.equal((await patcher.status(data)).liveProtocol, 1);
+  assert.equal((await fs.readdir(assetDirectory(data))).some(name => name.startsWith('media-')), false);
+  const page = await fs.readFile(path.join(path.dirname(data.workbenchPath), payload.videoPlayer), 'utf8');
+  assert.match(page, /connect-src 'self' https:; media-src blob: https:;/);
+  assert.match(page, /script-src 'self';/);
+  assert.doesNotMatch(page, /unsafe-eval|https:\/\//);
+  const player = /src="\.\/(video-player-[a-f0-9]{64}\.js)"/.exec(page)[1];
+  const bytes = await fs.readFile(path.join(assetDirectory(data), player));
+  assert.deepEqual(bytes, Buffer.concat([
+    await fs.readFile(path.join(data.appRoot, 'regions.js')), Buffer.from('\n;\n'),
+    await fs.readFile(path.join(data.appRoot, 'source.js')), Buffer.from('\n;\n'),
+    await fs.readFile(path.join(data.appRoot, 'vendor', 'hls.min.js')), Buffer.from('\n;\n'),
+    await fs.readFile(path.join(data.appRoot, 'video-player.js')),
+  ]));
+  assert.equal(player, `video-player-${crypto.createHash('sha256').update(bytes).digest('hex')}.js`);
+});
+
+test('HLS configuration updates preserve its source and helpers without reading runtime or media bytes', async t => {
+  const data = await fixture(t);
+  await patcher.apply(hlsOptions(data));
+  const previous = await liveState(data);
+  const names = (await fs.readdir(assetDirectory(data))).sort();
+  const readFile = fs.readFile;
+  t.mock.method(fs, 'readFile', async (filename, ...args) => {
+    assert.doesNotMatch(String(filename), /(?:renderer-|video-player-|media-)[a-f0-9]{64}\./, 'live updates need only the small control documents');
+    return readFile(filename, ...args);
+  });
+  t.mock.method(nativeFs, 'createReadStream', () => { throw new Error('no hashing or copying'); });
+  await patcher.updateConfig({ appRoot: data.appRoot, config: { blur: 23, playbackRate: 0.5, source: 'file:///outside.mp4', sourceType: 'local', mediaSource: hlsOptions(data, 'https://other.example.com/change.m3u8').mediaSource, videoPlayer: 'https://example.com/foreign.js' } });
+  const next = await liveState(data);
+  assert.notEqual(next.revision, previous.revision);
+  assert.equal(next.settings.blur, 23);
+  assert.equal(next.settings.playbackRate, 0.5);
+  assert.equal(next.settings.source, previous.settings.source);
+  assert.equal(next.settings.sourceType, 'hls');
+  assert.equal(next.settings.videoPlayer, previous.settings.videoPlayer);
+  assert.deepEqual(decodeConfig(await fs.readFile(data.workbenchPath, 'utf8')), next.settings);
+  assert.deepEqual((await fs.readdir(assetDirectory(data))).sort(), names);
+});
+
+test('HLS reapply preserves the last source while library and source-module changes invalidate the proper bundles', async t => {
+  const data = await fixture(t);
+  await fs.writeFile(data.rendererPath, 'globalThis.loadedSource = FrostedSource.version;');
+  await fs.writeFile(path.join(data.appRoot, 'video-player.js'), 'globalThis.loaded = [FrostedRegions.version, FrostedSource.version, Hls.version];');
+  await patcher.apply({ ...hlsOptions(data), config: { blur: 9, fit: 'fill' } });
+  const inspect = async () => {
+    const html = await fs.readFile(data.workbenchPath, 'utf8');
+    const payload = decodeConfig(html);
+    const rendererName = /src="\.\/frosted-background-assets\/(renderer-[a-f0-9]{64}\.js)"/.exec(html)[1];
+    const page = await fs.readFile(path.join(path.dirname(data.workbenchPath), payload.videoPlayer), 'utf8');
+    const playerName = /src="\.\/(video-player-[a-f0-9]{64}\.js)"/.exec(page)[1];
+    const rendererScope = {}, playerScope = {};
+    vm.runInNewContext(await fs.readFile(path.join(assetDirectory(data), rendererName), 'utf8'), rendererScope);
+    vm.runInNewContext(await fs.readFile(path.join(assetDirectory(data), playerName), 'utf8'), playerScope);
+    return { payload, rendererName, playerName, loaded: Array.from(playerScope.loaded), sourceVersion: rendererScope.loadedSource };
+  };
+  const first = await inspect();
+  assert.deepEqual(first.loaded, [1, 1, 1]);
+  await fs.unlink(data.mediaPath);
+  await fs.writeFile(path.join(data.appRoot, 'vendor', 'hls.min.js'), 'globalThis.Hls = { version: 2 };');
+  await patcher.reapply({ appRoot: data.appRoot, rendererPath: data.rendererPath });
+  const second = await inspect();
+  assert.deepEqual(second.loaded, [1, 1, 2]);
+  assert.equal(second.rendererName, first.rendererName, 'HLS is not loaded in the workbench renderer');
+  assert.notEqual(second.playerName, first.playerName);
+  assert.equal(second.payload.source, first.payload.source);
+  assert.equal(second.payload.blur, 9);
+  assert.equal(second.payload.fit, 'fill');
+  await fs.writeFile(path.join(data.appRoot, 'source.js'), 'globalThis.FrostedSource = { version: 2 };');
+  await patcher.reapply({ appRoot: data.appRoot, rendererPath: data.rendererPath });
+  const third = await inspect();
+  assert.equal(third.sourceVersion, 2);
+  assert.deepEqual(third.loaded, [1, 2, 2]);
+  assert.notEqual(third.rendererName, second.rendererName);
+  assert.notEqual(third.playerName, second.playerName);
+  assert.equal(third.payload.source, first.payload.source);
+  assert.equal((await patcher.status(data)).liveProtocol, 1);
+});
+
+test('invalid remote descriptors and ambiguous sources fail before creating any owned assets', async t => {
+  const data = await fixture(t);
+  const valid = hlsOptions(data).mediaSource;
+  for (const mediaSource of [null, [], {}, { ...valid, type: 'video' }, { ...valid, kind: 'image' },
+    ...['http://media.example.com/live.m3u8', 'file:///outside.m3u8', 'javascript:alert(1)', 'https://user:password@example.com/live.m3u8', 'https://127.0.0.1/live.m3u8', 'https://www.youtube.com/watch?v=M7lc1UVf-VE'].map(url => ({ ...valid, url }))]) {
+    await assert.rejects(patcher.apply({ ...data, mediaPath: undefined, mediaSource }));
+  }
+  await assert.rejects(patcher.apply({ ...data, mediaSource: valid }), /一个背景来源/);
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
+  await assert.rejects(fs.access(assetDirectory(data)), { code: 'ENOENT' });
+});
+
+test('cached HLS requires a strict source marker, normalized URL and owned local player', async t => {
+  const data = await fixture(t);
+  await patcher.apply(hlsOptions(data));
+  const original = await fs.readFile(data.workbenchPath, 'utf8');
+  const previous = decodeConfig(original);
+  for (const change of [{ sourceType: undefined }, { sourceType: 'remote' }, { source: 'https://user:password@example.com/live.m3u8' }, { source: previous.source + '#fragment' }, { kind: 'image' }, { videoPlayer: undefined }, { videoPlayer: './frosted-background-assets/../outside.html' }]) {
+    const altered = replaceConfig(original, { ...previous, ...change });
+    await fs.writeFile(data.workbenchPath, altered);
+    await assert.rejects(patcher.reapply({ appRoot: data.appRoot, rendererPath: data.rendererPath }));
+    await assert.rejects(patcher.updateConfig({ appRoot: data.appRoot, config: { blur: 2 } }));
+    assert.equal((await patcher.status(data)).liveProtocol, undefined);
+    assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), altered);
+  }
+  await fs.writeFile(data.workbenchPath, original);
+  await fs.unlink(path.join(path.dirname(data.workbenchPath), previous.videoPlayer));
+  await assert.rejects(patcher.updateConfig({ appRoot: data.appRoot, config: { blur: 2 } }), { code: 'ENOENT' });
+  await assert.rejects(patcher.reapply({ appRoot: data.appRoot, rendererPath: data.rendererPath }), { code: 'ENOENT' });
+  assert.equal((await patcher.status(data)).liveProtocol, undefined);
+});
+
+test('HLS publication failures preserve the previous local background and clean newly staged helpers', async t => {
+  const data = await fixture(t);
+  await patcher.apply(data);
+  const html = await fs.readFile(data.workbenchPath, 'utf8');
+  const live = await fs.readFile(livePath(data), 'utf8');
+  const names = (await fs.readdir(assetDirectory(data))).sort();
+  const rename = fs.rename;
+  t.mock.method(fs, 'rename', async (from, to) => {
+    if (to === livePath(data)) throw new Error('simulated HLS publication failure');
+    return rename(from, to);
+  });
+  await assert.rejects(patcher.apply(hlsOptions(data)), /HLS publication failure/);
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), html);
+  assert.equal(await fs.readFile(livePath(data), 'utf8'), live);
+  assert.deepEqual((await fs.readdir(assetDirectory(data))).sort(), names);
+});
+
+test('failed HLS HTML rollback retains the bundled player indirectly referenced by its persisted video page', async t => {
+  const data = await fixture(t);
+  await patcher.apply(data);
+  const live = await fs.readFile(livePath(data), 'utf8');
+  const rename = fs.rename;
+  let htmlWrites = 0;
+  t.mock.method(fs, 'rename', async (from, to) => {
+    if (to === livePath(data)) throw new Error('HLS live commit failed');
+    if (to === data.workbenchPath && ++htmlWrites === 2) throw new Error('HLS rollback failed');
+    return rename(from, to);
+  });
+  await assert.rejects(patcher.apply(hlsOptions(data)), error => error.message === 'HLS live commit failed' && error.rollbackError?.message === 'HLS rollback failed');
+  const html = await fs.readFile(data.workbenchPath, 'utf8');
+  const payload = decodeConfig(html);
+  assert.equal(payload.sourceType, 'hls');
+  const rendererName = /src="\.\/frosted-background-assets\/(renderer-[a-f0-9]{64}\.js)"/.exec(html)[1];
+  await fs.access(path.join(assetDirectory(data), rendererName));
+  const page = await fs.readFile(path.join(path.dirname(data.workbenchPath), payload.videoPlayer), 'utf8');
+  const playerName = /src="\.\/(video-player-[a-f0-9]{64}\.js)"/.exec(page)[1];
+  await fs.access(path.join(assetDirectory(data), playerName));
+  assert.equal(await fs.readFile(livePath(data), 'utf8'), live);
+});
+
+test('HLS restore publishes the disabled tombstone and removes only owned helper files', async t => {
+  const data = await fixture(t);
+  await patcher.apply(hlsOptions(data));
+  const unknown = path.join(assetDirectory(data), 'user-playlist.m3u8');
+  await fs.writeFile(unknown, 'keep this file');
+  const result = await patcher.restore(data);
+  assert.equal(result.liveProtocol, 1);
+  assert.deepEqual(result.cleanupErrors, []);
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
+  assert.deepEqual((await liveState(data)).settings, { enabled: false });
+  assert.equal(await fs.readFile(unknown, 'utf8'), 'keep this file');
+  assert.equal((await fs.readdir(assetDirectory(data))).some(name => /^(renderer|video-player|video-host)-[a-f0-9]{64}\./.test(name)), false);
+});
+
+test('source validation and HLS runtime modules reject missing, empty, nonregular and oversized files before staging', async t => {
+  for (const [name, limit] of [['source.js', 256 * 1024], ['vendor/hls.min.js', 2 * 1024 * 1024]]) {
+    for (const kind of ['missing', 'empty', 'directory', 'oversized']) {
+      await t.test(`${name}: ${kind}`, async child => {
+        const data = await fixture(child);
+        const filename = path.join(data.appRoot, name);
+        await fs.unlink(filename);
+        if (kind === 'empty') await fs.writeFile(filename, '');
+        if (kind === 'directory') await fs.mkdir(filename);
+        if (kind === 'oversized') {
+          const handle = await fs.open(filename, 'w');
+          await handle.truncate(limit + 1); await handle.close();
+        }
+        await assert.rejects(patcher.apply(hlsOptions(data)), /重新安装插件/);
+        assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
+        await assert.rejects(fs.access(assetDirectory(data)), { code: 'ENOENT' });
+      });
+    }
+  }
+});
+
+test('local videos do not need the HLS library and switching from HLS narrows only the isolated player policy', async t => {
+  const data = await fixture(t);
+  await patcher.apply(hlsOptions(data));
+  await fs.unlink(path.join(data.appRoot, 'vendor', 'hls.min.js'));
+  const video = path.join(data.appRoot, 'clip.mp4');
+  await fs.writeFile(video, 'local video fixture');
+  await patcher.apply({ ...data, mediaPath: video, config: { sourceType: 'hls' } });
+  const html = await fs.readFile(data.workbenchPath, 'utf8');
+  const payload = decodeConfig(html);
+  assert.equal(payload.sourceType, undefined);
+  assert.match(payload.source, /^\.\/frosted-background-assets\/media-[a-f0-9]{64}\.mp4$/);
+  const page = await fs.readFile(path.join(path.dirname(data.workbenchPath), payload.videoPlayer), 'utf8');
+  assert.match(page, /connect-src 'self'; media-src blob:;/);
+  assert.doesNotMatch(page, /https:/);
+  assert.equal(patcher.stripInjection(html), ORIGINAL);
+  assert.equal((await patcher.status(data)).liveProtocol, 1);
 });

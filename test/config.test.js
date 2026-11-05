@@ -3,6 +3,13 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { normalizeConfig, DEFAULTS } = require('../src/config');
 
+test('manual pause is persistent and only accepts a boolean', () => {
+  assert.equal(DEFAULTS.paused, false);
+  assert.equal(normalizeConfig({ paused: true }).paused, true);
+  assert.equal(normalizeConfig({ paused: 'true' }).paused, false);
+  assert.equal(require('../package.json').contributes.configuration.properties['frostedBackground.paused'].scope, 'application');
+});
+
 test('configuration constrains visual values and never accepts executable CSS values', () => {
   const config = normalizeConfig({ blur: Infinity, opacity: -2, tintOpacity: 10, brightness: NaN, saturation: 3,
     fit: 'url(https://example.com)', position: 'center; color:red', playbackRate: 0, pauseWhenUnfocused: 'false',

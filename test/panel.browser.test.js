@@ -32,6 +32,178 @@ test('panel localization catalog covers markup and defaults to English without a
   assert.equal(t('en', '__proto__'), '__proto__');
 });
 
+test('external links and explicit pause preserve one preview player and clean up HLS safely', {
+  skip: !process.env.PLAYWRIGHT_MODULE,
+  timeout: 30000,
+}, async () => {
+  const { chromium } = require(process.env.PLAYWRIGHT_MODULE);
+  const executablePath = process.env.BROWSER_EXECUTABLE || [
+    'C:/Program Files/Google/Chrome/Application/chrome.exe',
+    'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+  ].find(value => fs.existsSync(value));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'frosted-source-panel-test-'));
+  const fixtureFile = path.join(directory, 'panel.html');
+  const asset = name => pathToFileURL(path.resolve(__dirname, '../media', name)).href;
+  fs.writeFileSync(fixtureFile, renderPanelHtml({
+    cspSource: 'file:', nonce: 'source-panel-test-nonce',
+    scriptUri: asset('panel.js'), styleUri: asset('panel.css'), i18nUri: asset('i18n.js'),
+    regionsUri: asset('regions.js'), sourceUri: asset('source.js'), hlsUri: asset('vendor/hls.min.js'),
+  }));
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true, executablePath });
+    const page = await browser.newPage({ viewport: { width: 280, height: 620 }, reducedMotion: 'no-preference' });
+    page.setDefaultTimeout(6000);
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.addInitScript(() => {
+      window.__messages = []; window.__violations = [];
+      window.acquireVsCodeApi = () => ({ getState: () => window.__saved, setState: value => { window.__saved = value; }, postMessage: value => window.__messages.push(value) });
+      document.addEventListener('securitypolicyviolation', event => window.__violations.push(event.violatedDirective));
+    });
+    await page.goto(pathToFileURL(fixtureFile).href);
+    assert.equal(await page.evaluate(() => typeof Hls.isSupported), 'function', 'the actual local HLS vendor loads under the webview CSP');
+    const localUri = pathToFileURL(path.resolve(__dirname, 'fixtures/colors.webm')).href;
+    const media = { kind: 'video', name: 'colors.webm', uri: localUri };
+    let state = { type: 'state', language: 'en', config: { ...DEFAULTS, paused: true, pauseWhenUnfocused: false, respectReducedMotion: false }, defaults: DEFAULTS, media, enabled: true, busy: false, liveEnabled: true, liveAck: 0, resetDraft: true, error: null };
+    const sendState = async changes => {
+      state = { ...state, ...changes };
+      await page.evaluate(message => window.dispatchEvent(new MessageEvent('message', { data: message })), state);
+    };
+    const acknowledgeLive = async () => {
+      const previous = state.liveAck;
+      await page.waitForFunction(id => window.__messages.some(message => message.type === 'liveConfig' && message.requestId > id), previous);
+      const message = await page.evaluate(() => window.__messages.filter(item => item.type === 'liveConfig').at(-1));
+      await sendState({ config: message.config, liveAck: message.requestId, resetDraft: true });
+      return message;
+    };
+    await sendState();
+    await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2);
+    await page.evaluate(() => { window.__originalVideo = document.querySelector('video'); });
+    assert.equal(await page.locator('video').evaluate(video => video.paused && video.loop), true, 'saved pause is applied to the first decoded frame');
+    assert.equal(await page.locator('#toggle-playback').getAttribute('aria-label'), 'Play');
+    await page.locator('#toggle-playback').click();
+    await page.waitForFunction(() => !document.querySelector('video').paused);
+    assert.equal((await acknowledgeLive()).config.paused, false);
+    await page.locator('#toggle-playback').click();
+    assert.equal((await acknowledgeLive()).config.paused, true);
+    const pausedTime = await page.locator('video').evaluate(video => video.currentTime);
+    await page.locator('#blur').fill('29');
+    await page.locator('#blur').dispatchEvent('input');
+    assert.equal((await acknowledgeLive()).config.paused, true, 'effect changes retain manual pause');
+    assert.equal(await page.locator('video').evaluate(video => video.currentTime), pausedTime, 'effect edits do not advance a paused preview');
+    assert.equal(await page.evaluate(() => document.querySelector('video') === window.__originalVideo), true);
+
+    await page.locator('#source-link-card summary').click();
+    const chooseMessages = () => page.evaluate(() => window.__messages.filter(message => message.type === 'chooseUrl'));
+    for (const url of ['http://example.com/clip.mp4', 'javascript:alert(1)', 'https://user:private-credential@example.com/video.mp4', 'https://localhost/video.mp4']) {
+      await page.locator('#source-url').fill(url);
+      await page.locator('#source-url').press('Enter');
+      assert.equal((await chooseMessages()).length, 0);
+      assert.equal(await page.locator('#source-error').isVisible(), true);
+      assert.ok(!(await page.locator('#source-error').textContent()).includes('private-credential'));
+    }
+    const directUrl = 'https://media.example.com/clip.mp4?token=private-value';
+    await page.locator('#source-url').fill(directUrl);
+    await page.locator('#source-kind').selectOption('video');
+    await page.locator('#choose-url').click();
+    const choosing = (await chooseMessages()).at(-1);
+    assert.equal(choosing.kind, 'video'); assert.equal(choosing.url, directUrl);
+    assert.equal(choosing.config.blur, 29); assert.equal(choosing.config.paused, true);
+    assert.equal(await page.locator('#choose-url').textContent(), 'Loading…');
+    assert.equal(await page.locator('#source-url').isDisabled(), true);
+    await sendState({ busy: false, media: { ...media, sourceUrl: directUrl }, config: choosing.config });
+    assert.equal(await page.locator('#media-origin').textContent(), 'https://media.example.com');
+    assert.ok(!(await page.locator('.media-caption').textContent()).includes('private-value'));
+    assert.equal(await page.evaluate(() => document.querySelector('video') === window.__originalVideo), true);
+    for (const url of ['https://youtu.be/abcdefghijk', 'https://www.twitch.tv/example_channel']) {
+      await page.locator('#source-url').fill(url);
+      assert.equal(await page.locator('#source-kind').isDisabled(), true);
+      assert.equal(await page.locator('#choose-url').textContent(), 'Open page');
+      assert.equal(await page.locator('#source-hint').textContent(), dictionaries.en['此链接将在官方浏览器页面打开，不会用作背景。']);
+      await page.locator('#choose-url').click();
+      await sendState({ busy: false });
+      assert.equal(await page.evaluate(() => document.querySelector('video') === window.__originalVideo), true, 'opening an official platform page leaves the background player intact');
+    }
+
+    // Use the real vendor above for packaging/CSP coverage, then a deterministic
+    // adapter for lifecycle and private URL checks without contacting a stream.
+    await page.evaluate(() => {
+      window.__hlsPlayers = [];
+      window.Hls = class {
+        static Events = { MEDIA_ATTACHED: 'attached', MANIFEST_PARSED: 'parsed', ERROR: 'error' };
+        static isSupported() { return true; }
+        constructor(config) { this.config = config; this.handlers = {}; this.destroyed = 0; window.__hlsPlayers.push(this); }
+        on(name, handler) { this.handlers[name] = handler; }
+        emit(name, value) { this.handlers[name]?.(name, value); }
+        attachMedia(media) { this.media = media; this.emit('attached'); }
+        loadSource(url) { this.url = url; }
+        destroy() { this.destroyed++; }
+      };
+    });
+    const stream = { kind: 'video', type: 'hls', name: 'stream.example.com / live.m3u8', uri: 'https://stream.example.com/live.m3u8?token=secret-stream-token' };
+    await page.locator('#source-url').fill(stream.uri);
+    await page.locator('#source-kind').selectOption('auto');
+    assert.match(await page.locator('#source-hint').textContent(), /cross-origin/);
+    await page.locator('#choose-url').click();
+    await sendState({ media: stream, busy: false });
+    assert.equal(await page.locator('#preview-loading').isVisible(), true);
+    assert.equal(await page.locator('video').evaluate(video => video.loop), false);
+    assert.equal(await page.locator('#media-origin').textContent(), 'https://stream.example.com');
+    assert.deepEqual(await page.evaluate(() => {
+      const player = window.__hlsPlayers[0], xhr = { withCredentials: true };
+      player.config.xhrSetup(xhr, player.url);
+      const request = player.config.fetchSetup({ url: player.url }, {});
+      return { count: window.__hlsPlayers.length, worker: player.config.enableWorker, credentials: xhr.withCredentials, fetchCredentials: request.credentials, crossOrigin: player.media.crossOrigin };
+    }), { count: 1, worker: false, credentials: false, fetchCredentials: 'omit', crossOrigin: 'anonymous' });
+    assert.equal(await page.evaluate(() => {
+      const config = window.__hlsPlayers[0].config;
+      return ['https://127.0.0.1/key', 'https://user:private-credential@example.com/segment.ts', 'http://example.com/segment.ts'].every(url => {
+        let blocked = 0;
+        try { config.xhrSetup({}, url); } catch { blocked++; }
+        try { config.fetchSetup({ url }, {}); } catch { blocked++; }
+        return blocked === 2;
+      });
+    }), true, 'segment and key requests receive the same public HTTPS validation as the manifest');
+    await page.evaluate(bytes => {
+      const player = window.__hlsPlayers[0];
+      window.__streamFixture = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: 'video/webm' }));
+      player.media.src = window.__streamFixture; player.emit('parsed');
+    }, Array.from(fs.readFileSync(path.resolve(__dirname, 'fixtures/colors.webm'))));
+    await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2);
+    assert.equal(await page.locator('#preview-loading').isVisible(), false);
+    for (const language of ['es', 'zh-CN', 'en']) {
+      await page.locator('#language').selectOption(language);
+      assert.equal(await page.locator('#toggle-playback').textContent(), dictionaries[language]['继续播放']);
+      assert.equal(await page.locator('#toggle-playback').getAttribute('aria-label'), dictionaries[language]['继续播放']);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${language} external controls fit 280px`);
+    }
+    await page.locator('#toggle-playback').click();
+    await acknowledgeLive();
+    await page.waitForFunction(() => !document.querySelector('video').paused);
+    assert.equal(await page.evaluate(() => window.__hlsPlayers.length), 1, 'language, acknowledgements, and pause do not create another HLS instance');
+    await page.evaluate(() => window.__hlsPlayers[0].emit('error', { fatal: true, details: '<img src=x> secret-stream-token' }));
+    assert.equal(await page.locator('#preview-error').isVisible(), true);
+    assert.ok(!(await page.locator('#preview-error').textContent()).includes('secret-stream-token'));
+    assert.equal(await page.locator('#preview-error img').count(), 0);
+    assert.equal(await page.evaluate(() => window.__hlsPlayers[0].destroyed), 1);
+    await page.locator('#choose-url').click();
+    await sendState({ busy: false });
+    assert.equal(await page.evaluate(() => window.__hlsPlayers.length), 2, 'explicit retry recreates the failed stream');
+    await sendState({ media });
+    assert.equal(await page.evaluate(() => window.__hlsPlayers[1].destroyed), 1, 'changing media destroys HLS');
+    await sendState({ media: stream });
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+    assert.equal(await page.evaluate(() => window.__hlsPlayers[2].destroyed), 1, 'closing the webview destroys HLS');
+    await page.evaluate(() => URL.revokeObjectURL(window.__streamFixture));
+    assert.deepEqual(await page.evaluate(() => window.__violations), []);
+    assert.deepEqual(errors, []);
+  } finally {
+    if (browser) await browser.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('live controls coalesce edits, preserve newer drafts across acknowledgements, and use one Apply action', {
   skip: !process.env.PLAYWRIGHT_MODULE,
   timeout: 30000,
