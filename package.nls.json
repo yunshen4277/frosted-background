@@ -1,6 +1,6 @@
 {
   "extension.displayName": "Frosted Background",
-  "setting.regions.description": "Region effects edited in the control panel. Up to 8 areas can independently control blur, opacity, tint, brightness and saturation. Coordinates follow the original image or video; later areas take priority where they overlap.",
+  "setting.regions.description": "Region effects edited in the control panel. Up to 8 areas can independently control blur, opacity, tint, brightness and saturation, with adjustable feathered transitions. Coordinates follow the original image or video; later areas take priority where they overlap.",
   "extension.description": "Choose an image or muted video background for your code editor, with adjustable frosted glass and automatic resizing.",
   "extension.category": "Frosted Background",
   "command.openPanel": "Open Control Panel",

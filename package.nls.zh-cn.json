@@ -1,5 +1,5 @@
 {
-  "setting.regions.description": "在控制面板中编辑区域效果。最多 8 个区域可独立调整模糊、浓度、蒙层、亮度和饱和度。区域跟随原始图片或视频内容，重叠处以后添加的区域为准。",
+  "setting.regions.description": "在控制面板中编辑区域效果。最多 8 个区域可独立调整模糊、浓度、蒙层、亮度和饱和度，并设置边缘渐变。区域跟随原始图片或视频内容，重叠处以后添加的区域为准。",
   "extension.displayName": "Frosted Background · 毛玻璃背景",
   "extension.description": "为整个代码区选择图片或静音视频背景，带可调毛玻璃效果与自适应缩放。",
   "extension.category": "毛玻璃背景",
