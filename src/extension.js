@@ -8,6 +8,7 @@ const { BackgroundPanel } = require('./panel');
 const { UpdateController } = require('./updater');
 const { normalizeLanguage, t, localizedError, describeError: translateError } = require('./localization');
 const { resolveMediaLink } = require('./remote-media');
+const { resolveYouTubeLink } = require('./youtube-media');
 const { classifyLink, normalizeRemoteSource, displayName } = require('../media/source');
 
 function activate(context) {
@@ -24,7 +25,7 @@ function activate(context) {
   let runtimeReady = false;
   let panel;
   let updater;
-  const extensionVersion = context.extension?.packageJSON?.version || '0.10.0';
+  const extensionVersion = context.extension?.packageJSON?.version || '0.11.0';
   const readSelection = () => context.globalState.get('mediaSource') || context.globalState.get('mediaPath');
   const windowSession = typeof vscode.env.sessionId === 'string' && vscode.env.sessionId !== 'someValue.sessionId' ? vscode.env.sessionId : '';
   const bootstrapKey = windowSession ? 'bootstrapRequired:' + windowSession : undefined;
@@ -204,19 +205,25 @@ function activate(context) {
 
   async function chooseMediaLink(url, kind) {
     const source = classifyLink(url, kind);
-    if (source.type === 'platform') {
+    const youtube = source.type === 'platform' && source.platform === 'YouTube';
+    if (source.type === 'platform' && !youtube) {
       const opened = await vscode.env.openExternal(vscode.Uri.parse(source.url));
       if (!opened) throw localizedError('无法打开官方播放页，请检查默认浏览器。');
       return { openedExternal: true };
     }
     const abort = new AbortController();
     mediaDownloads.add(abort);
-    try { return await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: text('正在加载外部媒体…'), cancellable: true }, async (progress, token) => {
+    try { return await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: text(youtube ? '正在准备 YouTube 背景…' : '正在加载外部媒体…'), cancellable: true }, async (progress, token) => {
       const cancellation = token?.onCancellationRequested(() => abort.abort());
       if (token?.isCancellationRequested) abort.abort();
       try {
-        const selected = await resolveMediaLink(url, kind, {
-          directory: path.join(context.globalStorageUri.fsPath, 'external-media'), signal: abort.signal,
+        const resolve = youtube ? resolveYouTubeLink : resolveMediaLink;
+        const selected = await resolve(source.url, kind, {
+          directory: path.join(context.globalStorageUri.fsPath, youtube ? 'youtube-media' : 'external-media'), signal: abort.signal,
+          onStage: stage => {
+            const key = { prepare: '首次使用正在准备 YouTube 辅助工具…', resolve: '正在读取 YouTube 视频…', download: '正在缓存 YouTube 背景视频…' }[stage];
+            if (key) progress?.report({ message: text(key) });
+          },
           onProgress: bytes => progress?.report({ message: text('已下载 {size} MB', { size: Math.round(bytes / 1024 / 1024) }) })
         });
         if (disposed || abort.signal.aborted) throw localizedError('已取消链接加载或加载超时。');

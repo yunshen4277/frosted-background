@@ -65,7 +65,7 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, 
         <summary>${label("外部链接")}</summary>
         <label for="source-url" class="sr-only">${label("媒体链接")}</label><input id="source-url" type="url" placeholder="https://…" inputmode="url" autocomplete="off" spellcheck="false" maxlength="8192" aria-describedby="source-hint source-error">
         <div class="source-link-actions"><label for="source-kind" class="sr-only">${label("链接类型")}</label><select id="source-kind"><option value="auto" data-i18n="自动识别">${text("自动识别")}</option><option value="image" data-i18n="图片">${text("图片")}</option><option value="video" data-i18n="视频">${text("视频")}</option><option value="hls" data-i18n="HLS直播">${text("HLS直播")}</option></select><button type="button" class="secondary-button" id="choose-url" disabled>${label("载入链接")}</button></div>
-        <p class="source-hint" id="source-hint">${label("支持图片、视频直链与HLS直播；YouTube和Twitch在官方网页打开。")}</p>
+        <p class="source-hint" id="source-hint">${label("支持图片、视频直链、YouTube 视频与 HLS 直播；Twitch 在官方网页打开。")}</p>
         <p class="source-error" id="source-error" role="alert" hidden></p>
       </details>
     </section>
