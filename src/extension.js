@@ -6,9 +6,12 @@ const { DEFAULTS, normalizeConfig } = require('./config');
 const patcher = require('./patcher');
 const { BackgroundPanel } = require('./panel');
 const { UpdateController } = require('./updater');
+const { normalizeLanguage, t, localizedError, describeError: translateError } = require('./localization');
 
 function activate(context) {
-  const output = vscode.window.createOutputChannel('毛玻璃背景');
+  const readLanguage = () => normalizeLanguage(context.globalState.get('language'));
+  const text = (key, params) => t(readLanguage(), key, params);
+  const output = vscode.window.createOutputChannel('Frosted Background');
   context.subscriptions.push(output);
   let busy = false;
   let changeTimer;
@@ -16,7 +19,7 @@ function activate(context) {
   let savingConfig = false;
   let panel;
   let updater;
-  const extensionVersion = context.extension?.packageJSON?.version || '0.5.0';
+  const extensionVersion = context.extension?.packageJSON?.version || '0.6.0';
 
   const readConfig = () => {
     const config = vscode.workspace.getConfiguration('frostedBackground');
@@ -24,20 +27,15 @@ function activate(context) {
   };
 
   function requireDesktop() {
-    if (vscode.env.uiKind !== vscode.UIKind.Desktop) throw new Error('此插件需要桌面版 VS Code，网页版不支持编辑区背景。');
+    if (vscode.env.uiKind !== vscode.UIKind.Desktop) throw localizedError('此插件需要桌面版 VS Code，网页版不支持编辑区背景。');
   }
 
   function describeError(error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (error && ['EACCES', 'EPERM', 'EROFS'].includes(error.code)) {
-      return '无法写入 VS Code 安装目录。请使用安装在当前用户目录、且目录可写的 VS Code；macOS 请先将应用移到“应用程序”。详细信息：' + message;
-    }
-    if (error && error.code === 'ENOSPC') return '磁盘空间不足，请释放空间后再试。';
-    return message;
+    return translateError(readLanguage(), error);
   }
 
   async function runExclusive(callback) {
-    if (busy) throw new Error('正在处理背景，请稍候。');
+    if (busy) throw localizedError('正在处理背景，请稍候。');
     busy = true;
     panel?.refresh();
     try {
@@ -51,25 +49,27 @@ function activate(context) {
 
   const command = (name, callback) => {
     context.subscriptions.push(vscode.commands.registerCommand('frostedBackground.' + name, async () => {
-      if (busy) return vscode.window.showInformationMessage('正在处理背景，请稍候。');
+      if (busy) return vscode.window.showInformationMessage(text('正在处理背景，请稍候。'));
       try {
         return await runExclusive(callback);
       } catch (error) {
         output.appendLine(new Date().toISOString() + ' ' + (error.stack || String(error)));
-        const answer = await vscode.window.showErrorMessage('毛玻璃背景：' + describeError(error), '查看日志');
-        if (answer === '查看日志') output.show();
+        const action = text('查看日志');
+        const answer = await vscode.window.showErrorMessage(text('毛玻璃背景：{error}', { error: describeError(error) }), action);
+        if (answer === action) output.show();
       }
     }));
   };
 
   async function confirmFirstUse() {
     if (context.globalState.get('injectionConsent', false)) return true;
+    const action = text('启用背景');
     const choice = await vscode.window.showWarningMessage(
-      '毛玻璃背景需要修改当前 VS Code 的界面文件。',
-      { modal: true, detail: '官方扩展接口不支持代码区图片或视频背景。启用后可能出现“安装似乎已损坏”的完整性提示；可通过“关闭背景并恢复原状”撤销。此设置影响这份 VS Code 安装的所有窗口，更新 VS Code 后需要重新应用。' },
-      '启用背景'
+      text('毛玻璃背景需要修改当前 VS Code 的界面文件。'),
+      { modal: true, detail: text('官方扩展接口不支持代码区图片或视频背景。启用后可能出现“安装似乎已损坏”的完整性提示；可通过“关闭背景并恢复原状”撤销。此设置影响这份 VS Code 安装的所有窗口，更新 VS Code 后需要重新应用。') },
+      action
     );
-    if (choice !== '启用背景') return false;
+    if (choice !== action) return false;
     await context.globalState.update('injectionConsent', true);
     return true;
   }
@@ -77,9 +77,10 @@ function activate(context) {
   function offerReload(message) {
     // A notification can stay open indefinitely. Release the command lock after
     // the file operation, so ignoring this notification cannot block recovery.
-    vscode.window.showInformationMessage(message + ' 重载窗口后生效；其他已打开窗口也需重载。', '立即重载').then(choice => {
-      if (choice === '立即重载' && !disposed) return vscode.commands.executeCommand('workbench.action.reloadWindow');
-    }).then(undefined, error => output.appendLine('重载窗口：' + describeError(error)));
+    const action = text('立即重载');
+    vscode.window.showInformationMessage(text('{message} 重载窗口后生效；其他已打开窗口也需重载。', { message }), action).then(choice => {
+      if (choice === action && !disposed) return vscode.commands.executeCommand('workbench.action.reloadWindow');
+    }).then(undefined, error => output.appendLine(text('重载窗口：{error}', { error: describeError(error) })));
   }
 
   async function saveConfig(values) {
@@ -98,7 +99,7 @@ function activate(context) {
     if (!(await confirmFirstUse())) return { cancelled: true };
     const config = configOverride ? normalizeConfig(configOverride) : readConfig();
     let settingsError;
-    await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在应用毛玻璃背景…', cancellable: false }, async () => {
+    await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: text('正在应用毛玻璃背景…'), cancellable: false }, async () => {
       const result = await patcher.apply({
         appRoot: vscode.env.appRoot,
         rendererPath: context.asAbsolutePath('media/renderer.js'),
@@ -110,35 +111,37 @@ function activate(context) {
       await context.globalState.update('enabled', true);
       await context.globalState.update('lastVersion', vscode.version);
       await context.globalState.update('lastAppliedExtensionVersion', extensionVersion);
-      output.appendLine('已应用：' + result.workbenchPath);
+      output.appendLine(text('已应用：{path}', { path: result.workbenchPath }));
       if (configOverride) {
         try { await saveConfig(config); }
         catch (error) {
           // The background was already published successfully. Keep the panel's
           // draft and offer reload even if writing preferences failed afterward.
           settingsError = describeError(error);
-          output.appendLine('背景已应用，但设置保存失败：' + settingsError);
+          output.appendLine(text('背景已应用，但设置保存失败：{error}', { error: settingsError }));
         }
       }
     });
     if (!fromPanel) {
       panel?.refresh({ syncMedia: true, resetDraft: true });
-      offerReload('背景已准备好。');
+      offerReload(text('背景已准备好。'));
     }
+    const noticeKey = settingsError ? '背景已应用，重载窗口后生效。但设置保存失败，可稍后重试：{error}' : '背景已应用，重载窗口后生效。其他已打开窗口也需重载。';
+    const noticeParams = { error: settingsError };
     return { needsReload: true, resetDraft: !settingsError,
-      notice: settingsError ? '背景已应用，重载窗口后生效。但设置保存失败，可稍后重试：' + settingsError : '背景已应用，重载窗口后生效。其他已打开窗口也需重载。' };
+      noticeKey, noticeParams, notice: text(noticeKey, noticeParams) };
   }
 
   async function chooseMediaFile(kind) {
     const extensions = kind === 'video' ? ['mp4', 'webm'] : ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif'];
     const files = await vscode.window.showOpenDialog({
-      title: kind === 'video' ? '选择背景视频（静音循环；建议 WebM）' : '选择背景图片',
-      openLabel: '设为毛玻璃背景', canSelectMany: false, canSelectFiles: true, canSelectFolders: false,
-      filters: { [kind === 'video' ? '视频' : '图片']: extensions },
+      title: text(kind === 'video' ? '选择背景视频（静音循环；建议 WebM）' : '选择背景图片'),
+      openLabel: text('设为毛玻璃背景'), canSelectMany: false, canSelectFiles: true, canSelectFolders: false,
+      filters: { [text(kind === 'video' ? '视频' : '图片')]: extensions },
       defaultUri: context.globalState.get('mediaPath') ? vscode.Uri.file(context.globalState.get('mediaPath')) : undefined
     });
     if (!files || !files[0]) return;
-    if (files[0].scheme !== 'file') throw new Error('请选择本机上的图片或视频。远程工作区中的文件需要先保存到本机。');
+    if (files[0].scheme !== 'file') throw localizedError('请选择本机上的图片或视频。远程工作区中的文件需要先保存到本机。');
     return files[0].fsPath;
   }
 
@@ -150,14 +153,16 @@ function activate(context) {
   async function restoreBackground(fromPanel = false) {
     const result = await patcher.restore({ appRoot: vscode.env.appRoot });
     await context.globalState.update('enabled', false);
-    output.appendLine('已移除当前安装的背景注入。');
-    for (const error of result.cleanupErrors || []) output.appendLine('清理旧资源：' + error);
-    const notice = result.cleanupErrors?.length ? '已关闭背景；部分旧资源仍被占用，可重载后再次关闭背景以清理。' : '已恢复原状。';
+    output.appendLine(text('已移除当前安装的背景注入。'));
+    for (const error of result.cleanupErrors || []) output.appendLine(text('清理旧资源：{error}', { error }));
+    const baseNoticeKey = result.cleanupErrors?.length ? '已关闭背景；部分旧资源仍被占用，可重载后再次关闭背景以清理。' : '已恢复原状。';
+    const notice = text(baseNoticeKey);
     if (!fromPanel) {
       panel?.refresh();
       offerReload(notice);
     }
-    return { needsReload: true, notice: notice + ' 重载窗口后生效。' };
+    const noticeKey = baseNoticeKey + ' 重载窗口后生效。';
+    return { needsReload: true, noticeKey, notice: text(noticeKey) };
   }
 
   // Hiding the controls is a layout action, so it does not acquire the
@@ -175,13 +180,17 @@ function activate(context) {
     readUpdateState: () => updater?.getState() || null,
     checkUpdates: () => updater.check(true),
     setUpdateMode: mode => updater.setMode(mode),
+    onLanguageChanged: () => { refreshStatusLanguage(); updater?.refreshLanguage(); },
     log: error => output.appendLine(error.stack || String(error))
   });
   context.subscriptions.push(panel);
   context.subscriptions.push(vscode.window.registerWebviewViewProvider('frostedBackground.controls', panel));
   const statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 40);
-  statusItem.text = '$(color-mode) 毛玻璃';
-  statusItem.tooltip = '打开毛玻璃背景控制面板';
+  function refreshStatusLanguage() {
+    statusItem.text = '$(color-mode) ' + text('毛玻璃');
+    statusItem.tooltip = text('打开毛玻璃背景控制面板');
+  }
+  refreshStatusLanguage();
   statusItem.command = 'frostedBackground.openPanel';
   statusItem.show();
   context.subscriptions.push(statusItem);
@@ -191,7 +200,7 @@ function activate(context) {
     currentVersion: extensionVersion,
     extensionId: 'local-frosted.frosted-background',
     runExclusive,
-    log: error => output.appendLine('插件更新：' + (error.stack || String(error))),
+    log: error => output.appendLine(text('插件更新：{error}', { error: error.stack || String(error) })),
     onChange: () => panel.refresh()
   });
   context.subscriptions.push(updater);
@@ -207,9 +216,9 @@ function activate(context) {
     const mediaPath = context.globalState.get('mediaPath');
     if (!mediaPath) {
       const kind = await vscode.window.showQuickPick([
-        { label: '$(file-media) 选择图片', kind: 'image' },
-        { label: '$(play-circle) 选择视频', kind: 'video' }
-      ], { placeHolder: '选择背景类型' });
+        { label: '$(file-media) ' + text('选择图片'), kind: 'image' },
+        { label: '$(play-circle) ' + text('选择视频'), kind: 'video' }
+      ], { placeHolder: text('选择背景类型') });
       if (kind) await chooseMedia(kind.kind);
       return;
     }
@@ -220,8 +229,10 @@ function activate(context) {
     const state = await patcher.status({ appRoot: vscode.env.appRoot });
     const mediaPath = context.globalState.get('mediaPath');
     await vscode.window.showInformationMessage(
-      '毛玻璃背景：' + (state.installed ? '已应用' : '未应用') +
-      (mediaPath ? '；上次选择：' + path.basename(mediaPath) : '') + '。当前 VS Code ' + vscode.version + '。'
+      text('毛玻璃背景：{status}{media}。当前 VS Code {version}。', {
+        status: text(state.installed ? '已应用' : '未应用'),
+        media: mediaPath ? text('；上次选择：{name}', { name: path.basename(mediaPath) }) : '', version: vscode.version
+      })
     );
   });
 
@@ -233,8 +244,9 @@ function activate(context) {
     clearTimeout(changeTimer);
     changeTimer = setTimeout(async () => {
       if (disposed) return;
-      const choice = await vscode.window.showInformationMessage('毛玻璃效果设置已修改，应用后重载窗口即可生效。', '应用设置');
-      if (choice === '应用设置' && !disposed) await vscode.commands.executeCommand('frostedBackground.apply');
+      const action = text('应用设置');
+      const choice = await vscode.window.showInformationMessage(text('毛玻璃效果设置已修改，应用后重载窗口即可生效。'), action);
+      if (choice === action && !disposed) await vscode.commands.executeCommand('frostedBackground.apply');
     }, 1200);
   }));
   context.subscriptions.push({ dispose: () => { disposed = true; clearTimeout(changeTimer); } });
@@ -252,16 +264,17 @@ function activate(context) {
             await patcher.reapply({ appRoot: vscode.env.appRoot, rendererPath: context.asAbsolutePath('media/renderer.js') });
             await context.globalState.update('lastAppliedExtensionVersion', extensionVersion);
           });
-          offerReload('新版背景效果已自动准备好。');
+          offerReload(text('新版背景效果已自动准备好。'));
           return;
         } catch (error) {
-          output.appendLine('自动迁移背景未完成：' + describeError(error));
+          output.appendLine(text('自动迁移背景未完成：{error}', { error: describeError(error) }));
         }
       }
-      const message = state.installed ? '毛玻璃背景已更新，请在控制面板中应用一次，让新效果生效。' : '背景尚未应用到这份 VS Code 安装（例如更新之后），可以在控制面板重新应用。';
-      const choice = await vscode.window.showInformationMessage(message, '打开控制面板');
-      if (choice === '打开控制面板' && !disposed) await vscode.commands.executeCommand('frostedBackground.openPanel');
-    }).catch(error => output.appendLine('启动检查：' + describeError(error)));
+      const message = text(state.installed ? '毛玻璃背景已更新，请在控制面板中应用一次，让新效果生效。' : '背景尚未应用到这份 VS Code 安装（例如更新之后），可以在控制面板重新应用。');
+      const action = text('打开控制面板');
+      const choice = await vscode.window.showInformationMessage(message, action);
+      if (choice === action && !disposed) await vscode.commands.executeCommand('frostedBackground.openPanel');
+    }).catch(error => output.appendLine(text('启动检查：{error}', { error: describeError(error) })));
   }
 }
 
