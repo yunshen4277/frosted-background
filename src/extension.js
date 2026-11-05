@@ -21,7 +21,7 @@ function activate(context) {
   let runtimeReady = false;
   let panel;
   let updater;
-  const extensionVersion = context.extension?.packageJSON?.version || '0.7.0';
+  const extensionVersion = context.extension?.packageJSON?.version || '0.8.0';
   const windowSession = typeof vscode.env.sessionId === 'string' && vscode.env.sessionId !== 'someValue.sessionId' ? vscode.env.sessionId : '';
   const bootstrapKey = windowSession ? 'bootstrapRequired:' + windowSession : undefined;
   const markBootstrapRequired = async () => {
@@ -115,7 +115,8 @@ function activate(context) {
     clearTimeout(changeTimer);
     try {
       for (const key of Object.keys(DEFAULTS)) {
-        if (current[key] !== values[key]) await config.update(key, values[key], vscode.ConfigurationTarget.Global);
+        const changed = key === 'regions' ? JSON.stringify(current[key]) !== JSON.stringify(values[key]) : current[key] !== values[key];
+        if (changed) await config.update(key, values[key], vscode.ConfigurationTarget.Global);
       }
     } finally { savingConfig = false; }
   }
@@ -154,11 +155,11 @@ function activate(context) {
       if (!runtimeReady) offerReload(text('背景已准备好。'));
     }
     const noticeKey = runtimeReady
-      ? (settingsError ? '背景已实时应用，但设置保存失败，可稍后重试：{error}' : '背景已实时应用，无需重载。')
+      ? (settingsError ? '背景已实时应用，但设置保存失败，可稍后重试：{error}' : null)
       : (settingsError ? '背景已应用，重载窗口后生效。但设置保存失败，可稍后重试：{error}' : '首次启用或升级后需要重载一次，之后更换背景和调整效果将自动生效。');
     const noticeParams = { error: settingsError };
     return { needsReload: !runtimeReady, resetDraft: !settingsError,
-      noticeKey, noticeParams, notice: text(noticeKey, noticeParams) };
+      noticeKey, noticeParams, notice: noticeKey ? text(noticeKey, noticeParams) : null };
   }
 
   async function applyLiveConfig(configOverride) {
@@ -170,7 +171,7 @@ function activate(context) {
         await patcher.updateConfig({ appRoot: vscode.env.appRoot, config });
         try { await saveConfig(config); }
         catch (error) { throw localizedError('背景已实时应用，但设置保存失败，可稍后重试：{error}', { error: describeError(error) }); }
-        return { needsReload: false, resetDraft: true, noticeKey: '背景已实时应用，无需重载。' };
+        return { needsReload: false, resetDraft: true, notice: null };
       });
     } finally { liveConfigBusy = false; }
   }

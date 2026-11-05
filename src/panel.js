@@ -42,6 +42,7 @@ class BackgroundPanel {
       scriptUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/panel.js'))).toString(),
       styleUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/panel.css'))).toString(),
       i18nUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/i18n.js'))).toString(),
+      regionsUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/regions.js'))).toString(),
       language: this.language,
       nonce: crypto.randomBytes(24).toString('base64')
     });
@@ -186,7 +187,7 @@ class BackgroundPanel {
           this.mediaApplyFailed = false;
           this.needsReload = result?.needsReload !== false;
           this.notice = result?.noticeKey ? { key: result.noticeKey, params: result.noticeParams }
-            : result?.notice || { key: '背景已应用，重载窗口后在编辑区生效。' };
+            : result?.notice || null;
           resetDraft = result?.resetDraft !== false;
           if (message.reloadAfterApply === true && resetDraft
             && (this.needsReload || this.callbacks.needsBootstrap?.() || this.callbacks.readUpdateState?.()?.pendingVersion)) {

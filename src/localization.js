@@ -3,6 +3,8 @@
 // Native VS Code messages use the persisted panel language, independently of
 // VS Code's own display language. Unknown diagnostics remain intact for support.
 const messages = {
+  '区域效果文件无效或缺失，请重新安装插件。': ['The region effects file is invalid or missing. Reinstall the extension.', 'El archivo de efectos por zonas no es válido o falta. Reinstala la extensión.'],
+  '插件运行文件无效或过大，请重新安装插件。': ['An extension runtime file is invalid or too large. Reinstall the extension.', 'Un archivo de la extensión no es válido o es demasiado grande. Reinstala la extensión.'],
   '实时背景配置地址无效，已停止操作。': ['The live background settings address is invalid. The operation was stopped.', 'La dirección de los ajustes del fondo en tiempo real no es válida. Se detuvo la operación.'],
   '视频播放器缓存地址无效，已停止操作。': ['The cached video player address is invalid. The operation was stopped.', 'La dirección del reproductor de vídeo en caché no es válida. Se detuvo la operación.'],
   '实时背景配置不是有效的普通文件，已停止操作。': ['Live background settings are not a valid regular file. The operation was stopped.', 'Los ajustes del fondo en tiempo real no son un archivo normal válido. Se detuvo la operación.'],

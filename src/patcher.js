@@ -14,6 +14,9 @@ const OWNER = 'frosted-background/v1';
 const START_MARKER = '<!-- FROSTED-BACKGROUND:START v1 -->';
 const END_MARKER = '<!-- FROSTED-BACKGROUND:END v1 -->';
 const MAX_MEDIA_BYTES = 500 * 1024 * 1024;
+const MAX_RUNTIME_BYTES = 2 * 1024 * 1024;
+const MAX_REGIONS_BYTES = 512 * 1024;
+const SCRIPT_SEPARATOR = Buffer.from('\n;\n');
 const LIVE_STATE_FILE = 'live-state.json';
 const LIVE_STATE_SOURCE = `./${ASSET_DIRECTORY}/${LIVE_STATE_FILE}`;
 const MAX_LIVE_STATE_BYTES = 128 * 1024;
@@ -253,6 +256,27 @@ function friendly(error) {
   return error;
 }
 
+async function readRuntimeSource(filename, limit, invalidMessage) {
+  const info = await exists(filename);
+  if (!info?.isFile() || info.isSymbolicLink() || !info.size || info.size > limit) throw new Error(invalidMessage);
+  const handle = await fsp.open(filename, 'r');
+  try {
+    // Verify the opened file is the same ordinary file that was inspected.
+    // Bound the read itself so growth after lstat cannot allocate arbitrary RAM.
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== info.dev || opened.ino !== info.ino || !opened.size || opened.size > limit) throw new Error(invalidMessage);
+    const buffer = Buffer.alloc(limit + 1);
+    let total = 0;
+    while (total <= limit) {
+      const { bytesRead } = await handle.read(buffer, total, buffer.length - total, total);
+      if (!bytesRead) break;
+      total += bytesRead;
+    }
+    if (!total || total > limit) throw new Error(invalidMessage);
+    return buffer.subarray(0, total);
+  } finally { await handle.close(); }
+}
+
 async function applyChecked({ appRoot, rendererPath, mediaPath, config = {} }, cachedExpectation) {
   try {
     const extension = path.extname(mediaPath || '').toLowerCase();
@@ -261,13 +285,17 @@ async function applyChecked({ appRoot, rendererPath, mediaPath, config = {} }, c
     const mediaInfo = await fsp.stat(mediaPath);
     if (!mediaInfo.isFile() || !mediaInfo.size) throw new Error('请选择有效且非空的本地媒体文件。');
     if (mediaInfo.size > MAX_MEDIA_BYTES) throw new Error('背景文件过大，请选择不超过 500 MB 的文件。');
-    const rendererInfo = await fsp.stat(rendererPath);
-    if (!rendererInfo.isFile()) throw new Error('插件渲染文件缺失，请重新安装插件。');
+    const regionsPath = path.join(path.dirname(rendererPath), 'regions.js');
+    const regionsBytes = await readRuntimeSource(regionsPath, MAX_REGIONS_BYTES, '区域效果文件无效或缺失，请重新安装插件。');
+    const availableRuntimeBytes = MAX_RUNTIME_BYTES - regionsBytes.length - SCRIPT_SEPARATOR.length;
+    const rendererBytes = await readRuntimeSource(rendererPath, availableRuntimeBytes, '插件运行文件无效或过大，请重新安装插件。');
+    const rendererBundle = Buffer.concat([regionsBytes, SCRIPT_SEPARATOR, rendererBytes]);
     // The video page has its own media policy. The workbench CSP is untouched.
     const videoPlayerPath = path.join(path.dirname(rendererPath), 'video-player.js');
+    let playerBundle;
     if (kind === 'video') {
-      const playerInfo = await exists(videoPlayerPath);
-      if (!playerInfo?.isFile() || playerInfo.isSymbolicLink()) throw new Error('视频播放器文件缺失，请重新安装插件。');
+      const playerBytes = await readRuntimeSource(videoPlayerPath, availableRuntimeBytes, '视频播放器文件缺失，请重新安装插件。');
+      playerBundle = Buffer.concat([regionsBytes, SCRIPT_SEPARATOR, playerBytes]);
     }
     const workbenchPath = await findWorkbench(appRoot);
     const directory = await ensureAssets(workbenchPath, true);
@@ -287,13 +315,13 @@ async function applyChecked({ appRoot, rendererPath, mediaPath, config = {} }, c
       }
       const created = [];
       try {
-        const rendererName = await stageAsset(rendererPath, directory, 'renderer', '.js', 2 * 1024 * 1024, created);
+        const rendererName = await stageAsset(rendererBundle, directory, 'renderer', '.js', MAX_RUNTIME_BYTES, created);
         const mediaName = await stageAsset(mediaPath, directory, 'media', extension, MAX_MEDIA_BYTES, created);
         if (cachedExpectation && mediaName !== cachedExpectation.mediaName) throw new Error('缓存背景在更新期间被修改，已停止应用。');
         const payload = { ...normalizeConfig(config), enabled: true, source: `./${ASSET_DIRECTORY}/${mediaName}`, kind, liveState: LIVE_STATE_SOURCE };
         delete payload.videoPlayer;
         if (kind === 'video') {
-          const playerName = await stageAsset(videoPlayerPath, directory, 'video-player', '.js', 2 * 1024 * 1024, created);
+          const playerName = await stageAsset(playerBundle, directory, 'video-player', '.js', MAX_RUNTIME_BYTES, created);
           const videoPage = Buffer.from(`<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; connect-src 'self'; media-src blob:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent}video{position:absolute;inset:0;width:100%;height:100%;display:block;pointer-events:none}</style><script src="./${playerName}" defer></script></head><body></body></html>\n`);
           const pageName = await stageAsset(videoPage, directory, 'video-host', '.html', 64 * 1024, created);
           payload.videoPlayer = `./${ASSET_DIRECTORY}/${pageName}`;
@@ -354,14 +382,14 @@ async function validateCachedFiles(directory, parsed) {
     return filename;
   };
   await validateFile(parsed.source[1], MAX_MEDIA_BYTES);
-  await validateFile(parsed.rendererName, 2 * 1024 * 1024);
+  await validateFile(parsed.rendererName, MAX_RUNTIME_BYTES);
   if (parsed.payload.kind === 'video') {
     if (!parsed.payload.videoPlayer) throw new Error('视频播放器缓存地址无效，已停止操作。');
     const pagePath = await validateFile(path.basename(parsed.payload.videoPlayer), 64 * 1024);
     const page = await fsp.readFile(pagePath, 'utf8');
     const player = /<script src="\.\/(video-player-[a-f0-9]{64}\.js)" defer><\/script>/.exec(page);
     if (!player) throw new Error('视频播放器缓存地址无效，已停止操作。');
-    await validateFile(player[1], 2 * 1024 * 1024);
+    await validateFile(player[1], MAX_RUNTIME_BYTES);
   }
 }
 
