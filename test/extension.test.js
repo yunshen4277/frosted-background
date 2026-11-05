@@ -253,11 +253,11 @@ function attachPanel(env) {
 }
 
 test('region changes are saved structurally and successful live edits remain quiet', async () => {
-  const env = harness({ version: '0.8.0', liveProtocol: 1, captureTimers: true,
-    state: { enabled: true, mediaPath: 'D:/saved.png', injectionConsent: true, lastAppliedExtensionVersion: '0.8.0' } });
+  const env = harness({ version: '0.9.0', liveProtocol: 1, captureTimers: true,
+    state: { enabled: true, mediaPath: 'D:/saved.png', injectionConsent: true, lastAppliedExtensionVersion: '0.9.0' } });
   const panel = attachPanel(env);
   await settle();
-  const regions = { enabled: true, items: [{ id: 'left', name: 'Clear', points: [[0, 0], [0.5, 0], [0.5, 1], [0, 1]], blur: 0, opacity: 1, tintOpacity: 0, brightness: 1, saturation: 1 }] };
+  const regions = { enabled: true, items: [{ id: 'left', name: 'Clear', points: [[0, 0], [0.5, 0], [0.5, 1], [0, 1]], feather: 0.06, blur: 0, opacity: 1, tintOpacity: 0, brightness: 1, saturation: 1 }] };
   await panel.send({ type: 'liveConfig', requestId: 1, config: { ...DEFAULTS, regions } });
   assert.deepEqual(env.calls.updateConfig[0].config.regions, regions);
   assert.deepEqual(env.calls.configurationWrites, [{ key: 'regions', value: regions, target: 1 }]);
@@ -266,7 +266,12 @@ test('region changes are saved structurally and successful live edits remain qui
   await panel.send({ type: 'liveConfig', requestId: 2, config: { ...DEFAULTS, regions: JSON.parse(JSON.stringify(regions)) } });
   assert.equal(env.calls.configurationWrites.length, 1, 'equivalent region objects are not repeatedly persisted');
   assert.equal(env.timers.size, 0, 'internal writes do not schedule a competing effect update');
-  await panel.send({ type: 'apply', config: { ...DEFAULTS, regions } });
+  const softerRegions = { ...regions, items: regions.items.map(region => ({ ...region, feather: 0.12 })) };
+  await panel.send({ type: 'liveConfig', requestId: 3, config: { ...DEFAULTS, regions: softerRegions } });
+  assert.equal(env.calls.configurationWrites.length, 2, 'a feather-only edit persists once');
+  assert.deepEqual(env.calls.updateConfig.at(-1).config.regions, softerRegions);
+  assert.equal(panel.latest().needsReload, false);
+  await panel.send({ type: 'apply', config: { ...DEFAULTS, regions: softerRegions } });
   assert.equal(panel.latest().notice, null, 'manual successful live apply has no redundant banner');
   assert.equal(env.calls.command.length, 0);
   env.dispose();

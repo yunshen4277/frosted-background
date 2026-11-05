@@ -250,10 +250,16 @@ test('regions preview independent effects, keep source coordinates, and support 
     assert.equal(await page.locator('#notice').isVisible(), true, 'a useful settings-save warning remains visible without reload');
     await sendState({ notice: null });
     await page.locator('#regions-section summary').click();
-    await page.locator('#region-template-apply').click();
+    assert.equal(await page.locator('#region-template').inputValue(), '', 'the placeholder allows the first left/right selection to trigger change');
+    assert.equal(await page.locator('#region-template-apply').count(), 0, 'templates need no extra apply button');
+    await page.locator('#region-template').selectOption('vertical');
+    assert.equal(await page.locator('#region-overlay').isVisible(), true, 'choosing a template immediately opens its editable outlines');
+    assert.equal(await page.locator('#region-overlay polygon').count(), 2);
     const initial = await acknowledge();
     assert.equal(initial.regions.enabled, true);
     assert.equal(initial.regions.items.length, 2);
+    assert.ok(initial.regions.items.every(region => region.feather === 0.06));
+    assert.equal(await page.locator('#region-template').inputValue(), 'vertical');
     assert.equal(await page.evaluate(() => window.__saved.dirty), false, 'structurally equal acknowledged region objects are clean');
     assert.equal(await page.locator('#region-canvas').isVisible(), true);
     const contrast = await page.locator('#region-canvas').evaluate(canvas => {
@@ -268,14 +274,13 @@ test('regions preview independent effects, keep source coordinates, and support 
     assert.ok(contrast.clear > 70 && contrast.blurred < 30, `canvas visibly preserves a sharp region beside blur: ${JSON.stringify(contrast)}`);
     for (const [template, count] of [['horizontal', 2], ['columns', 3], ['grid', 4], ['center', 1]]) {
       await page.locator('#region-template').selectOption(template);
-      await page.locator('#region-template-apply').click();
       const config = await acknowledge();
       assert.equal(config.regions.items.length, count);
       assert.ok(config.regions.items.every(region => region.points.every(point => point.every(value => value >= 0 && value <= 1))));
     }
     await page.locator('#region-name').fill('<b>My focus</b>');
     await page.locator('#region-name').dispatchEvent('input');
-    for (const [key, value] of Object.entries({ blur: 17, opacity: 0.7, tintOpacity: 0.2, brightness: 1.3, saturation: 0.6 })) {
+    for (const [key, value] of Object.entries({ blur: 17, opacity: 0.7, tintOpacity: 0.2, brightness: 1.3, saturation: 0.6, feather: 0.12 })) {
       await page.locator(`#region-${key}`).fill(String(value));
       await page.locator(`#region-${key}`).dispatchEvent('input');
     }
@@ -286,11 +291,22 @@ test('regions preview independent effects, keep source coordinates, and support 
     assert.equal(config.regions.items[0].tintOpacity, 0.2);
     assert.equal(config.regions.items[0].brightness, 1.3);
     assert.equal(config.regions.items[0].saturation, 0.6);
+    assert.equal(config.regions.items[0].feather, 0.12, 'feather is included in the live request and acknowledgement');
+    assert.equal(await page.locator('#region-feather-value').textContent(), '12%');
+    assert.equal(await page.locator('#region-template').inputValue(), '', 'custom changes do not claim to still match a template');
     assert.equal(await page.locator('#region-select b').count(), 0, 'region names are text, never markup');
     await page.locator('#region-sharp').click();
     config = await acknowledge();
     assert.equal(config.regions.items[0].blur, 0);
     assert.equal(config.blur, 24, 'regional sliders never overwrite the global effect');
+    await page.locator('[data-region-tool="polygon"]').click();
+    await page.locator('#region-overlay').focus(); await page.keyboard.press('Space');
+    assert.equal(await page.locator('#region-overlay .drawing-vertex').count(), 1);
+    await page.locator('#region-template').selectOption('center');
+    config = await acknowledge();
+    assert.equal(config.regions.items[0].feather, 0.06, 'reselecting the same template after customization resets it immediately');
+    assert.equal(await page.locator('[data-region-tool="select"]').getAttribute('aria-pressed'), 'true', 'a new template is ready to select and drag, regardless of the previous drawing tool');
+    assert.equal(await page.locator('#region-overlay .drawing-shape').count(), 0);
 
     const portrait = await page.evaluate(() => {
       const canvas = document.createElement('canvas'); canvas.width = 180; canvas.height = 320;
@@ -299,7 +315,7 @@ test('regions preview independent effects, keep source coordinates, and support 
     });
     await sendState({ config: { ...config, fit: 'cover', regions: { enabled: true, items: [] } }, media: { kind: 'image', name: 'portrait.png', uri: portrait }, resetDraft: true });
     await page.locator('#preview-media img').evaluate(image => image.decode());
-    await page.locator('#region-edit').click();
+    if (await page.locator('#region-edit').getAttribute('aria-pressed') !== 'true') await page.locator('#region-edit').click();
     assert.equal(await page.locator('.preview-code').isVisible(), false);
     assert.equal(await page.locator('#preview-media img').evaluate(image => getComputedStyle(image).objectFit), 'contain');
     await page.locator('[data-region-tool="rect"]').click();
@@ -321,7 +337,7 @@ test('regions preview independent effects, keep source coordinates, and support 
     await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.9, bounds.top + bounds.y + bounds.height * 0.8, { steps: 8 });
     await page.mouse.up();
     config = await acknowledge();
-    const rectangle = config.regions.items[0];
+    let rectangle = config.regions.items[0];
     assert.ok(Math.abs(rectangle.points[0][0] - 0.1) < 0.01 && Math.abs(rectangle.points[0][1] - 0.2) < 0.01);
     assert.ok(Math.abs(rectangle.points[2][0] - 0.9) < 0.01 && Math.abs(rectangle.points[2][1] - 0.8) < 0.01);
     await page.evaluate(() => document.documentElement.style.setProperty('--vscode-editor-background', '#f7f6f4'));
@@ -334,10 +350,13 @@ test('regions preview independent effects, keep source coordinates, and support 
     assert.ok(Math.abs(projected.y - (bounds.y + rectangle.points[0][1] * bounds.height)) < 1);
     assert.deepEqual(await page.evaluate(() => window.__saved.draft.regions.items[0].points), rectangle.points, 'resizing does not alter source anchors');
 
-    await page.locator('[data-region-tool="polygon"]').click();
+    await page.locator('[data-region-tool="lasso"]').click();
     await page.locator('#region-overlay').scrollIntoViewIfNeeded();
     bounds = await displayBounds();
     const circlePoint = angle => [bounds.left + bounds.x + bounds.width * (0.5 + 0.4 * Math.cos(angle)), bounds.top + bounds.y + bounds.height * (0.5 + 0.4 * Math.sin(angle))];
+    await page.mouse.click(bounds.left + bounds.x + bounds.width * 0.5, bounds.top + bounds.y + bounds.height * 0.5);
+    assert.equal(await page.locator('#region-drawing-error').isVisible(), true, 'an accidental lasso click gives useful feedback');
+    assert.equal(await page.locator('#region-overlay .drawing-shape').count(), 0, 'a short lasso never continues into the next gesture');
     await page.mouse.move(...circlePoint(0)); await page.mouse.down();
     for (let index = 1; index <= 130; index++) await page.mouse.move(...circlePoint(index * Math.PI * 2 / 130));
     await page.mouse.up();
@@ -346,11 +365,101 @@ test('regions preview independent effects, keep source coordinates, and support 
     assert.ok(freehand.points.length >= 8 && freehand.points.length <= 64);
     assert.ok(Math.min(...freehand.points.map(point => point[0])) < 0.13 && Math.max(...freehand.points.map(point => point[0])) > 0.87);
     assert.ok(Math.min(...freehand.points.map(point => point[1])) < 0.13 && Math.max(...freehand.points.map(point => point[1])) > 0.87, 'a long lasso preserves the late half of the stroke');
+    const distanceToSegment = (point, a, b) => {
+      const dx = b[0] - a[0], dy = b[1] - a[1];
+      const t = dx || dy ? Math.max(0, Math.min(1, ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / (dx * dx + dy * dy))) : 0;
+      return Math.hypot(point[0] - a[0] - t * dx, point[1] - a[1] - t * dy);
+    };
+    const simplifiedPixels = freehand.points.map(([x, y]) => [x * bounds.width, y * bounds.height]);
+    const maxError = Math.max(...Array.from({ length: 131 }, (_, index) => {
+      const angle = index * Math.PI * 2 / 130;
+      const point = [(0.5 + 0.4 * Math.cos(angle)) * bounds.width, (0.5 + 0.4 * Math.sin(angle)) * bounds.height];
+      return Math.min(...simplifiedPixels.map((a, i) => distanceToSegment(point, a, simplifiedPixels[(i + 1) % simplifiedPixels.length])));
+    }));
+    assert.ok(maxError <= 2, `lasso simplification stays within two preview pixels (${maxError})`);
+    assert.equal(freehand.feather, 0.06);
+
+    const clickPoint = async (x, y, options) => page.mouse.click(bounds.left + bounds.x + bounds.width * x, bounds.top + bounds.y + bounds.height * y, options);
+    await page.locator('[data-region-tool="polygon"]').click();
+    await page.locator('#region-overlay').scrollIntoViewIfNeeded(); bounds = await displayBounds();
+    await clickPoint(0.2, 0.2); await clickPoint(0.8, 0.2); await clickPoint(0.8, 0.8);
+    assert.equal(await page.evaluate(() => window.__saved.draft.regions.items.length), 2, 'click polygons stay open after three points');
+    assert.equal(await page.locator('#region-overlay .drawing-vertex').count(), 3);
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.2, bounds.top + bounds.y + bounds.height * 0.8);
+    assert.equal(await page.locator('#region-overlay .drawing-shape').evaluate(line => line.points.numberOfItems), 4, 'an open polygon previews the next edge under the pointer');
+    await page.keyboard.press('Backspace');
+    assert.equal(await page.locator('#region-overlay .drawing-vertex').count(), 2);
+    await clickPoint(0.8, 0.8); await clickPoint(0.2, 0.8);
+    await page.keyboard.press('Enter');
+    config = await acknowledge();
+    assert.equal(config.regions.items.length, 3);
+    assert.equal(config.regions.items[2].points.length, 4);
+    await page.locator('[data-region-tool="polygon"]').click();
+    await page.locator('#region-overlay').scrollIntoViewIfNeeded(); bounds = await displayBounds();
+    await clickPoint(0.3, 0.3); await clickPoint(0.7, 0.3);
+    await page.mouse.dblclick(bounds.left + bounds.x + bounds.width * 0.5, bounds.top + bounds.y + bounds.height * 0.7);
+    config = await acknowledge();
+    assert.equal(config.regions.items.length, 4, 'double click closes a polygon without duplicate vertices');
+    assert.equal(config.regions.items[3].points.length, 3);
+    await page.locator('[data-region-tool="polygon"]').click();
+    await page.locator('#region-overlay').scrollIntoViewIfNeeded(); bounds = await displayBounds();
+    await clickPoint(0.2, 0.3); await clickPoint(0.3, 0.4); await page.keyboard.press('Escape');
+    assert.equal(await page.locator('#region-overlay .drawing-shape').count(), 0);
+    assert.equal(await page.evaluate(() => window.__saved.draft.regions.items.length), 4);
     await page.locator('[data-region-tool="rect"]').click();
     await page.locator('#region-overlay').focus();
     await page.keyboard.press('Space'); await page.keyboard.press('Shift+ArrowRight'); await page.keyboard.press('Shift+ArrowDown'); await page.keyboard.press('Enter');
     config = await acknowledge();
-    assert.equal(config.regions.items.length, 3, 'a rectangle can be created with the keyboard alone');
+    assert.equal(config.regions.items.length, 5, 'a rectangle can be created with the keyboard alone');
+    await page.locator('[data-region-tool="select"]').click();
+    await page.locator('#region-overlay').scrollIntoViewIfNeeded(); bounds = await displayBounds();
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.12, bounds.top + bounds.y + bounds.height * 0.22);
+    await page.mouse.down();
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 1.2, bounds.top + bounds.y + bounds.height * 1.2, { steps: 8 });
+    assert.deepEqual(await page.evaluate(() => window.__saved.draft.regions.items[0].points), rectangle.points, 'moving only previews geometry until release');
+    await page.mouse.up();
+    config = await acknowledge();
+    const moved = config.regions.items[0];
+    assert.ok(Math.abs(moved.points[2][0] - 1) < 0.001 && Math.abs(moved.points[2][1] - 1) < 0.001, 'dragging clamps the whole region to source bounds');
+    assert.ok(Math.abs((moved.points[2][0] - moved.points[0][0]) - (rectangle.points[2][0] - rectangle.points[0][0])) < 0.001, 'dragging preserves the region shape');
+    rectangle = moved;
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.21, bounds.top + bounds.y + bounds.height * 0.95); await page.mouse.down();
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.15, bounds.top + bounds.y + bounds.height * 0.85);
+    await page.keyboard.press('ArrowRight'); await page.mouse.up();
+    assert.deepEqual(await page.evaluate(() => window.__saved.draft.regions), config.regions, 'changing selection cancels a drag instead of writing its geometry into another region');
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.21, bounds.top + bounds.y + bounds.height * 0.95); await page.mouse.down();
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.15, bounds.top + bounds.y + bounds.height * 0.85);
+    const externalPoints = [[0.1, 0.1], [0.3, 0.1], [0.3, 0.3], [0.1, 0.3]];
+    config = { ...config, regions: { ...config.regions, items: config.regions.items.map((region, index) => index ? region : { ...region, points: externalPoints }) } };
+    await sendState({ config, resetDraft: false }); await page.mouse.up();
+    assert.deepEqual(await page.evaluate(() => window.__saved.draft.regions.items[0].points), externalPoints, 'external config replacement cancels stale drag geometry even without resetDraft');
+    rectangle = config.regions.items[0];
+    await page.locator('[data-region-tool="rect"]').click();
+    await page.locator('#region-overlay').scrollIntoViewIfNeeded(); bounds = await displayBounds();
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.2, bounds.top + bounds.y + bounds.height * 0.2); await page.mouse.down();
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.4, bounds.top + bounds.y + bounds.height * 0.4);
+    await sendState({ busy: true });
+    assert.equal(await page.locator('#region-overlay .drawing-shape').count(), 0, 'busy state cancels a pending gesture');
+    await page.mouse.up(); await sendState({ busy: false });
+    assert.equal(await page.evaluate(() => window.__saved.draft.regions.items.length), 5);
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.2, bounds.top + bounds.y + bounds.height * 0.2); await page.mouse.down();
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.3, bounds.top + bounds.y + bounds.height * 0.3);
+    await page.locator('#region-overlay').dispatchEvent('pointercancel', { pointerId: 1, isPrimary: true });
+    assert.equal(await page.locator('#region-overlay .drawing-shape').count(), 0, 'pointer cancellation releases the unfinished gesture');
+    await page.mouse.up();
+    assert.equal(await page.evaluate(() => window.__saved.draft.regions.items.length), 5);
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.2, bounds.top + bounds.y + bounds.height * 0.2); await page.mouse.down();
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.3, bounds.top + bounds.y + bounds.height * 0.3);
+    await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+    assert.equal(await page.locator('#region-overlay .drawing-shape').count(), 0, 'losing window focus cancels an unfinished gesture');
+    await page.mouse.up();
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.2, bounds.top + bounds.y + bounds.height * 0.2); await page.mouse.down();
+    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.3, bounds.top + bounds.y + bounds.height * 0.3);
+    await page.setViewportSize({ width: 340, height: 900 });
+    await page.waitForFunction(() => !document.querySelector('#region-overlay .drawing-shape'));
+    await page.mouse.up();
+    assert.equal(await page.evaluate(() => window.__saved.draft.regions.items.length), 5, 'resizing cancels an unfinished gesture without committing a shifted region');
+    await page.setViewportSize({ width: 360, height: 900 });
     assert.equal(await page.locator('#region-canvas').isVisible(), true, 'editing can show the actual regional effects');
     await page.locator('#region-show-effects').uncheck();
     assert.equal(await page.locator('#region-canvas').isVisible(), false);
@@ -374,14 +483,20 @@ test('regions preview independent effects, keep source coordinates, and support 
     assert.equal(await page.locator('[data-region-tool="rect"]').isEnabled(), true);
     for (const language of ['zh-CN', 'es', 'en']) {
       await page.locator('#language').selectOption(language);
-      assert.equal(await page.locator('#region-template-apply').textContent(), dictionaries[language]['套用模板']);
+      assert.equal(await page.locator('#region-template option[value=""]').textContent(), dictionaries[language]['选择模板']);
+      assert.equal(await page.locator('label[for="region-feather"]').textContent(), dictionaries[language]['渐变过渡']);
       assert.equal(await page.locator('#region-overlay').getAttribute('aria-label'), dictionaries[language]['区域绘制画布']);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
     }
     await page.clock.resume();
     await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.locator('[data-region-tool="polygon"]').click();
+    await page.locator('#region-overlay').scrollIntoViewIfNeeded(); bounds = await displayBounds();
+    await clickPoint(0.2, 0.2); await clickPoint(0.3, 0.3);
+    assert.equal(await page.locator('#region-overlay .drawing-vertex').count(), 2);
     const video = { kind: 'video', name: 'edges.webm', uri: pathToFileURL(path.resolve(__dirname, 'fixtures/edges.webm')).href };
     await sendState({ media: video, language: 'en' });
+    assert.equal(await page.locator('#region-overlay .drawing-shape').count(), 0, 'switching media discards the old source drawing');
     await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2);
     await page.locator('video').evaluate(video => { window.__regionVideo = video; });
     await page.locator('#region-edit').click();
@@ -396,10 +511,10 @@ test('regions preview independent effects, keep source coordinates, and support 
     await page.locator('#preview-media img').evaluate(image => image.decode());
     assert.equal(await page.locator('#error').isVisible(), true);
     await page.setViewportSize({ width: 280, height: 620 });
-    await page.locator('#region-saturation').scrollIntoViewIfNeeded();
+    await page.locator('#region-feather').scrollIntoViewIfNeeded();
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
-    const sliderBox = await page.locator('#region-saturation').boundingBox(), footerBox = await page.locator('.action-bar').boundingBox();
-    assert.ok(sliderBox.y >= 0 && sliderBox.y + sliderBox.height <= footerBox.y, 'all five regional controls are reachable above the sticky footer');
+    const sliderBox = await page.locator('#region-feather').boundingBox(), footerBox = await page.locator('.action-bar').boundingBox();
+    assert.ok(sliderBox.y >= 0 && sliderBox.y + sliderBox.height <= footerBox.y, 'all regional controls are reachable above the sticky footer');
     assert.deepEqual(await page.evaluate(() => window.__violations), []);
     assert.deepEqual(errors, []);
   } finally {

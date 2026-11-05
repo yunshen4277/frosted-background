@@ -480,7 +480,10 @@ test('live state swaps media without reload, preserves video settings updates an
       window.__cspViolations = [];
       window.__blobEvents = [];
       window.__liveAborts = 0;
+      window.__maskReads = 0;
       window.__messageListeners = new Set();
+      const pixels = CanvasRenderingContext2D.prototype.getImageData;
+      CanvasRenderingContext2D.prototype.getImageData = function (...args) { if (!this.canvas.isConnected) window.__maskReads++; return pixels.apply(this, args); };
       document.addEventListener('securitypolicyviolation', event => window.__cspViolations.push(event.effectiveDirective));
       const add = window.addEventListener.bind(window), remove = window.removeEventListener.bind(window);
       window.addEventListener = (type, listener, options) => { if (type === 'message') window.__messageListeners.add(listener); return add(type, listener, options); };
@@ -521,7 +524,7 @@ test('live state swaps media without reload, preserves video settings updates an
     publish({ ...initial, fit: 'fill', blur: 3, opacity: 0.6 });
     await page.waitForFunction(() => document.querySelector('img').style.objectFit === 'fill' && document.querySelector('img').style.opacity === '0.6');
     assert.equal(await page.locator('.frosted-background-layer').evaluate(el => el.getBoundingClientRect().top), 52, 'live fill excludes the opaque title');
-    const clearRegion = { id: 'clear', name: 'Clear', points: [[0.05, 0.15], [0.55, 0.15], [0.55, 0.85], [0.05, 0.85]], blur: 0, opacity: 1, tintOpacity: 0, brightness: 1, saturation: 1 };
+    const clearRegion = { id: 'clear', name: 'Clear', points: [[0.05, 0.15], [0.55, 0.15], [0.55, 0.85], [0.05, 0.85]], blur: 0, opacity: 1, tintOpacity: 0, brightness: 1, saturation: 1, feather: 0.06 };
     const overlapRegion = { ...clearRegion, id: 'overlap', name: 'Overlap', points: [[0.25, 0.25], [0.42, 0.25], [0.42, 0.75], [0.25, 0.75]], brightness: 0.2 };
     const regionalImage = { ...initial, blur: 14, opacity: 1, tintOpacity: 0, fit: 'fill', regions: { enabled: true, items: [clearRegion, overlapRegion] } };
     async function regionPixels(fit) {
@@ -583,6 +586,9 @@ test('live state swaps media without reload, preserves video settings updates an
     assert.equal(await frame.locator('video').evaluate(element => element.currentTime), videoTime);
     assert.equal(await page.locator('iframe').evaluate(el => el.style.filter), 'none', 'parent does not apply global effects twice');
     assert.equal(await page.locator('.frosted-background-tint').evaluate(el => el.style.opacity), '0');
+    await frame.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const videoMaskReads = await frame.evaluate(() => window.__maskReads);
+    assert.ok(videoMaskReads > 0, 'video feather initially builds a real alpha mask');
     publish({ ...video, fit: 'fill', blur: 0, opacity: 1, tintOpacity: 0, regions: { enabled: true, items: [{ ...videoRegions.items[0], opacity: 0.05, tintOpacity: 0.9 }] } });
     await nextPoll();
     await page.evaluate(() => document.documentElement.style.setProperty('--vscode-editor-background', '#dc2020'));
@@ -601,6 +607,7 @@ test('live state swaps media without reload, preserves video settings updates an
       return !document.querySelector('video').paused && pixel !== previous;
     }, beforePlayback);
     assert.equal(await frame.locator('video').evaluate(element => element.style.visibility), 'hidden', 'canvas receives fresh video pixels while the raw video element is hidden');
+    assert.equal(await frame.evaluate(() => window.__maskReads), videoMaskReads, 'video playback, regional effect edits and theme changes reuse the same feather mask');
     publish({ ...video, fit: 'fill', blur: 0 });
     await frame.waitForFunction(() => document.querySelector('video').style.objectFit === 'fill');
     await frame.waitForFunction(() => !document.querySelector('canvas'));
@@ -711,6 +718,97 @@ test('live state swaps media without reload, preserves video settings updates an
     await browser.close();
     fs.rmSync(localDirectory, { recursive: true, force: true });
   }
+});
+
+test('feather masks blend real pixels without seams and reuse cached geometry', {
+  skip: !process.env.PLAYWRIGHT_MODULE,
+  timeout: 60000,
+}, async () => {
+  const { chromium } = require(process.env.PLAYWRIGHT_MODULE);
+  const executablePath = process.env.BROWSER_EXECUTABLE || [
+    'C:/Program Files/Google/Chrome/Application/chrome.exe',
+    'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+  ].find(value => fs.existsSync(value));
+  const browser = await chromium.launch({ headless: true, executablePath });
+  try {
+    const page = await browser.newPage({ viewport: { width: 760, height: 360 } });
+    await page.setContent('<style>body{margin:24px;background:#151923;color:#eee;font:14px system-ui}canvas{display:block;width:320px;height:180px}#comparison{display:flex;gap:24px}p{margin:8px 0}</style><h2>Region edge transition</h2><section id="comparison"><div><p>0% — hard edge</p><canvas id="output" data-output="true"></canvas></div></section>');
+    await page.addScriptTag({ content: fs.readFileSync(path.join(__dirname, '../media/regions.js'), 'utf8') });
+    await page.evaluate(async () => {
+      const original = document.createElement('canvas'); original.width = 320; original.height = 180;
+      original.getContext('2d').fillStyle = '#fff'; original.getContext('2d').fillRect(0, 0, 320, 180);
+      const source = new Image(); source.src = original.toDataURL(); await source.decode();
+      const canvas = document.querySelector('#output');
+      window.__maskReads = 0; window.__offscreen = [];
+      const read = CanvasRenderingContext2D.prototype.getImageData;
+      CanvasRenderingContext2D.prototype.getImageData = function (...args) { if (!this.canvas.dataset.output) window.__maskReads++; return read.apply(this, args); };
+      const create = document.createElement.bind(document);
+      document.createElement = (tag, ...args) => { const element = create(tag, ...args); if (tag === 'canvas') window.__offscreen.push(element); return element; };
+      const compositor = FrostedRegions.createCompositor({ source, canvas });
+      const base = { fit: 'fill', position: 'center center', blur: 0, opacity: 1, tintOpacity: 0, brightness: 0.2, saturation: 1, tintColor: '#14283c' };
+      window.__region = (id, left, right, brightness = 1, feather = 0.06) => ({ id, name: id, points: [[left, 0], [right, 0], [right, 1], [left, 1]], blur: 0, opacity: 1, tintOpacity: 0, brightness, saturation: 1, feather });
+      window.__set = (items, extra = {}, width = 320, height = 180) => {
+        canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
+        compositor.update({ ...base, ...extra, regions: { enabled: true, items } });
+      };
+      window.__samples = (points = [[140, 90], [150, 90], [156, 90], [160, 90], [164, 90], [170, 90], [180, 90]]) => points.map(([x, y]) => [...canvas.getContext('2d').getImageData(x, y, 1, 1).data].slice(0, 3));
+      window.__fx = { canvas, compositor, source, base };
+    });
+    await page.evaluate(() => __set([__region('left', 0, 0.5, 1, 0)]));
+    const hard = await page.evaluate(() => __samples([[159, 90], [160, 90]]));
+    assert.deepEqual(hard, [[255, 255, 255], [51, 51, 51]], 'zero feather preserves the exact hard boundary');
+    await page.evaluate(() => __set([__region('left', 0, 0.5)]));
+    const soft = await page.evaluate(() => __samples());
+    assert.ok(soft[0][0] > 245 && soft.at(-1)[0] < 60, JSON.stringify(soft));
+    assert.ok(soft.filter(pixel => pixel[0] > 70 && pixel[0] < 235).length >= 3, `edge has real intermediate alpha values: ${JSON.stringify(soft)}`);
+    assert.ok(soft.every((pixel, index) => !index || pixel[0] <= soft[index - 1][0]), 'single-region transition is monotonic');
+    assert.ok((await page.evaluate(() => __samples([[2, 2], [2, 178], [80, 2], [80, 178]]))).every(pixel => pixel[0] > 250), 'image-border template edges do not fade into the base');
+    const initialReads = await page.evaluate(() => __maskReads);
+    await page.evaluate(() => { __set([__region('left', 0, 0.5, 0.8)]); for (let i = 0; i < 5; i++) __fx.compositor.draw(); });
+    assert.equal(await page.evaluate(() => __maskReads), initialReads, 'effect changes and frame draws do not rebuild/read masks');
+    await page.evaluate(() => __set([__region('left', 0, 0.6, 0.8)]));
+    assert.equal(await page.evaluate(() => __maskReads), initialReads + 1, 'polygon geometry changes rebuild the cached mask');
+    await page.evaluate(() => __set([__region('left', 0, 0.6, 0.8, 0.12)]));
+    assert.equal(await page.evaluate(() => __maskReads), initialReads + 2, 'feather changes rebuild the cached mask');
+
+    await page.evaluate(() => __set([__region('whole', 0, 1)]));
+    const whole = await page.evaluate(() => __samples());
+    await page.evaluate(() => __set([__region('left', 0, 0.5), __region('right', 0.5, 1)]));
+    const adjacent = await page.evaluate(() => __samples());
+    assert.ok(adjacent.every((pixel, index) => pixel.every((channel, c) => Math.abs(channel - whole[index][c]) <= 2)), `adjacent equal effects match a single region without a dark seam: ${JSON.stringify(adjacent)}`);
+    await page.evaluate(() => __set([__region('left', 0, 0.5), __region('right', 0.5, 1, 0.5)]));
+    const differing = await page.evaluate(() => __samples());
+    assert.ok(differing.every(pixel => pixel[0] >= 126 && pixel[0] <= 255), 'adjacent different effects do not dip below either endpoint');
+    assert.ok(differing.every((pixel, i) => !i || pixel[0] <= differing[i - 1][0] + 1), `different effects transition continuously: ${JSON.stringify(differing)}`);
+    await page.evaluate(() => __set([__region('hard-base', 0, 1, 1, 0), __region('soft-later', 0.5, 1, 0.2)]));
+    const mixed = await page.evaluate(() => __samples());
+    assert.ok(mixed[0][0] > 245 && mixed.at(-1)[0] < 60 && mixed[3][0] > 70 && mixed[3][0] < 235, 'hard/soft overlap preserves the later effect and its soft boundary');
+    await page.evaluate(() => __set([__region('first', 0, 1), __region('later', 0.25, 1, 0.2)]));
+    assert.deepEqual(await page.evaluate(() => __samples([[20, 90], [280, 90]])), [[255, 255, 255], [51, 51, 51]], 'the later region wins fully inside an overlap');
+    await page.evaluate(() => __set([__region('center', 0.4, 0.6)]));
+    const outside = await page.evaluate(() => __samples([[110, 90], [124, 90], [160, 90], [210, 90]]));
+    assert.ok(outside[0][0] === 51 && outside[1][0] > 51 && outside[2][0] > 250 && outside[3][0] === 51, `feather crosses the original polygon boundary without expanding indefinitely: ${JSON.stringify(outside)}`);
+
+    await page.evaluate(() => __set([__region('whole', 0, 1, 1, 0.3)], { fit: 'contain' }, 320, 320));
+    assert.deepEqual(await page.evaluate(() => __samples([[100, 30], [100, 69], [100, 250], [100, 290]])), Array(4).fill([20, 40, 60]), 'feather does not spill image pixels into contain letterboxes');
+    await page.evaluate(() => __set([__region('whole', 0, 1, 1, 0.3)], { fit: 'cover' }, 64, 320));
+    assert.ok((await page.evaluate(() => __samples([[1, 1], [62, 1], [1, 318], [62, 318], [32, 160]]))).every(pixel => pixel[0] > 250), 'extreme narrow cover retains all visible outer-edge coverage');
+    assert.ok(await page.evaluate(() => __offscreen.every(canvas => canvas.width * canvas.height <= 1000000)), 'mask padding never creates oversized buffers');
+
+    if (process.env.RENDERER_ARTIFACT_DIR) {
+      fs.mkdirSync(process.env.RENDERER_ARTIFACT_DIR, { recursive: true });
+      await page.evaluate(() => {
+        __set([__region('left', 0, 0.5, 1, 0)]);
+        const panel = document.createElement('div'), title = document.createElement('p'), canvas = document.createElement('canvas');
+        title.textContent = '6% — feathered edge'; canvas.dataset.output = 'true'; panel.append(title, canvas); document.querySelector('#comparison').append(panel);
+        window.__comparison = FrostedRegions.createCompositor({ source: __fx.source, canvas });
+        __comparison.update({ ...__fx.base, regions: { enabled: true, items: [__region('left', 0, 0.5)] } });
+      });
+      await page.screenshot({ path: path.join(process.env.RENDERER_ARTIFACT_DIR, 'feather-comparison.png') });
+    }
+    await page.evaluate(() => { __fx.compositor.dispose(); window.__comparison?.dispose(); });
+    assert.ok(await page.evaluate(() => __offscreen.filter(canvas => !canvas.dataset.output).every(canvas => canvas.width * canvas.height === 1)), 'disposing releases every mask and scratch buffer');
+  } finally { await browser.close(); }
 });
 
 test('complete compression keeps all four image and video edges visible in small code viewports', {

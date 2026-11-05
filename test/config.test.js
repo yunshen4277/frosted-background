@@ -45,7 +45,7 @@ test('region settings survive normalization while unknown nested fields and inva
   assert.equal(normalized.regions.items.length, 1);
   assert.deepEqual(normalized.regions.items[0], {
     id: 'sharp-area', name: 'Sharp <area>', points: values.items[0].points,
-    blur: 0, opacity: 1, tintOpacity: 0, brightness: 1.2, saturation: 0.5
+    feather: 0, blur: 0, opacity: 1, tintOpacity: 0, brightness: 1.2, saturation: 0.5
   });
   assert.notEqual(normalized.regions.items[0].points, values.items[0].points);
   assert.deepEqual(normalizeConfig(null), DEFAULTS);
@@ -63,4 +63,15 @@ test('region state stays bounded and disabling preserves shapes for later use', 
   assert.ok(Buffer.byteLength(JSON.stringify(result)) < 64000);
   result.items[0].points[0][0] = 0;
   assert.equal(items[0].points[0][0], 1, 'normalization never mutates the supplied geometry');
+});
+
+test('region edge transitions preserve old sharp boundaries and clamp configurable feathering', () => {
+  const points = [[0, 0], [1, 0], [1, 1], [0, 1]];
+  for (const [input, expected] of [[undefined, 0], [0, 0], [0.06, 0.06], [-1, 0], [2, 0.3], [Infinity, 0], ['blur(20px)', 0]]) {
+    const config = normalizeConfig({ regions: { enabled: true, items: [{ id: 'area', points, feather: input, blur: 0 }] } });
+    assert.equal(config.regions.items[0].feather, expected);
+    assert.equal(config.regions.items[0].blur, 0);
+  }
+  const schema = require('../package.json').contributes.configuration.properties['frostedBackground.regions'].properties.items.items.properties.feather;
+  assert.deepEqual(schema, { type: 'number', minimum: 0, maximum: 0.3, default: 0 });
 });

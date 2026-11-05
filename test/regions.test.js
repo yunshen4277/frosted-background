@@ -8,11 +8,18 @@ const triangle = [[0, 0], [1, 0], [0, 1]];
 test('region normalization bounds polygons and independent effects without mutating input', () => {
   const input = { enabled: true, unsafe: 'drop', items: [{ id: '<bad>', name: 'x'.repeat(80), points: [[-1, 0], [1.5, 0], [0.123456, 1]], blur: 90, opacity: 0, tintOpacity: 2, brightness: 0, saturation: 3, unsafe: true }] };
   const output = normalizeRegions(input);
-  assert.deepEqual(output, { enabled: true, items: [{ id: 'region-1', name: 'x'.repeat(40), points: [[0, 0], [1, 0], [0.1235, 1]], blur: 60, opacity: 0.05, tintOpacity: 0.9, brightness: 0.2, saturation: 2 }] });
+  assert.deepEqual(output, { enabled: true, items: [{ id: 'region-1', name: 'x'.repeat(40), points: [[0, 0], [1, 0], [0.1235, 1]], blur: 60, opacity: 0.05, tintOpacity: 0.9, brightness: 0.2, saturation: 2, feather: 0 }] });
   assert.equal(input.items[0].blur, 90);
   assert.deepEqual(input.items[0].points[0], [-1, 0]);
   assert.deepEqual(normalizeRegions(), { enabled: false, items: [] });
   assert.deepEqual(normalizeRegions({ enabled: 'true', items: [] }), { enabled: false, items: [] });
+});
+
+test('legacy regions keep hard edges and feather is bounded independently of image blur', () => {
+  const items = [undefined, -1, 0, 0.06, 0.9, '0.1', NaN].map((feather, i) => ({ id: `r${i}`, points: triangle, feather, blur: 0 }));
+  const result = normalizeRegions({ enabled: true, items });
+  assert.deepEqual(result.items.map(item => item.feather), [0, 0, 0, 0.06, 0.3, 0, 0]);
+  assert.ok(result.items.every(item => item.blur === 0));
 });
 
 test('invalid or degenerate region polygons are dropped and duplicate IDs remain unique', () => {
