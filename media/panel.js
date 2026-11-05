@@ -4,6 +4,7 @@
   const vscode = acquireVsCodeApi();
   const { normalizeLanguage, t } = window.FrostedI18n;
   const regionApi = window.FrostedRegions;
+  const sourceApi = window.FrostedSource;
   const normalizeRegions = value => regionApi ? regionApi.normalizeRegions(value) : { enabled: false, items: [] };
   const clone = value => JSON.parse(JSON.stringify(value));
   let language = normalizeLanguage(document.documentElement.lang);
@@ -11,7 +12,7 @@
   const fallback = {
     blur: 14, opacity: 0.35, tintOpacity: 0.18, saturation: 1, brightness: 1,
     fit: 'cover', position: 'center center', playbackRate: 1,
-    pauseWhenUnfocused: true, respectReducedMotion: true,
+    pauseWhenUnfocused: true, respectReducedMotion: true, paused: false,
     regions: { enabled: false, items: [] },
   };
   const ranges = { blur: [0, 60], opacity: [0.05, 1], tintOpacity: [0, 0.9], brightness: [0.2, 2], saturation: [0, 2], playbackRate: [0.25, 2] };
@@ -29,7 +30,7 @@
     }
     if (['cover', 'contain', 'fill'].includes(values.fit)) result.fit = values.fit;
     if (['center center', 'center top', 'center bottom', 'left center', 'right center'].includes(values.position)) result.position = values.position;
-    for (const key of ['pauseWhenUnfocused', 'respectReducedMotion']) if (typeof values[key] === 'boolean') result[key] = values[key];
+    for (const key of ['pauseWhenUnfocused', 'respectReducedMotion', 'paused']) if (typeof values[key] === 'boolean') result[key] = values[key];
     return result;
   };
   const saved = vscode.getState() || {};
@@ -50,6 +51,12 @@
   let videoReady = false;
   let previewErrorKey = null;
   let mediaFailed = false;
+  let previewLoading = false;
+  let hlsPlayer = null;
+  let nativeHls = false;
+  let sourceErrorKey = null;
+  let loadingUrl = false;
+  let submittedUrl = '';
   let compositor = null;
   let regionEditing = false;
   let regionEffectsVisible = true;
@@ -91,6 +98,7 @@
       }
     }
     if (previewErrorKey) byId('preview-error').textContent = translate(previewErrorKey);
+    byId('preview-loading').textContent = translate('正在加载直播…');
     // Only text changes. The current image/video element, time, and draft stay
     // intact; updateMedia has an identity guard for authoritative host echoes.
     updateMedia();
@@ -295,13 +303,14 @@
 
   function syncPlayback() {
     if (!currentMedia || currentMedia.tagName !== 'VIDEO') return;
-    const shouldPause = document.hidden || (draft.respectReducedMotion && reducedMotion.matches)
+    if (mediaFailed) { currentMedia.pause(); return; }
+    const shouldPause = draft.paused || document.hidden || (draft.respectReducedMotion && reducedMotion.matches)
       || (draft.pauseWhenUnfocused && !document.hasFocus());
     if (shouldPause) {
       currentMedia.pause();
       // Metadata alone can leave a blank video surface. Seek once so a still
       // frame is decoded even when reduced-motion or focus rules pause playback.
-      if (videoReady && currentMedia.currentTime === 0 && Number.isFinite(currentMedia.duration)) {
+      if (state.media?.type !== 'hls' && videoReady && currentMedia.currentTime === 0 && Number.isFinite(currentMedia.duration)) {
         try { currentMedia.currentTime = Math.min(0.05, currentMedia.duration / 2); } catch { /* Unsupported codec: media error handler supplies a useful message. */ }
       }
     } else {
@@ -311,6 +320,7 @@
   }
 
   function renderPreview() {
+    byId('preview-loading').hidden = !previewLoading || mediaFailed;
     byId('preview').style.backgroundColor = 'var(--vscode-editor-background, #111923)';
     byId('preview').classList.toggle('is-region-editing', regionEditing);
     byId('preview').classList.toggle('show-region-effects', regionEffectsVisible);
@@ -344,19 +354,26 @@
   function updateMedia() {
     const media = state.media;
     const valid = media && typeof media.uri === 'string' && ['image', 'video'].includes(media.kind);
-    const identity = valid ? `${media.kind}:${media.uri}` : '';
-    byId('media-kind').textContent = translate(valid ? (media.kind === 'video' ? '视频' : '图片') : '未选择背景');
+    const identity = valid ? `${media.kind}:${media.type || 'file'}:${media.uri}` : '';
+    byId('media-kind').textContent = translate(valid ? (media.type === 'hls' ? 'HLS直播' : media.kind === 'video' ? '视频' : '图片') : '未选择背景');
     byId('media-name').textContent = valid && typeof media.name === 'string' ? media.name : translate('从本机选择文件');
     byId('media-name').title = valid && typeof media.name === 'string' ? media.name : '';
     byId('video-section').hidden = !valid || media.kind !== 'video';
+    byId('video-behavior').textContent = translate(media?.type === 'hls' ? '静音 · 直播流' : '静音 · 循环');
+    let origin = '';
+    try { if (valid && media.sourceUrl) origin = new URL(media.sourceUrl).origin; else if (valid && media.type === 'hls') origin = new URL(media.uri).origin; } catch { /* A host-provided display name still remains available. */ }
+    byId('media-origin').textContent = origin;
+    byId('media-origin').hidden = !origin;
     byId('preview-empty').hidden = Boolean(valid);
     byId('preview').classList.toggle('has-media', Boolean(valid));
     if (identity === mediaIdentity) return;
     mediaIdentity = identity;
+    disposeHls();
     if (compositor) { compositor.dispose(); compositor = null; }
     byId('region-canvas').width = 1; byId('region-canvas').height = 1;
     byId('region-canvas').hidden = true;
     mediaFailed = false;
+    previewLoading = Boolean(valid && media.type === 'hls');
     cancelGesture(false); drawingErrorKey = null;
     if (!valid) regionEditing = false;
     videoReady = false;
@@ -371,27 +388,115 @@
     if (media.kind === 'video') {
       element.muted = true;
       element.defaultMuted = true;
-      element.loop = true;
+      element.loop = media.type !== 'hls';
       element.playsInline = true;
       element.preload = 'auto';
-      element.addEventListener('loadedmetadata', () => { videoReady = true; renderPreview(); });
-      element.addEventListener('loadeddata', renderPreview);
+      element.addEventListener('loadedmetadata', () => { if (element === currentMedia) { videoReady = true; renderPreview(); } });
+      element.addEventListener('loadeddata', () => { if (element === currentMedia) { previewLoading = false; renderPreview(); } });
     } else {
       element.alt = '';
       element.draggable = false;
-      element.addEventListener('load', renderPreview);
+      element.addEventListener('load', () => { if (element === currentMedia) renderPreview(); });
     }
     element.addEventListener('error', () => {
       if (element !== currentMedia) return;
-      cancelGesture(false);
-      mediaFailed = true;
-      previewErrorKey = media.kind === 'video' ? '此视频无法预览，请尝试 WebM 格式。' : '无法读取预览，请重新选择图片。';
-      byId('preview-error').textContent = translate(previewErrorKey);
-      byId('preview-error').hidden = false;
-      renderPreview();
+      failPreview(element, media.type === 'hls' ? '直播无法预览，请检查播放地址、跨域权限或视频编码。' : media.kind === 'video' ? '此视频无法预览，请尝试 WebM 格式。' : '无法读取预览，请重新选择图片。');
     });
-    element.src = media.uri;
     byId('preview-media').append(element);
+    if (media.type === 'hls') attachHls(element, media.uri);
+    else element.src = media.uri;
+  }
+
+  function disposeHls() {
+    const player = hlsPlayer;
+    hlsPlayer = null;
+    if (player) player.destroy();
+    if (nativeHls && currentMedia?.tagName === 'VIDEO') {
+      nativeHls = false; currentMedia.pause(); currentMedia.removeAttribute('src'); currentMedia.load();
+    }
+  }
+
+  function failPreview(element, key) {
+    if (element !== currentMedia) return;
+    cancelGesture(false); mediaFailed = true; previewLoading = false;
+    disposeHls();
+    previewErrorKey = key;
+    byId('preview-error').textContent = translate(key);
+    byId('preview-error').hidden = false;
+    renderPreview();
+  }
+
+  function validatedUrl(value) {
+    if (sourceApi) return sourceApi.mediaURL(value);
+    const url = new URL(value.trim());
+    if (url.protocol !== 'https:' || url.username || url.password || value.length > 8192) throw new Error('Invalid URL');
+    url.hash = '';
+    return url;
+  }
+
+  function attachHls(element, address) {
+    const streamingUrl = value => {
+      const normalized = sourceApi?.normalizeRemoteSource({ type: 'hls', kind: 'video', url: value });
+      if (!normalized) throw new Error('Stream validation is unavailable');
+      return normalized.url;
+    };
+    let url;
+    try { url = streamingUrl(address); }
+    catch { failPreview(element, '请输入有效的HTTPS链接，不支持包含账号密码的地址。'); return; }
+    element.crossOrigin = 'anonymous';
+    const Hls = window.Hls;
+    if (Hls?.isSupported()) {
+      try {
+        const player = new Hls({
+          enableWorker: false, debug: false, enableInterstitialPlayback: false,
+          maxBufferLength: 20, maxMaxBufferLength: 60, backBufferLength: 10,
+          xhrSetup(xhr, address) { streamingUrl(address); xhr.withCredentials = false; },
+          fetchSetup(context, init) { return new Request(streamingUrl(context.url), { ...init, credentials: 'omit' }); },
+        });
+        hlsPlayer = player;
+        player.on(Hls.Events.MEDIA_ATTACHED, () => { if (hlsPlayer === player && element === currentMedia) player.loadSource(url); });
+        player.on(Hls.Events.MANIFEST_PARSED, () => { if (hlsPlayer === player && element === currentMedia) syncPlayback(); });
+        player.on(Hls.Events.ERROR, (_event, data) => {
+          if (hlsPlayer === player && element === currentMedia && data?.fatal) failPreview(element, '直播无法预览，请检查播放地址、跨域权限或视频编码。');
+        });
+        player.attachMedia(element);
+      } catch { failPreview(element, '直播无法预览，请检查播放地址、跨域权限或视频编码。'); }
+    } else if (element.canPlayType('application/vnd.apple.mpegurl')) {
+      nativeHls = true; element.src = url;
+    } else failPreview(element, '此浏览器不支持HLS预览。');
+  }
+
+  function linkInfo() {
+    const value = byId('source-url').value.trim();
+    if (!value) return null;
+    try {
+      if (sourceApi) return sourceApi.classifyLink(value, byId('source-kind').value);
+      const url = validatedUrl(value);
+      const platform = ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be', 'www.youtube-nocookie.com', 'twitch.tv', 'www.twitch.tv', 'm.twitch.tv', 'player.twitch.tv', 'clips.twitch.tv'].includes(url.hostname);
+      return { type: platform ? 'platform' : byId('source-kind').value, url: url.href };
+    } catch { return null; }
+  }
+
+  function renderLinkControls() {
+    const info = linkInfo();
+    const platform = info?.type === 'platform';
+    byId('source-kind').disabled = Boolean(state.busy || platform);
+    byId('choose-url').disabled = Boolean(state.busy || !byId('source-url').value.trim());
+    byId('choose-url').textContent = translate(loadingUrl ? '正在载入…' : platform ? '打开网页' : '载入链接');
+    byId('source-hint').textContent = translate(platform ? '此链接将在官方浏览器页面打开，不会用作背景。' : info?.type === 'hls' || byId('source-kind').value === 'hls' ? 'HLS直播需要允许跨域访问的HTTPS播放地址。' : '支持图片、视频直链与HLS直播；YouTube和Twitch在官方网页打开。');
+    byId('source-error').textContent = sourceErrorKey ? translate(sourceErrorKey) : '';
+    byId('source-error').hidden = !sourceErrorKey;
+  }
+
+  function chooseUrl() {
+    if (state.busy) return;
+    const url = byId('source-url').value.trim();
+    try { validatedUrl(url); }
+    catch { sourceErrorKey = '请输入有效的HTTPS链接，不支持包含账号密码的地址。'; renderLinkControls(); return; }
+    const info = linkInfo();
+    if (!info) { sourceErrorKey = '此链接格式不受支持，请检查地址或选择正确类型。'; renderLinkControls(); return; }
+    sourceErrorKey = null; loadingUrl = true; submittedUrl = info.url;
+    sendAction({ type: 'chooseUrl', url, kind: byId('source-kind').value, config: clone(draft) });
   }
 
   function renderActions() {
@@ -401,6 +506,10 @@
     for (const input of document.querySelectorAll('input, select:not(#language), [data-preset], #reset, #choose-image, #choose-video')) input.disabled = busy;
     byId('apply').disabled = busy || liveApplying || (!state.media && !state.needsReload);
     byId('restore').disabled = busy || (!state.enabled && !state.needsReload);
+    byId('toggle-playback').disabled = busy || state.media?.kind !== 'video';
+    byId('toggle-playback').textContent = translate(draft.paused ? '继续播放' : '暂停播放');
+    byId('toggle-playback').setAttribute('aria-label', translate(draft.paused ? '继续播放' : '暂停播放'));
+    byId('toggle-playback').setAttribute('aria-pressed', String(draft.paused));
     const update = state.update;
     byId('update-section').hidden = !update;
     if (update) {
@@ -435,6 +544,7 @@
       byId(key).hidden = !message;
     }
     renderRegionAvailability();
+    renderLinkControls();
   }
 
   function changed() {
@@ -745,6 +855,11 @@
   for (const element of [document.documentElement, document.body]) themeObserver.observe(element, { attributes: true, attributeFilter: ['class', 'style'] });
   byId('choose-image').addEventListener('click', () => sendAction({ type: 'chooseMedia', kind: 'image', config: clone(draft) }));
   byId('choose-video').addEventListener('click', () => sendAction({ type: 'chooseMedia', kind: 'video', config: clone(draft) }));
+  byId('choose-url').addEventListener('click', chooseUrl);
+  byId('source-url').addEventListener('input', () => { sourceErrorKey = null; renderLinkControls(); });
+  byId('source-kind').addEventListener('change', () => { sourceErrorKey = null; renderLinkControls(); });
+  byId('source-url').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); chooseUrl(); } });
+  byId('toggle-playback').addEventListener('click', () => { if (!state.busy && state.media?.kind === 'video') { draft.paused = !draft.paused; changed(); } });
   byId('apply').addEventListener('click', () => {
     if (state.needsReload && (!dirty || !state.media)) sendAction({ type: 'reload' });
     else sendAction({ type: 'apply', config: clone(draft), reloadAfterApply: true });
@@ -785,6 +900,12 @@
     // is no unsaved local draft, while preserving deliberate local edits.
     if (shouldReplaceDraft) draft = { ...applied };
     if (acknowledged) liveRequest = null;
+    if (loadingUrl && !message.busy) {
+      // An explicit retry of a failed stream creates one fresh player. Other
+      // host echoes, including opening a platform page, retain the old media.
+      if (!message.error && mediaFailed && message.media?.type === 'hls' && message.media.uri === submittedUrl) mediaIdentity = '';
+      loadingUrl = false;
+    }
     state = {
       config: applied, enabled: Boolean(message.enabled), media: message.media || null,
       busy: Boolean(message.busy), error: message.error, notice: message.notice,
@@ -801,7 +922,12 @@
   document.addEventListener('visibilitychange', () => { if (document.hidden) cancelGesture(); syncPlayback(); });
   window.addEventListener('focus', syncPlayback);
   window.addEventListener('blur', () => { cancelGesture(); syncPlayback(); });
-  window.addEventListener('pagehide', () => { if (debounceTimer) clearTimeout(debounceTimer); if (currentMedia?.tagName === 'VIDEO') currentMedia.pause(); });
+  window.addEventListener('pagehide', () => {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    if (currentMedia?.tagName === 'VIDEO') currentMedia.pause();
+    disposeHls();
+    if (compositor) { compositor.dispose(); compositor = null; }
+  });
   renderLanguage();
   vscode.postMessage({ type: 'ready' });
 })();

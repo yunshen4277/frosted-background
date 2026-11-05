@@ -30,6 +30,8 @@
     position: typeof settings.position === 'string' && settings.position.length < 80 ? settings.position : 'center center',
     pauseWhenUnfocused: settings.pauseWhenUnfocused !== false,
     respectReducedMotion: settings.respectReducedMotion !== false,
+    paused: settings.paused === true,
+    sourceType: settings.sourceType === 'hls' ? 'hls' : undefined,
     regions: regionTools?.normalizeRegions(settings.regions) || { enabled: false, items: [] },
   });
   const origin = new URL(document.baseURI);
@@ -42,22 +44,28 @@
     if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new Error('Invalid settings.');
     if (settings.enabled === false) return { enabled: false };
     if (typeof settings.source !== 'string' || !settings.source || (strict && (settings.enabled !== true || !['image', 'video'].includes(settings.kind)))) throw new Error('Missing media source.');
-    const source = new URL(settings.source, origin);
-    if (!sameOrigin(source)) throw new Error('Only local workbench media is supported.');
-    if (strict && (source.search || source.hash || source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1) !== ownedDirectory.pathname ||
+    const streaming = settings.sourceType === 'hls';
+    if (settings.sourceType !== undefined && !streaming) throw new Error('Unsupported background source type.');
+    if (streaming && settings.kind !== 'video') throw new Error('HLS sources must be videos.');
+    const normalizedStream = streaming ? window.FrostedSource?.normalizeRemoteSource({ type: 'hls', kind: 'video', url: settings.source }) : undefined;
+    if (streaming && !normalizedStream) throw new Error('HLS source validation is unavailable.');
+    const source = new URL(streaming ? normalizedStream.url : settings.source, origin);
+    if (!streaming && !sameOrigin(source)) throw new Error('Only local workbench media is supported.');
+    if (!streaming && strict && (source.search || source.hash || source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1) !== ownedDirectory.pathname ||
         !/^media-[a-f0-9]{64}\.(png|jpe?g|gif|webp|bmp|avif|mp4|webm)$/.test(source.pathname.slice(source.pathname.lastIndexOf('/') + 1)) ||
         /\.(mp4|webm)$/.test(source.pathname) !== (settings.kind === 'video'))) throw new Error('Media is not an owned cached asset.');
     let videoPlayer;
     if (settings.kind === 'video' && settings.videoPlayer) {
       videoPlayer = new URL(settings.videoPlayer, origin);
-      const directory = source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1);
-      if (!sameOrigin(videoPlayer) || videoPlayer.search || videoPlayer.hash || source.search || source.hash ||
+      const directory = streaming ? ownedDirectory.pathname : source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1);
+      if (!sameOrigin(videoPlayer) || videoPlayer.search || videoPlayer.hash || (!streaming && (source.search || source.hash)) ||
           !/\/frosted-background-assets\/$/.test(directory) ||
           videoPlayer.pathname.slice(0, videoPlayer.pathname.lastIndexOf('/') + 1) !== directory ||
           !/^video-host-[a-f0-9]{64}\.html$/.test(videoPlayer.pathname.slice(videoPlayer.pathname.lastIndexOf('/') + 1)) ||
-          !/^media-[a-f0-9]{64}\.(mp4|webm)$/.test(source.pathname.slice(source.pathname.lastIndexOf('/') + 1))) throw new Error('Invalid local video player.');
+          (!streaming && !/^media-[a-f0-9]{64}\.(mp4|webm)$/.test(source.pathname.slice(source.pathname.lastIndexOf('/') + 1)))) throw new Error('Invalid local video player.');
     }
-    if (strict && settings.kind === 'video' && !videoPlayer) throw new Error('Missing local video player.');
+    if ((strict || streaming) && settings.kind === 'video' && !videoPlayer) throw new Error('Missing local video player.');
+    if (settings.paused !== undefined && typeof settings.paused !== 'boolean') throw new Error('Invalid manual playback setting.');
     if (strict) {
       if (settings.liveState !== undefined && new URL(settings.liveState, origin).href !== ownedState.href) throw new Error('Live state location cannot change.');
       for (const key of ['blur', 'opacity', 'tintOpacity', 'saturation', 'brightness', 'playbackRate']) {
@@ -225,7 +233,7 @@
     const targetOrigin = playerOrigin || '*';
     const postPlayer = data => media.contentWindow?.postMessage({ type: 'frosted-background-player', channel, ...data }, targetOrigin);
 
-    const shouldPlay = () => !stopped && !failed && !document.hidden && inViewport &&
+    const shouldPlay = () => !stopped && !failed && !config.paused && !document.hidden && inViewport &&
       host.isConnected && host.clientWidth > 0 && host.clientHeight > 0 &&
       (!config.pauseWhenUnfocused || document.hasFocus()) &&
       (!config.respectReducedMotion || !reducedMotion.matches);
@@ -411,6 +419,7 @@
     intersection.observe(host);
 
     const state = {
+      get failed() { return failed; },
       updatePlayback,
       updateSettings(next) {
         config = next;
@@ -485,10 +494,17 @@
 
   function applySettings(next) {
     const sameMedia = active.enabled && next.enabled && active.source.href === next.source.href &&
-      active.videoPlayer?.href === next.videoPlayer?.href && active.config.kind === next.config.kind;
+      active.videoPlayer?.href === next.videoPlayer?.href && active.config.kind === next.config.kind && active.config.sourceType === next.config.sourceType;
     active = next;
     if (sameMedia) {
-      for (const state of hosts.values()) state.updateSettings(next.config);
+      for (const [host, state] of hosts) {
+        // This path runs only for a new valid publication, never for repeated
+        // polls. Explicit Apply can retry a failed stream without replacing a
+        // healthy decoder or resetting its playback position.
+        if (state.failed) { state.dispose(); hosts.delete(host); }
+        else state.updateSettings(next.config);
+      }
+      reconcile();
     } else {
       for (const state of hosts.values()) state.dispose();
       hosts.clear();
