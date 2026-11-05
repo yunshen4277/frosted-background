@@ -905,8 +905,22 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     await page.locator('#pauseWhenUnfocused').focus();
     await page.keyboard.press('Space');
     assert.equal(await page.locator('#pauseWhenUnfocused').isChecked(), false);
-    await page.locator('video').evaluate(async video => { video.loop = false; video.currentTime = video.duration / 4; await video.play(); });
-    await page.waitForFunction(() => document.querySelector('video').currentTime > document.querySelector('video').duration / 3);
+    assert.equal(await page.locator('video').evaluate(video => video.paused), true, 'a failed preview remains paused even when focus and reduced-motion rules allow playback');
+    // The preceding error is intentional and remains latched for that source.
+    // Select a healthy source before exercising playing-language changes;
+    // calling play() directly on the failed element races its valid pause guard.
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await sendState({ media: { name: '播放语言测试.webm', kind: 'video', uri: pathToFileURL(path.resolve(__dirname, 'fixtures/edges.webm')).href }, resetDraft: false });
+    await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2 && document.querySelector('video').paused);
+    assert.equal(await page.locator('#preview-error').isVisible(), false, 'a newly selected valid source clears the failed-preview state');
+    assert.equal(await page.locator('video').evaluate(video => video === window.__previewNode), false);
+    await page.locator('video').evaluate(video => { window.__previewNode = video; video.loop = false; video.currentTime = video.duration / 4; });
+    await page.waitForFunction(() => !document.querySelector('video').seeking);
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    await page.waitForFunction(() => {
+      const video = document.querySelector('video');
+      return !video.paused && !video.ended && video.currentTime > video.duration / 3;
+    });
     const playingTime = await page.locator('video').evaluate(video => video.currentTime);
     await page.locator('#language').selectOption('es');
     assert.equal(await page.locator('video').evaluate(video => video === window.__previewNode), true, 'a playing video keeps its node');
