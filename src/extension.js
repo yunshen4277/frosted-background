@@ -7,6 +7,8 @@ const patcher = require('./patcher');
 const { BackgroundPanel } = require('./panel');
 const { UpdateController } = require('./updater');
 const { normalizeLanguage, t, localizedError, describeError: translateError } = require('./localization');
+const { resolveMediaLink } = require('./remote-media');
+const { classifyLink, normalizeRemoteSource, displayName } = require('../media/source');
 
 function activate(context) {
   const readLanguage = () => normalizeLanguage(context.globalState.get('language'));
@@ -16,12 +18,14 @@ function activate(context) {
   let busy = false;
   let changeTimer;
   let disposed = false;
+  const mediaDownloads = new Set();
   let savingConfig = false;
   let liveConfigBusy = false;
   let runtimeReady = false;
   let panel;
   let updater;
-  const extensionVersion = context.extension?.packageJSON?.version || '0.9.0';
+  const extensionVersion = context.extension?.packageJSON?.version || '0.10.0';
+  const readSelection = () => context.globalState.get('mediaSource') || context.globalState.get('mediaPath');
   const windowSession = typeof vscode.env.sessionId === 'string' && vscode.env.sessionId !== 'someValue.sessionId' ? vscode.env.sessionId : '';
   const bootstrapKey = windowSession ? 'bootstrapRequired:' + windowSession : undefined;
   const markBootstrapRequired = async () => {
@@ -122,20 +126,24 @@ function activate(context) {
   }
 
   async function applyMedia(mediaPath, configOverride, fromPanel = false) {
+    if (disposed) return { cancelled: true };
+    const remote = typeof mediaPath === 'object' ? normalizeRemoteSource(mediaPath) : undefined;
     if (!(await confirmFirstUse())) return { cancelled: true };
     await initialStatus.catch(() => {});
     await markBootstrapRequired();
+    if (disposed) return { cancelled: true };
     const config = configOverride ? normalizeConfig(configOverride) : readConfig();
     let settingsError;
     await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: text('正在应用毛玻璃背景…'), cancellable: false }, async () => {
       const result = await patcher.apply({
         appRoot: vscode.env.appRoot,
         rendererPath: context.asAbsolutePath('media/renderer.js'),
-        mediaPath,
+        ...(remote ? { mediaSource: remote } : { mediaPath }),
         config
       });
       // Retain the source path only on this machine. It is never written to workspace settings.
-      await context.globalState.update('mediaPath', mediaPath);
+      await context.globalState.update('mediaPath', remote ? undefined : mediaPath);
+      await context.globalState.update('mediaSource', remote);
       await context.globalState.update('enabled', true);
       await context.globalState.update('lastVersion', vscode.version);
       await context.globalState.update('lastAppliedExtensionVersion', extensionVersion);
@@ -194,6 +202,29 @@ function activate(context) {
     if (mediaPath) return applyMedia(mediaPath);
   }
 
+  async function chooseMediaLink(url, kind) {
+    const source = classifyLink(url, kind);
+    if (source.type === 'platform') {
+      const opened = await vscode.env.openExternal(vscode.Uri.parse(source.url));
+      if (!opened) throw localizedError('无法打开官方播放页，请检查默认浏览器。');
+      return { openedExternal: true };
+    }
+    const abort = new AbortController();
+    mediaDownloads.add(abort);
+    try { return await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: text('正在加载外部媒体…'), cancellable: true }, async (progress, token) => {
+      const cancellation = token?.onCancellationRequested(() => abort.abort());
+      if (token?.isCancellationRequested) abort.abort();
+      try {
+        const selected = await resolveMediaLink(url, kind, {
+          directory: path.join(context.globalStorageUri.fsPath, 'external-media'), signal: abort.signal,
+          onProgress: bytes => progress?.report({ message: text('已下载 {size} MB', { size: Math.round(bytes / 1024 / 1024) }) })
+        });
+        if (disposed || abort.signal.aborted) throw localizedError('已取消链接加载或加载超时。');
+        return selected;
+      } finally { cancellation?.dispose(); }
+    }); } finally { mediaDownloads.delete(abort); }
+  }
+
   async function restoreBackground(fromPanel = false) {
     const result = await patcher.restore({ appRoot: vscode.env.appRoot });
     await context.globalState.update('enabled', false);
@@ -220,6 +251,7 @@ function activate(context) {
     needsBootstrap: () => context.globalState.get('enabled', false) && !runtimeReady,
     liveConfig: applyLiveConfig,
     chooseMedia: kind => runExclusive(() => chooseMediaFile(kind)),
+    chooseUrl: (url, kind) => runExclusive(() => chooseMediaLink(url, kind)),
     apply: (mediaPath, config) => runExclusive(() => applyMedia(mediaPath, config, true)),
     restore: () => runExclusive(() => restoreBackground(true)),
     reload: () => vscode.commands.executeCommand('workbench.action.reloadWindow'),
@@ -260,7 +292,7 @@ function activate(context) {
   command('selectVideo', () => chooseMedia('video'));
   command('openSettings', openPanel);
   command('apply', async () => {
-    const mediaPath = context.globalState.get('mediaPath');
+    const mediaPath = readSelection();
     if (!mediaPath) {
       const kind = await vscode.window.showQuickPick([
         { label: '$(file-media) ' + text('选择图片'), kind: 'image' },
@@ -274,11 +306,11 @@ function activate(context) {
   command('restore', () => restoreBackground());
   command('status', async () => {
     const state = await patcher.status({ appRoot: vscode.env.appRoot });
-    const mediaPath = context.globalState.get('mediaPath');
+    const mediaPath = readSelection();
     await vscode.window.showInformationMessage(
       text('毛玻璃背景：{status}{media}。当前 VS Code {version}。', {
         status: text(state.installed ? '已应用' : '未应用'),
-        media: mediaPath ? text('；上次选择：{name}', { name: path.basename(mediaPath) }) : '', version: vscode.version
+        media: mediaPath ? text('；上次选择：{name}', { name: typeof mediaPath === 'string' ? path.basename(mediaPath) : displayName(mediaPath.url) }) : '', version: vscode.version
       })
     );
   });
@@ -306,7 +338,7 @@ function activate(context) {
     };
     changeTimer = setTimeout(applyChangedConfig, 300);
   }));
-  context.subscriptions.push({ dispose: () => { disposed = true; clearTimeout(changeTimer); } });
+  context.subscriptions.push({ dispose: () => { disposed = true; clearTimeout(changeTimer); for (const download of mediaDownloads) download.abort(); mediaDownloads.clear(); } });
 
   // An extension update can refresh an already-enabled, consented background.
   // A missing patch (such as after VS Code itself updates) always needs manual apply.

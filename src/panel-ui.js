@@ -6,7 +6,7 @@ function escapeAttribute(value) {
   return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 }
 
-function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, nonce, language = 'en' }) {
+function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, sourceUri, hlsUri, nonce, language = 'en' }) {
   language = normalizeLanguage(language);
   const text = key => escapeAttribute(t(language, key));
   const label = key => `<span data-i18n="${escapeAttribute(key)}">${text(key)}</span>`;
@@ -17,7 +17,7 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, 
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${asset} data:; media-src ${asset}; style-src ${asset}; script-src 'nonce-${token}';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${asset} data:; media-src ${asset} https: blob:; connect-src https:; style-src ${asset}; script-src 'nonce-${token}';">
   <link href="${escapeAttribute(styleUri)}" rel="stylesheet">
   <title data-i18n="毛玻璃背景">${text("毛玻璃背景")}</title>
 </head>
@@ -46,6 +46,7 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, 
         </div>
         <span class="preview-empty" id="preview-empty">${label("选择一张图片，或一段风景")}</span>
         <span class="preview-error" id="preview-error" hidden></span>
+        <span class="preview-loading" id="preview-loading" role="status" hidden></span>
       </div>
       <div class="region-drawing-tools" id="region-drawing-tools" hidden>
         <div class="region-tool-buttons" role="group" data-i18n-aria-label="绘制工具" aria-label="${text("绘制工具")}"><button type="button" data-region-tool="select" aria-pressed="true">${label("选择")}</button><button type="button" data-region-tool="rect" aria-pressed="false">${label("矩形")}</button><button type="button" data-region-tool="lasso" aria-pressed="false">${label("套索")}</button><button type="button" data-region-tool="polygon" aria-pressed="false">${label("多边形")}</button></div>
@@ -55,10 +56,18 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, 
         <p class="region-drawing-error" id="region-drawing-error" role="alert" hidden></p>
       </div>
       <div class="media-caption"><span class="media-kind" id="media-kind">${label("未选择背景")}</span><span class="media-name" id="media-name">${label("从本机选择文件")}</span></div>
+      <div class="media-origin" id="media-origin" hidden></div>
       <div class="media-actions">
         <button type="button" class="secondary-button" id="choose-image"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><rect x="2.5" y="3.5" width="15" height="13" rx="2"/><circle cx="7" cy="7.5" r="1.3"/><path d="m3 14 4-4 3.5 3 2.5-2.5 4 4"/></svg>${label("选择图片")}</button>
         <button type="button" class="secondary-button" id="choose-video"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><rect x="2.5" y="3.5" width="15" height="13" rx="2"/><path d="m8 7 5 3-5 3Z"/></svg>${label("选择视频")}</button>
       </div>
+      <details class="source-link-card" id="source-link-card">
+        <summary>${label("外部链接")}</summary>
+        <label for="source-url" class="sr-only">${label("媒体链接")}</label><input id="source-url" type="url" placeholder="https://…" inputmode="url" autocomplete="off" spellcheck="false" maxlength="8192" aria-describedby="source-hint source-error">
+        <div class="source-link-actions"><label for="source-kind" class="sr-only">${label("链接类型")}</label><select id="source-kind"><option value="auto" data-i18n="自动识别">${text("自动识别")}</option><option value="image" data-i18n="图片">${text("图片")}</option><option value="video" data-i18n="视频">${text("视频")}</option><option value="hls" data-i18n="HLS直播">${text("HLS直播")}</option></select><button type="button" class="secondary-button" id="choose-url" disabled>${label("载入链接")}</button></div>
+        <p class="source-hint" id="source-hint">${label("支持图片、视频直链与HLS直播；YouTube和Twitch在官方网页打开。")}</p>
+        <p class="source-error" id="source-error" role="alert" hidden></p>
+      </details>
     </section>
 
     <details class="regions-section" id="regions-section">
@@ -99,7 +108,8 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, 
     </section>
 
     <section class="video-section" id="video-section" aria-labelledby="video-heading" hidden>
-      <div class="section-heading"><h2 id="video-heading">${label("视频播放")}</h2><span class="subtle-label">${label("静音 · 循环")}</span></div>
+      <div class="section-heading"><h2 id="video-heading">${label("视频播放")}</h2><span class="subtle-label" id="video-behavior">${label("静音 · 循环")}</span></div>
+      <button type="button" class="secondary-button playback-button" id="toggle-playback" aria-pressed="false">${label("暂停播放")}</button>
       <div class="range-control"><div class="control-label"><label for="playbackRate">${label("播放速度")}</label><output for="playbackRate" id="playbackRate-value">1×</output></div><input type="range" id="playbackRate" min="0.25" max="2" step="0.25" value="1"></div>
       <label class="switch-control" for="pauseWhenUnfocused"><span>${label("切换窗口时暂停")}<small>${label("减少后台资源占用")}</small></span><input type="checkbox" role="switch" id="pauseWhenUnfocused" checked><span class="switch-track" aria-hidden="true"></span></label>
       <label class="switch-control" for="respectReducedMotion"><span>${label("跟随系统减少动态效果")}</span><input type="checkbox" role="switch" id="respectReducedMotion" checked><span class="switch-track" aria-hidden="true"></span></label>
@@ -121,7 +131,9 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, 
     <div class="footer-secondary"><button type="button" class="text-button" id="restore" disabled>${label("关闭背景并恢复")}</button></div>
   </footer>
   <script nonce="${token}" src="${escapeAttribute(i18nUri)}"></script>
+  ${sourceUri ? `<script nonce="${token}" src="${escapeAttribute(sourceUri)}"></script>` : ''}
   ${regionsUri ? `<script nonce="${token}" src="${escapeAttribute(regionsUri)}"></script>` : ''}
+  ${hlsUri ? `<script nonce="${token}" src="${escapeAttribute(hlsUri)}"></script>` : ''}
   <script nonce="${token}" src="${escapeAttribute(scriptUri)}"></script>
 </body>
 </html>`;

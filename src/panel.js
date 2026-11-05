@@ -5,6 +5,10 @@ const crypto = require('node:crypto');
 const { DEFAULTS, normalizeConfig } = require('./config');
 const { renderPanelHtml } = require('./panel-ui');
 const { normalizeLanguage, t, describeError } = require('./localization');
+const { normalizeRemoteSource, displayName } = require('../media/source');
+
+const readSelection = context => context.globalState.get('mediaSource') || context.globalState.get('mediaPath');
+const sameSelection = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 
 // A webview can change values, but only the native file picker chooses paths.
 class BackgroundPanel {
@@ -12,7 +16,7 @@ class BackgroundPanel {
     this.vscode = vscode;
     this.context = context;
     this.callbacks = callbacks;
-    this.mediaPath = context.globalState.get('mediaPath');
+    this.mediaPath = readSelection(context);
     this.pending = false;
     this.error = null;
     this.notice = null;
@@ -43,6 +47,8 @@ class BackgroundPanel {
       styleUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/panel.css'))).toString(),
       i18nUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/i18n.js'))).toString(),
       regionsUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/regions.js'))).toString(),
+      hlsUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/vendor/hls.min.js'))).toString(),
+      sourceUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/source.js'))).toString(),
       language: this.language,
       nonce: crypto.randomBytes(24).toString('base64')
     });
@@ -61,13 +67,18 @@ class BackgroundPanel {
   }
 
   refresh({ resetDraft = false, syncMedia = false } = {}) {
-    if (syncMedia) { this.mediaPath = this.context.globalState.get('mediaPath'); this.mediaApplyFailed = false; }
+    if (syncMedia) { this.mediaPath = readSelection(this.context); this.mediaApplyFailed = false; }
     if (!this.view || this.disposed) return;
     const webview = this.view.webview;
     this.view.title = t(this.language, '背景控制面板');
     const roots = [this.vscode.Uri.file(this.context.asAbsolutePath('media'))];
     let media = null;
-    if (this.mediaPath) {
+    if (this.mediaPath && typeof this.mediaPath === 'object') {
+      try {
+        const source = normalizeRemoteSource(this.mediaPath);
+        media = { name: displayName(source.url), kind: 'video', type: 'hls', uri: source.url, sourceUrl: new URL(source.url).origin };
+      } catch { this.error = new Error('请输入有效的 HTTPS 媒体链接，不支持本机地址或包含账号密码的链接。'); }
+    } else if (this.mediaPath) {
       roots.push(this.vscode.Uri.file(path.dirname(this.mediaPath)));
       media = {
         name: path.basename(this.mediaPath),
@@ -96,7 +107,7 @@ class BackgroundPanel {
   }
 
   canApplyLive() {
-    return !this.mediaApplyFailed && Boolean(this.mediaPath && this.callbacks.isLiveEnabled?.()) && this.mediaPath === this.context.globalState.get('mediaPath');
+    return !this.mediaApplyFailed && Boolean(this.mediaPath && this.callbacks.isLiveEnabled?.()) && sameSelection(this.mediaPath, readSelection(this.context));
   }
 
   async setLanguage(language) {
@@ -142,7 +153,7 @@ class BackgroundPanel {
 
   async receive(message) {
     if (this.disposed || !message || typeof message !== 'object' || Array.isArray(message)) return;
-    if (!['ready', 'closePanel', 'setLanguage', 'liveConfig', 'chooseMedia', 'apply', 'restore', 'reload', 'checkUpdates', 'setUpdateMode'].includes(message.type)) return;
+    if (!['ready', 'closePanel', 'setLanguage', 'liveConfig', 'chooseMedia', 'chooseUrl', 'apply', 'restore', 'reload', 'checkUpdates', 'setUpdateMode'].includes(message.type)) return;
     if (message.type === 'ready') return this.refresh();
     // Hiding the controls must remain available while an unrelated operation is
     // pending, without changing media, enabled state, or the unsaved draft.
@@ -151,6 +162,7 @@ class BackgroundPanel {
     if (message.type === 'liveConfig') return this.receiveLiveConfig(message);
     if (this.pending || this.callbacks.isBusy()) return;
     if (message.type === 'chooseMedia' && !['image', 'video'].includes(message.kind)) return;
+    if (message.type === 'chooseUrl' && (typeof message.url !== 'string' || message.url.length > 8192 || !['auto', 'image', 'video', 'hls'].includes(message.kind))) return;
     if (message.type === 'apply' && (!message.config || typeof message.config !== 'object' || Array.isArray(message.config))) return;
     if (message.type === 'setUpdateMode' && !['automatic', 'notify', 'off'].includes(message.mode)) return;
     this.pending = true;
@@ -164,9 +176,12 @@ class BackgroundPanel {
       await this.liveWork;
       this.error = null;
       this.notice = null;
-      if (message.type === 'chooseMedia') {
-        const selected = await this.callbacks.chooseMedia(message.kind);
-        if (selected) {
+      if (message.type === 'chooseMedia' || message.type === 'chooseUrl') {
+        const selected = message.type === 'chooseUrl' ? await this.callbacks.chooseUrl(message.url, message.kind) : await this.callbacks.chooseMedia(message.kind);
+        if (this.disposed) return;
+        if (selected?.openedExternal) {
+          this.notice = { key: '已在浏览器打开官方播放页，当前背景保持不变。' };
+        } else if (selected) {
           this.mediaPath = selected;
           this.mediaApplyFailed = true;
           const config = message.config && typeof message.config === 'object' && !Array.isArray(message.config)

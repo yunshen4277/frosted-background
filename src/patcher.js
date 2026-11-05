@@ -7,6 +7,7 @@ const crypto = require('node:crypto');
 const { Readable, Transform } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { normalizeConfig } = require('./config');
+const { normalizeRemoteSource } = require('../media/source');
 
 const ASSET_DIRECTORY = 'frosted-background-assets';
 const OWNER_FILE = '.owner.json';
@@ -14,8 +15,10 @@ const OWNER = 'frosted-background/v1';
 const START_MARKER = '<!-- FROSTED-BACKGROUND:START v1 -->';
 const END_MARKER = '<!-- FROSTED-BACKGROUND:END v1 -->';
 const MAX_MEDIA_BYTES = 500 * 1024 * 1024;
-const MAX_RUNTIME_BYTES = 2 * 1024 * 1024;
+const MAX_RUNTIME_BYTES = 3 * 1024 * 1024;
 const MAX_REGIONS_BYTES = 512 * 1024;
+const MAX_SOURCE_BYTES = 256 * 1024;
+const MAX_HLS_BYTES = 2 * 1024 * 1024;
 const SCRIPT_SEPARATOR = Buffer.from('\n;\n');
 const LIVE_STATE_FILE = 'live-state.json';
 const LIVE_STATE_SOURCE = `./${ASSET_DIRECTORY}/${LIVE_STATE_FILE}`;
@@ -137,12 +140,17 @@ async function atomicReplace(filename, content, expected) {
 
 function validatePayload(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload) || payload.enabled !== true || typeof payload.source !== 'string') throw new Error('背景缓存配置无效。');
-  const source = /^\.\/frosted-background-assets\/(media-([a-f0-9]{64})\.(png|jpe?g|gif|webp|bmp|avif|mp4|webm))$/.exec(payload.source);
+  const remote = payload.sourceType === 'hls';
+  if (payload.sourceType !== undefined && !remote) throw new Error('背景缓存配置无效。');
+  const source = remote ? normalizeRemoteSource({ type: 'hls', kind: payload.kind, url: payload.source })
+    : /^\.\/frosted-background-assets\/(media-([a-f0-9]{64})\.(png|jpe?g|gif|webp|bmp|avif|mp4|webm))$/.exec(payload.source);
   if (!source) throw new Error('缓存背景地址不属于本插件的本地资源。');
-  const expectedKind = ['mp4', 'webm'].includes(source[3]) ? 'video' : 'image';
+  if (remote && source.url !== payload.source) throw new Error('背景缓存配置无效。');
+  const expectedKind = remote || ['mp4', 'webm'].includes(source[3]) ? 'video' : 'image';
   if (payload.kind !== expectedKind) throw new Error('缓存背景类型不匹配。');
   if (payload.liveState !== undefined && payload.liveState !== LIVE_STATE_SOURCE) throw new Error('实时背景配置地址无效，已停止操作。');
   if (payload.videoPlayer !== undefined && (expectedKind !== 'video' || !/^\.\/frosted-background-assets\/video-host-[a-f0-9]{64}\.html$/.test(payload.videoPlayer))) throw new Error('视频播放器缓存地址无效，已停止操作。');
+  if (remote && !payload.videoPlayer) throw new Error('视频播放器缓存地址无效，已停止操作。');
   return source;
 }
 
@@ -205,6 +213,14 @@ async function cleanFailedAssets(created, workbenchPath, directory) {
     const html = await fsp.readFile(workbenchPath, 'utf8');
     const live = await readLiveState(directory);
     references = html + (live.content || '');
+    // A workbench/live document refers to the video page, which in turn refers
+    // to its bundled player. Keep that indirect dependency if rollback fails.
+    const pages = new Set(Array.from(references.matchAll(/video-host-[a-f0-9]{64}\.html/g), match => match[0]));
+    for (const name of pages) {
+      const filename = path.join(directory, name);
+      const page = await readRuntimeSource(filename, 64 * 1024, '视频播放器缓存地址无效，已停止操作。');
+      references += page.toString('utf8');
+    }
   } catch { return; }
   for (const filename of created) {
     if (!references.includes(path.basename(filename))) await fsp.unlink(filename).catch(() => {});
@@ -277,25 +293,32 @@ async function readRuntimeSource(filename, limit, invalidMessage) {
   } finally { await handle.close(); }
 }
 
-async function applyChecked({ appRoot, rendererPath, mediaPath, config = {} }, cachedExpectation) {
+async function applyChecked({ appRoot, rendererPath, mediaPath, mediaSource, config = {} }, cachedExpectation) {
   try {
+    if (mediaSource !== undefined && mediaPath !== undefined) throw new Error('请选择一个背景来源。');
+    const remote = mediaSource === undefined ? undefined : normalizeRemoteSource(mediaSource);
     const extension = path.extname(mediaPath || '').toLowerCase();
-    const kind = IMAGE_EXTENSIONS.has(extension) ? 'image' : VIDEO_EXTENSIONS.has(extension) ? 'video' : undefined;
+    const kind = remote ? 'video' : IMAGE_EXTENSIONS.has(extension) ? 'image' : VIDEO_EXTENSIONS.has(extension) ? 'video' : undefined;
     if (!kind) throw new Error('请选择 PNG、JPG、JPEG、GIF、WebP、BMP、AVIF 图片，或 MP4、WebM 视频。');
-    const mediaInfo = await fsp.stat(mediaPath);
-    if (!mediaInfo.isFile() || !mediaInfo.size) throw new Error('请选择有效且非空的本地媒体文件。');
-    if (mediaInfo.size > MAX_MEDIA_BYTES) throw new Error('背景文件过大，请选择不超过 500 MB 的文件。');
+    if (!remote) {
+      const mediaInfo = await fsp.stat(mediaPath);
+      if (!mediaInfo.isFile() || !mediaInfo.size) throw new Error('请选择有效且非空的本地媒体文件。');
+      if (mediaInfo.size > MAX_MEDIA_BYTES) throw new Error('背景文件过大，请选择不超过 500 MB 的文件。');
+    }
     const regionsPath = path.join(path.dirname(rendererPath), 'regions.js');
     const regionsBytes = await readRuntimeSource(regionsPath, MAX_REGIONS_BYTES, '区域效果文件无效或缺失，请重新安装插件。');
-    const availableRuntimeBytes = MAX_RUNTIME_BYTES - regionsBytes.length - SCRIPT_SEPARATOR.length;
+    const sourceBytes = await readRuntimeSource(path.join(path.dirname(rendererPath), 'source.js'), MAX_SOURCE_BYTES, '媒体来源文件无效或缺失，请重新安装插件。');
+    const sharedBundle = Buffer.concat([regionsBytes, SCRIPT_SEPARATOR, sourceBytes, SCRIPT_SEPARATOR]);
+    const availableRuntimeBytes = MAX_RUNTIME_BYTES - sharedBundle.length;
     const rendererBytes = await readRuntimeSource(rendererPath, availableRuntimeBytes, '插件运行文件无效或过大，请重新安装插件。');
-    const rendererBundle = Buffer.concat([regionsBytes, SCRIPT_SEPARATOR, rendererBytes]);
+    const rendererBundle = Buffer.concat([sharedBundle, rendererBytes]);
     // The video page has its own media policy. The workbench CSP is untouched.
     const videoPlayerPath = path.join(path.dirname(rendererPath), 'video-player.js');
     let playerBundle;
     if (kind === 'video') {
-      const playerBytes = await readRuntimeSource(videoPlayerPath, availableRuntimeBytes, '视频播放器文件缺失，请重新安装插件。');
-      playerBundle = Buffer.concat([regionsBytes, SCRIPT_SEPARATOR, playerBytes]);
+      const hlsBytes = remote ? await readRuntimeSource(path.join(path.dirname(rendererPath), 'vendor', 'hls.min.js'), MAX_HLS_BYTES, 'HLS 播放器文件无效或缺失，请重新安装插件。') : Buffer.alloc(0);
+      const playerBytes = await readRuntimeSource(videoPlayerPath, availableRuntimeBytes - hlsBytes.length - (remote ? SCRIPT_SEPARATOR.length : 0), '视频播放器文件缺失，请重新安装插件。');
+      playerBundle = Buffer.concat(remote ? [sharedBundle, hlsBytes, SCRIPT_SEPARATOR, playerBytes] : [sharedBundle, playerBytes]);
     }
     const workbenchPath = await findWorkbench(appRoot);
     const directory = await ensureAssets(workbenchPath, true);
@@ -316,13 +339,14 @@ async function applyChecked({ appRoot, rendererPath, mediaPath, config = {} }, c
       const created = [];
       try {
         const rendererName = await stageAsset(rendererBundle, directory, 'renderer', '.js', MAX_RUNTIME_BYTES, created);
-        const mediaName = await stageAsset(mediaPath, directory, 'media', extension, MAX_MEDIA_BYTES, created);
-        if (cachedExpectation && mediaName !== cachedExpectation.mediaName) throw new Error('缓存背景在更新期间被修改，已停止应用。');
-        const payload = { ...normalizeConfig(config), enabled: true, source: `./${ASSET_DIRECTORY}/${mediaName}`, kind, liveState: LIVE_STATE_SOURCE };
+        const mediaName = remote ? undefined : await stageAsset(mediaPath, directory, 'media', extension, MAX_MEDIA_BYTES, created);
+        if (cachedExpectation && !remote && mediaName !== cachedExpectation.mediaName) throw new Error('缓存背景在更新期间被修改，已停止应用。');
+        const payload = { ...normalizeConfig(config), enabled: true, source: remote ? remote.url : `./${ASSET_DIRECTORY}/${mediaName}`, kind, liveState: LIVE_STATE_SOURCE };
+        if (remote) payload.sourceType = 'hls';
         delete payload.videoPlayer;
         if (kind === 'video') {
           const playerName = await stageAsset(playerBundle, directory, 'video-player', '.js', MAX_RUNTIME_BYTES, created);
-          const videoPage = Buffer.from(`<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; connect-src 'self'; media-src blob:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent}video{position:absolute;inset:0;width:100%;height:100%;display:block;pointer-events:none}</style><script src="./${playerName}" defer></script></head><body></body></html>\n`);
+          const videoPage = Buffer.from(`<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; connect-src 'self'${remote ? ' https:' : ''}; media-src blob:${remote ? ' https:' : ''}; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent}video{position:absolute;inset:0;width:100%;height:100%;display:block;pointer-events:none}</style><script src="./${playerName}" defer></script></head><body></body></html>\n`);
           const pageName = await stageAsset(videoPage, directory, 'video-host', '.html', 64 * 1024, created);
           payload.videoPlayer = `./${ASSET_DIRECTORY}/${pageName}`;
         }
@@ -350,9 +374,14 @@ function decodeOwnAttribute(value) {
 async function cachedBackground(appRoot) {
   const workbenchPath = await findWorkbench(appRoot);
   const html = await fsp.readFile(workbenchPath, 'utf8');
-  const { payload, source } = parseInjection(html);
+  const parsed = parseInjection(html);
+  const { payload, source } = parsed;
   const directory = await ensureAssets(workbenchPath, false);
   if (!directory) throw new Error('背景缓存目录缺失，请重新选择背景。');
+  if (source.type === 'hls') {
+    await validateCachedFiles(directory, parsed);
+    return { html, mediaSource: source, config: normalizeConfig(payload) };
+  }
   const mediaPath = path.join(directory, source[1]);
   const info = await fsp.lstat(mediaPath);
   if (!info.isFile() || info.isSymbolicLink() || !info.size || info.size > MAX_MEDIA_BYTES) throw new Error('缓存背景不是有效的普通媒体文件。');
@@ -371,7 +400,7 @@ async function cachedBackground(appRoot) {
 // The user's original media path is neither required nor changed by this helper.
 async function reapply({ appRoot, rendererPath, config }) {
   const cached = await cachedBackground(appRoot);
-  return applyChecked({ appRoot, rendererPath, mediaPath: cached.mediaPath, config: config === undefined ? cached.config : normalizeConfig(config) }, cached);
+  return applyChecked({ appRoot, rendererPath, mediaPath: cached.mediaPath, mediaSource: cached.mediaSource, config: config === undefined ? cached.config : normalizeConfig(config) }, cached);
 }
 
 async function validateCachedFiles(directory, parsed) {
@@ -381,7 +410,7 @@ async function validateCachedFiles(directory, parsed) {
     if (!info.isFile() || info.isSymbolicLink() || !info.size || info.size > limit) throw new Error('缓存背景不是有效的普通媒体文件。');
     return filename;
   };
-  await validateFile(parsed.source[1], MAX_MEDIA_BYTES);
+  if (parsed.source.type !== 'hls') await validateFile(parsed.source[1], MAX_MEDIA_BYTES);
   await validateFile(parsed.rendererName, MAX_RUNTIME_BYTES);
   if (parsed.payload.kind === 'video') {
     if (!parsed.payload.videoPlayer) throw new Error('视频播放器缓存地址无效，已停止操作。');
@@ -412,6 +441,7 @@ async function updateConfig({ appRoot, config = {} }) {
         source: parsed.payload.source, kind: parsed.payload.kind, liveState: LIVE_STATE_SOURCE
       };
       if (parsed.payload.videoPlayer) settings.videoPlayer = parsed.payload.videoPlayer;
+      if (parsed.payload.sourceType === 'hls') settings.sourceType = 'hls';
       const next = inject(original, parsed.rendererName, settings);
       await publishState(workbenchPath, original, next, live, settings);
       return { workbenchPath, kind: settings.kind, liveProtocol: 1 };
