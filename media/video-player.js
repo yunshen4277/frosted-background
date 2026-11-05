@@ -68,6 +68,12 @@
   video.addEventListener('canplay', markReady);
   video.addEventListener('error', fail);
 
+  function applySettings(data) {
+    video.style.objectFit = ['cover', 'contain', 'fill'].includes(data.fit) ? data.fit : 'cover';
+    video.style.objectPosition = typeof data.position === 'string' && data.position.length < 80 ? data.position : 'center center';
+    video.playbackRate = typeof data.playbackRate === 'number' && Number.isFinite(data.playbackRate) ? Math.max(0.25, Math.min(2, data.playbackRate)) : 1;
+  }
+
   async function initialize(data) {
     if (initialized || disposed) return;
     initialized = true;
@@ -81,9 +87,7 @@
           !/\/frosted-background-assets\/$/.test(directory) || !/^media-[a-f0-9]{64}\.(mp4|webm)$/.test(basename)) {
         throw new Error('Video source must be an owned cached media asset beside this player.');
       }
-      video.style.objectFit = ['cover', 'contain', 'fill'].includes(data.fit) ? data.fit : 'cover';
-      video.style.objectPosition = typeof data.position === 'string' && data.position.length < 80 ? data.position : 'center center';
-      video.playbackRate = typeof data.playbackRate === 'number' && Number.isFinite(data.playbackRate) ? Math.max(0.25, Math.min(2, data.playbackRate)) : 1;
+      applySettings(data);
       desiredPlaying = data.playing === true;
       // VS Code's vscode-file protocol supports fetch but is not registered for
       // streaming media. Decode a local Blob instead of handing that protocol
@@ -109,6 +113,7 @@
     const data = event.data;
     if (!data || data.type !== MESSAGE || data.channel !== channel || disposed) return;
     if (data.action === 'initialize') initialize(data);
+    else if (data.action === 'settings') applySettings(data);
     else if (data.action === 'playback') {
       desiredPlaying = data.playing === true;
       if (data.retry === true) playbackBlocked = false;
@@ -128,7 +133,11 @@
     if (objectURL) URL.revokeObjectURL(objectURL);
     objectURL = undefined;
     window.removeEventListener('message', receive);
+    window.removeEventListener('pagehide', cleanup);
+    if (window.__frostedVideoDispose === disposeFromParent) delete window.__frostedVideoDispose;
   }
+  const disposeFromParent = token => { if (token === channel) cleanup(); };
+  window.__frostedVideoDispose = disposeFromParent;
   window.addEventListener('message', receive);
   window.addEventListener('pagehide', cleanup, { once: true });
   send('booted');

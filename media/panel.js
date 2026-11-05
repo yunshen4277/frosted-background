@@ -33,7 +33,14 @@
   let defaults = { ...fallback };
   let applied = { ...fallback };
   let dirty = Boolean(saved.dirty && saved.draft);
-  let state = { config: applied, enabled: false, media: null, busy: true, error: null, notice: null, needsReload: false, update: null };
+  let state = { config: applied, enabled: false, media: null, busy: true, error: null, notice: null, needsReload: false, update: null, liveEnabled: false, liveApplying: false };
+  let editRevision = 0;
+  let requestSequence = Number.isSafeInteger(saved.liveRequestId) && saved.liveRequestId > 0 ? saved.liveRequestId : 0;
+  let lastLiveAck = 0;
+  let liveRequest = null;
+  let queuedRevision = null;
+  let debounceTimer = null;
+  let debounceReady = false;
   let currentMedia = null;
   let mediaIdentity = '';
   let videoReady = false;
@@ -42,7 +49,7 @@
 
   function persistDraft() {
     dirty = Object.keys(fallback).some(key => draft[key] !== applied[key]);
-    vscode.setState({ draft: { ...draft }, dirty });
+    vscode.setState({ draft: { ...draft }, dirty, liveRequestId: requestSequence });
   }
 
   function formatValue(key, value) {
@@ -169,12 +176,11 @@
 
   function renderActions() {
     const busy = Boolean(state.busy);
+    const liveApplying = Boolean(state.liveApplying || liveRequest);
     byId('panel').setAttribute('aria-busy', String(busy));
     for (const input of document.querySelectorAll('input, select:not(#language), [data-preset], #reset, #choose-image, #choose-video')) input.disabled = busy;
-    byId('apply').disabled = busy || !state.media;
+    byId('apply').disabled = busy || liveApplying || (!state.media && !state.needsReload);
     byId('restore').disabled = busy || (!state.enabled && !state.needsReload);
-    byId('reload').disabled = busy;
-    byId('reload').hidden = !state.needsReload;
     const update = state.update;
     byId('update-section').hidden = !update;
     if (update) {
@@ -189,12 +195,19 @@
       byId('update-message').textContent = typeof update.message === 'string' ? update.message : '';
       byId('update-message').classList.toggle('is-error', update.status === 'error');
     }
-    byId('apply-label').textContent = translate(busy ? '正在处理…' : '应用到编辑区');
-    const statusText = busy ? '处理中' : state.needsReload ? '待重载' : state.enabled ? '已启用' : '未启用';
+    byId('apply-label').textContent = translate('应用');
+    const statusText = busy ? '处理中' : state.needsReload ? '待应用' : liveApplying ? '更新中' : state.liveEnabled ? '实时生效' : state.enabled ? '已启用' : '未启用';
     byId('status-text').textContent = translate(statusText);
     byId('status').classList.toggle('is-active', Boolean(state.enabled || state.needsReload));
-    byId('draft-label').textContent = translate(dirty ? '● 效果已调整，尚未应用到编辑区' : state.needsReload ? (update?.pendingVersion ? '插件更新已准备好，重载窗口后生效' : '背景已准备好，重载窗口后生效') : state.media ? '预览效果不会影响代码清晰度' : '把喜欢的风景，放进代码里');
+    const feedbackKey = state.needsReload ? (update?.pendingVersion ? '点击应用将重载窗口，完成插件更新。' : '点击应用将重载窗口，完成背景设置。')
+      : liveApplying ? '正在自动应用最新效果…'
+        : state.liveEnabled && dirty && state.error ? '自动应用失败，请点击应用重试。'
+          : dirty ? (state.liveEnabled ? '效果调整将自动应用…' : '效果已调整，点击应用使其生效。')
+            : state.liveEnabled ? '效果调整会自动生效，无需点击应用。'
+              : state.media ? '点击应用启用背景；首次设置需要重载一次。' : '选择图片或视频，即可应用背景。';
+    byId('draft-label').textContent = translate(feedbackKey);
     byId('draft-label').classList.toggle('is-dirty', dirty);
+    byId('draft-label').classList.toggle('requires-reload', state.needsReload);
     for (const key of ['error', 'notice']) {
       const message = typeof state[key] === 'string' ? state[key] : '';
       byId(key).textContent = message;
@@ -203,12 +216,45 @@
   }
 
   function changed() {
+    editRevision += 1;
+    queuedRevision = editRevision;
+    debounceReady = false;
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      debounceTimer = null;
+      debounceReady = true;
+      flushLiveConfig();
+    }, 250);
     persistDraft();
     renderControls();
   }
 
+  function clearQueuedConfig() {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = null;
+    queuedRevision = null;
+    debounceReady = false;
+  }
+
+  function flushLiveConfig() {
+    if (queuedRevision === null || !debounceReady || liveRequest || !state.liveEnabled || state.busy || !state.media) return;
+    if (!dirty) { clearQueuedConfig(); return; }
+    const requestId = ++requestSequence;
+    liveRequest = { requestId, revision: editRevision };
+    clearQueuedConfig();
+    persistDraft();
+    renderActions();
+    // This operation intentionally does not acquire the ordinary UI busy lock:
+    // subsequent edits stay responsive and are sent after this request's ack.
+    vscode.postMessage({ type: 'liveConfig', config: { ...draft }, requestId });
+  }
+
   function sendAction(message) {
     if (state.busy) return;
+    // Keep a queued change while the picker is open: if choosing is canceled,
+    // it still belongs to the existing background. A successful choice returns
+    // matching config and clears the queue without a duplicate write.
+    if (['apply', 'restore', 'reload'].includes(message.type)) clearQueuedConfig();
     state.busy = true;
     renderActions();
     vscode.postMessage(message);
@@ -228,11 +274,13 @@
     button.addEventListener('click', () => { draft = { ...draft, ...presets[button.dataset.preset] }; changed(); });
   }
   byId('reset').addEventListener('click', () => { draft = { ...defaults }; changed(); });
-  byId('choose-image').addEventListener('click', () => sendAction({ type: 'chooseMedia', kind: 'image' }));
-  byId('choose-video').addEventListener('click', () => sendAction({ type: 'chooseMedia', kind: 'video' }));
-  byId('apply').addEventListener('click', () => sendAction({ type: 'apply', config: { ...draft } }));
+  byId('choose-image').addEventListener('click', () => sendAction({ type: 'chooseMedia', kind: 'image', config: { ...draft } }));
+  byId('choose-video').addEventListener('click', () => sendAction({ type: 'chooseMedia', kind: 'video', config: { ...draft } }));
+  byId('apply').addEventListener('click', () => {
+    if (state.needsReload && (!dirty || !state.media)) sendAction({ type: 'reload' });
+    else sendAction({ type: 'apply', config: { ...draft }, reloadAfterApply: true });
+  });
   byId('restore').addEventListener('click', () => sendAction({ type: 'restore' }));
-  byId('reload').addEventListener('click', () => sendAction({ type: 'reload' }));
   // Closing is a view-only action: do not acquire the operation lock or modify
   // saved drafts, the selected media, or the background's enabled state.
   byId('close-panel').addEventListener('click', () => vscode.postMessage({ type: 'closePanel' }));
@@ -247,26 +295,41 @@
   window.addEventListener('message', event => {
     const message = event.data;
     if (!message || message.type !== 'state') return;
+    const ack = Number.isSafeInteger(message.liveAck) && message.liveAck > 0 ? message.liveAck : 0;
+    // Ignore an older acknowledgement snapshot rather than rolling controls
+    // back after a newer request has already completed.
+    if (ack && ack < lastLiveAck) return;
+    lastLiveAck = Math.max(lastLiveAck, ack);
+    requestSequence = Math.max(requestSequence, ack);
+    const request = liveRequest;
+    const acknowledged = Boolean(request && ack >= request.requestId);
+    const canReset = message.resetDraft && (request
+      ? acknowledged && editRevision === request.revision && !message.error
+      : !state.liveEnabled || queuedRevision === null);
     language = normalizeLanguage(message.language);
     applied = normalize(message.config);
     defaults = normalize(message.defaults);
     // Host settings may change outside this panel. Follow them whenever there
     // is no unsaved local draft, while preserving deliberate local edits.
-    if (message.resetDraft || !dirty) draft = { ...applied };
+    if (canReset || (!dirty && !request && queuedRevision === null)) draft = { ...applied };
+    if (acknowledged) liveRequest = null;
     state = {
       config: applied, enabled: Boolean(message.enabled), media: message.media || null,
       busy: Boolean(message.busy), error: message.error, notice: message.notice,
       needsReload: Boolean(message.needsReload),
+      liveEnabled: Boolean(message.liveEnabled), liveApplying: Boolean(message.liveApplying),
       update: message.update && typeof message.update === 'object' ? message.update : null,
     };
     persistDraft();
+    if (!dirty && !liveRequest) clearQueuedConfig();
     renderLanguage();
+    flushLiveConfig();
   });
   reducedMotion.addEventListener('change', syncPlayback);
   document.addEventListener('visibilitychange', syncPlayback);
   window.addEventListener('focus', syncPlayback);
   window.addEventListener('blur', syncPlayback);
-  window.addEventListener('pagehide', () => { if (currentMedia?.tagName === 'VIDEO') currentMedia.pause(); });
+  window.addEventListener('pagehide', () => { if (debounceTimer) clearTimeout(debounceTimer); if (currentMedia?.tagName === 'VIDEO') currentMedia.pause(); });
   renderLanguage();
   vscode.postMessage({ type: 'ready' });
 })();

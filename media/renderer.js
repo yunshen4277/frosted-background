@@ -13,37 +13,11 @@
 
   // Reinstallation must never accumulate observers, video decoders or styles.
   window.__frostedBackgroundCleanup?.();
-  if (settings.enabled === false || !settings.source) return;
-
-  let source;
-  let videoPlayer;
-  try {
-    source = new URL(settings.source, document.baseURI);
-    const origin = new URL(document.baseURI);
-    if (source.protocol !== origin.protocol || source.host !== origin.host || source.username || source.password) {
-      throw new Error('Only media copied into this VS Code installation is supported.');
-    }
-    if (settings.kind === 'video' && settings.videoPlayer) {
-      videoPlayer = new URL(settings.videoPlayer, document.baseURI);
-      const directory = source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1);
-      if (videoPlayer.protocol !== origin.protocol || videoPlayer.host !== origin.host || videoPlayer.username || videoPlayer.password || videoPlayer.search || videoPlayer.hash ||
-          source.search || source.hash || !/\/frosted-background-assets\/$/.test(directory) ||
-          videoPlayer.pathname.slice(0, videoPlayer.pathname.lastIndexOf('/') + 1) !== directory ||
-          !/^video-host-[a-f0-9]{64}\.html$/.test(videoPlayer.pathname.slice(videoPlayer.pathname.lastIndexOf('/') + 1)) ||
-          !/^media-[a-f0-9]{64}\.(mp4|webm)$/.test(source.pathname.slice(source.pathname.lastIndexOf('/') + 1))) {
-        throw new Error('Video player and media must be owned, adjacent cached assets.');
-      }
-    }
-  } catch (error) {
-    console.warn('[Frosted Background] Invalid local media location.', error);
-    return;
-  }
-
   const number = (value, fallback, min, max) => {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
   };
-  const config = {
+  const normalizeConfig = settings => ({
     kind: settings.kind === 'video' ? 'video' : 'image',
     blur: number(settings.blur, 14, 0, 60),
     opacity: number(settings.opacity, 0.35, 0, 1),
@@ -55,7 +29,55 @@
     position: typeof settings.position === 'string' && settings.position.length < 80 ? settings.position : 'center center',
     pauseWhenUnfocused: settings.pauseWhenUnfocused !== false,
     respectReducedMotion: settings.respectReducedMotion !== false,
-  };
+  });
+  const origin = new URL(document.baseURI);
+  const ownedDirectory = new URL('./frosted-background-assets/', origin);
+  const ownedState = new URL('live-state.json', ownedDirectory);
+  const sameOrigin = url => url.protocol === origin.protocol && url.host === origin.host && !url.username && !url.password;
+  let liveState;
+  let active;
+  function parseSettings(settings, strict = false) {
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new Error('Invalid settings.');
+    if (settings.enabled === false) return { enabled: false };
+    if (typeof settings.source !== 'string' || !settings.source || (strict && (settings.enabled !== true || !['image', 'video'].includes(settings.kind)))) throw new Error('Missing media source.');
+    const source = new URL(settings.source, origin);
+    if (!sameOrigin(source)) throw new Error('Only local workbench media is supported.');
+    if (strict && (source.search || source.hash || source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1) !== ownedDirectory.pathname ||
+        !/^media-[a-f0-9]{64}\.(png|jpe?g|gif|webp|bmp|avif|mp4|webm)$/.test(source.pathname.slice(source.pathname.lastIndexOf('/') + 1)) ||
+        /\.(mp4|webm)$/.test(source.pathname) !== (settings.kind === 'video'))) throw new Error('Media is not an owned cached asset.');
+    let videoPlayer;
+    if (settings.kind === 'video' && settings.videoPlayer) {
+      videoPlayer = new URL(settings.videoPlayer, origin);
+      const directory = source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1);
+      if (!sameOrigin(videoPlayer) || videoPlayer.search || videoPlayer.hash || source.search || source.hash ||
+          !/\/frosted-background-assets\/$/.test(directory) ||
+          videoPlayer.pathname.slice(0, videoPlayer.pathname.lastIndexOf('/') + 1) !== directory ||
+          !/^video-host-[a-f0-9]{64}\.html$/.test(videoPlayer.pathname.slice(videoPlayer.pathname.lastIndexOf('/') + 1)) ||
+          !/^media-[a-f0-9]{64}\.(mp4|webm)$/.test(source.pathname.slice(source.pathname.lastIndexOf('/') + 1))) throw new Error('Invalid local video player.');
+    }
+    if (strict && settings.kind === 'video' && !videoPlayer) throw new Error('Missing local video player.');
+    if (strict) {
+      if (settings.liveState !== undefined && new URL(settings.liveState, origin).href !== ownedState.href) throw new Error('Live state location cannot change.');
+      for (const key of ['blur', 'opacity', 'tintOpacity', 'saturation', 'brightness', 'playbackRate']) {
+        if (typeof settings[key] !== 'number' || !Number.isFinite(settings[key])) throw new Error('Invalid numeric setting.');
+      }
+      if (!['cover', 'contain', 'fill'].includes(settings.fit) || !['center center', 'center top', 'center bottom', 'left center', 'right center'].includes(settings.position) ||
+          typeof settings.pauseWhenUnfocused !== 'boolean' || typeof settings.respectReducedMotion !== 'boolean') throw new Error('Invalid layout or playback setting.');
+    }
+    return { enabled: true, source, videoPlayer, config: normalizeConfig(settings) };
+  }
+  try {
+    if (settings.liveState !== undefined) {
+      const location = new URL(settings.liveState, origin);
+      if (location.href !== ownedState.href) throw new Error('Invalid live state location.');
+      liveState = location;
+    }
+    active = parseSettings(settings, Boolean(liveState));
+  } catch (error) {
+    console.warn('[Frosted Background] Invalid local background configuration.', error);
+    return;
+  }
+  if (!active.enabled && !liveState) return;
 
   const style = document.createElement('style');
   style.id = 'frosted-background-style';
@@ -121,6 +143,10 @@
   const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
   let disposed = false;
   let pendingFrame = 0;
+  let pollTimer;
+  let pollRequest;
+  let revision;
+  let pollSequence = 0;
 
   const listen = (target, name, callback, options) => {
     target.addEventListener(name, callback, options);
@@ -128,6 +154,8 @@
   };
 
   function mount(host) {
+    const { source, videoPlayer } = active;
+    let config = active.config;
     const layer = document.createElement('div');
     layer.className = 'frosted-background-layer';
     layer.setAttribute('aria-hidden', 'true');
@@ -137,18 +165,20 @@
     media.className = 'frosted-background-media';
     media.setAttribute('aria-hidden', 'true');
     media.setAttribute('tabindex', '-1');
-    const overscan = config.fit === 'cover' ? config.blur * 3 : 0;
-    Object.assign(media.style, {
-      left: `${-overscan}px`, top: `${-overscan}px`,
-      width: `calc(100% + ${overscan * 2}px)`, height: `calc(100% + ${overscan * 2}px)`,
-      objectFit: config.fit, objectPosition: config.position,
-      filter: `blur(${config.blur}px) saturate(${config.saturation}) brightness(${config.brightness})`,
-      opacity: String(config.opacity),
-      border: '0',
-    });
     const tint = document.createElement('div');
     tint.className = 'frosted-background-tint';
-    tint.style.opacity = String(config.tintOpacity);
+    function applyMediaStyles() {
+      const overscan = config.fit === 'cover' ? config.blur * 3 : 0;
+      Object.assign(media.style, {
+        left: `${-overscan}px`, top: `${-overscan}px`,
+        width: `calc(100% + ${overscan * 2}px)`, height: `calc(100% + ${overscan * 2}px)`,
+        objectFit: config.fit, objectPosition: config.position,
+        filter: `blur(${config.blur}px) saturate(${config.saturation}) brightness(${config.brightness})`,
+        opacity: String(config.opacity), border: '0',
+      });
+      tint.style.opacity = String(config.tintOpacity);
+    }
+    applyMediaStyles();
     layer.append(media, tint);
 
     const initialPosition = host.style.getPropertyValue('position');
@@ -332,12 +362,22 @@
     }
     const resize = new ResizeObserver(() => { scheduleGeometry(); updatePlayback(); });
     resize.observe(host);
-    const layoutObserver = config.fit === 'fill' ? new MutationObserver(records => {
+    const layoutObserver = new MutationObserver(records => {
       if (records.some(record => record.target.matches?.(layoutSelector) ||
         [...record.addedNodes, ...record.removedNodes].some(node => node.nodeType === 1 && (node.matches(layoutSelector) || node.querySelector(layoutSelector))))) scheduleGeometry();
-    }) : undefined;
-    layoutObserver?.observe(host, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
-    updateFillBounds();
+    });
+    const observeLayout = () => {
+      cancelAnimationFrame(geometryFrame);
+      layoutObserver.disconnect();
+      if (config.fit === 'fill') layoutObserver.observe(host, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
+      else {
+        for (const element of geometryNodes) resize.unobserve(element);
+        geometryNodes.clear();
+        layer.style.inset = '0';
+      }
+      updateFillBounds();
+    };
+    observeLayout();
     const intersection = new IntersectionObserver(entries => {
       inViewport = entries[0]?.isIntersecting ?? true;
       updatePlayback();
@@ -346,6 +386,14 @@
 
     const state = {
       updatePlayback,
+      updateSettings(next) {
+        config = next;
+        applyMediaStyles();
+        observeLayout();
+        if (framedVideo && playerBooted) postPlayer({ action: 'settings', fit: config.fit, position: config.position, playbackRate: config.playbackRate });
+        else if (config.kind === 'video' && !framedVideo) media.playbackRate = config.playbackRate;
+        updatePlayback();
+      },
       retryPlayback() {
         playbackBlocked = false;
         if (framedVideo && playerBooted && !stopped) postPlayer({ action: 'playback', playing: shouldPlay(), retry: true });
@@ -360,6 +408,9 @@
         media.removeEventListener(config.kind === 'video' ? 'loadeddata' : 'load', onReady);
         media.removeEventListener('error', onError);
         if (framedVideo) {
+          // Same-origin teardown is synchronous: removing an iframe immediately
+          // after postMessage need not deliver that message before destruction.
+          try { media.contentWindow?.__frostedVideoDispose?.(channel); } catch { /* A still-loading frame is released when removed. */ }
           postPlayer({ action: 'dispose' });
           window.removeEventListener('message', receivePlayer);
           media.removeEventListener('load', initializePlayer);
@@ -389,6 +440,7 @@
         hosts.delete(host);
       }
     }
+    if (!active.enabled) return;
     for (const host of document.querySelectorAll('.part.editor')) {
       if (!hosts.has(host)) mount(host);
     }
@@ -396,6 +448,71 @@
 
   function scheduleReconcile() {
     if (!pendingFrame && !disposed) pendingFrame = requestAnimationFrame(reconcile);
+  }
+
+  function applySettings(next) {
+    const sameMedia = active.enabled && next.enabled && active.source.href === next.source.href &&
+      active.videoPlayer?.href === next.videoPlayer?.href && active.config.kind === next.config.kind;
+    active = next;
+    if (sameMedia) {
+      for (const state of hosts.values()) state.updateSettings(next.config);
+    } else {
+      for (const state of hosts.values()) state.dispose();
+      hosts.clear();
+      reconcile();
+    }
+  }
+
+  async function readState(response) {
+    const limit = 64 * 1024;
+    if (!response.ok || Number(response.headers.get('content-length')) > limit) throw new Error('Invalid live state response.');
+    // Enforce the limit while streaming too; a missing Content-Length must not
+    // allow an accidental large local file to be buffered without a bound.
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error('Missing live state body.');
+    const decoder = new TextDecoder();
+    let length = 0;
+    let text = '';
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        length += value.byteLength;
+        if (length > limit) { await reader.cancel(); throw new Error('Live state exceeds its size limit.'); }
+        text += decoder.decode(value, { stream: true });
+      }
+      return JSON.parse(text + decoder.decode());
+    } finally { reader.releaseLock(); }
+  }
+
+  async function poll() {
+    if (disposed || !liveState) return;
+    const request = new AbortController();
+    pollRequest = request;
+    const timeout = setTimeout(() => request.abort(), 5000);
+    try {
+      const url = new URL(liveState.href);
+      url.searchParams.set('frosted-poll', `${Date.now()}-${++pollSequence}`);
+      const response = await fetch(url.href, { cache: 'no-store', credentials: 'omit', redirect: 'error', signal: request.signal });
+      const envelope = await readState(response);
+      if (disposed || request.signal.aborted) return;
+      if (!envelope || envelope.protocol !== 1 || typeof envelope.revision !== 'string' ||
+          !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(envelope.revision)) throw new Error('Invalid live state envelope.');
+      if (envelope.revision !== revision) {
+        const next = parseSettings(envelope.settings, true);
+        applySettings(next);
+        revision = envelope.revision;
+      }
+    } catch {
+      // Stop any unread oversized response too. An atomic replacement,
+      // transient read or invalid file keeps the previous background.
+      request.abort();
+    }
+    finally {
+      clearTimeout(timeout);
+      pollRequest = undefined;
+      if (!disposed) pollTimer = setTimeout(poll, 500);
+    }
   }
 
   // Changes to editor lines are frequent. Ignore mutations inside existing hosts
@@ -428,6 +545,8 @@
   function cleanup() {
     if (disposed) return;
     disposed = true;
+    clearTimeout(pollTimer);
+    pollRequest?.abort();
     cancelAnimationFrame(pendingFrame);
     observer.disconnect();
     for (const remove of removers) remove();
@@ -439,4 +558,5 @@
   window.__frostedBackgroundCleanup = cleanup;
   listen(window, 'pagehide', cleanup, { once: true });
   reconcile();
+  if (liveState) pollTimer = setTimeout(poll, 500);
 })();
