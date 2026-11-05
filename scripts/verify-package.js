@@ -21,7 +21,8 @@ async function main() {
     'extension/src/patcher.js', 'extension/media/renderer.js', 'extension/media/video-player.js',
     'extension/src/panel.js', 'extension/src/panel-ui.js', 'extension/media/panel.js', 'extension/media/panel.css',
     'extension/media/background-icon.svg', 'extension/src/updater.js', 'extension/src/github-update.js',
-    'extension/src/localization.js', 'extension/media/i18n.js', 'extension/media/regions.js']) {
+    'extension/src/localization.js', 'extension/media/i18n.js', 'extension/media/regions.js',
+    'extension/src/remote-media.js', 'extension/media/source.js', 'extension/media/vendor/hls.min.js', 'extension/media/vendor/HLS-LICENSE.txt']) {
     assert.ok(archive.file(required), `Missing ${required}`);
   }
   const packedPkg = JSON.parse(await archive.file('extension/package.json').async('string'));
