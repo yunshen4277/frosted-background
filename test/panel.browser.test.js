@@ -8,6 +8,29 @@ const os = require('node:os');
 const { pathToFileURL } = require('node:url');
 const { renderPanelHtml } = require('../src/panel-ui');
 const { DEFAULTS } = require('../src/config');
+const { normalizeLanguage, t, dictionaries } = require('../media/i18n');
+
+test('panel localization catalog covers markup and defaults to English without a first-render flash', () => {
+  assert.equal(normalizeLanguage('es'), 'es');
+  assert.equal(normalizeLanguage('zh-CN'), 'zh-CN');
+  for (const value of [undefined, null, 'fr', 'EN', {}, '__proto__']) assert.equal(normalizeLanguage(value), 'en');
+  const options = { cspSource: 'file:', nonce: 'test', scriptUri: 'panel.js', styleUri: 'panel.css', i18nUri: 'i18n.js' };
+  const html = renderPanelHtml(options);
+  assert.match(html, /<html lang="en">/);
+  assert.match(html, /<title[^>]*>Frosted Background<\/title>/);
+  assert.ok(html.indexOf('src="i18n.js"') < html.indexOf('src="panel.js"'));
+  assert.deepEqual([...html.matchAll(/>([^<>]*[\u3400-\u9fff][^<>]*)</g)].map(match => match[1]), ['简体中文'], 'only the native language name is Chinese in the English first render');
+  for (const match of html.matchAll(/data-i18n(?:-aria-label|-title)?="([^"]+)"/g)) {
+    for (const language of ['en', 'zh-CN', 'es']) assert.equal(typeof dictionaries[language][match[1]], 'string', `${language}: ${match[1]}`);
+  }
+  for (const language of ['en', 'zh-CN', 'es']) {
+    assert.deepEqual(Object.keys(dictionaries[language]), Object.keys(dictionaries.en));
+    assert.match(renderPanelHtml({ ...options, language }), new RegExp(`<html lang="${language}">`));
+  }
+  assert.equal(t('es', '发现 v{version}', { version: '0.7.0' }), 'v0.7.0 disponible');
+  assert.equal(t('en', '发现 v{version}', { version: '<script>' }), 'v<script> available', 'parameters stay plain text for DOM consumers');
+  assert.equal(t('en', '__proto__'), '__proto__');
+});
 
 test('sidebar previews drafts, sends explicit actions, and stays usable across widths and themes', {
   skip: !process.env.PLAYWRIGHT_MODULE,
@@ -24,6 +47,7 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     cspSource: 'file:', nonce: 'panel-test-nonce',
     scriptUri: pathToFileURL(path.resolve(__dirname, '../media/panel.js')).href,
     styleUri: pathToFileURL(path.resolve(__dirname, '../media/panel.css')).href,
+    i18nUri: pathToFileURL(path.resolve(__dirname, '../media/i18n.js')).href,
   }));
   let browser;
   try {
@@ -44,11 +68,14 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(pathToFileURL(fixtureFile).href);
     assert.deepEqual(await page.evaluate(() => window.__messages), [{ type: 'ready' }]);
+    assert.equal(await page.locator('html').getAttribute('lang'), 'en');
+    assert.equal(await page.locator('h1').textContent(), 'Frosted Background');
+    assert.equal(await page.getByRole('button', { name: 'Close control panel' }).count(), 1);
     const media = {
       name: '山谷 · 清晨.png', kind: 'image',
       uri: pathToFileURL(path.resolve(__dirname, 'fixtures/wallpaper.png')).href,
     };
-    let state = { type: 'state', config: { ...DEFAULTS }, defaults: { ...DEFAULTS }, enabled: false, media, busy: false, error: null, notice: null, needsReload: false };
+    let state = { type: 'state', language: 'zh-CN', config: { ...DEFAULTS }, defaults: { ...DEFAULTS }, enabled: false, media, busy: false, error: null, notice: null, needsReload: false };
     const sendState = async changes => {
       state = { ...state, ...changes };
       await page.evaluate(message => window.dispatchEvent(new MessageEvent('message', { data: message })), state);
@@ -166,6 +193,86 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     await page.locator('#playbackRate').dispatchEvent('input');
     assert.equal(await page.locator('video').evaluate(video => video.playbackRate), 1.5);
 
+    await page.locator('video').evaluate(video => { video.currentTime = 0.2; window.__previewNode = video; });
+    await page.waitForFunction(() => !document.querySelector('video').seeking);
+    const languageDraft = await page.evaluate(() => window.__saved);
+    const languageTime = await page.locator('video').evaluate(video => video.currentTime);
+    await page.locator('video').dispatchEvent('error');
+    await sendState({ busy: true, resetDraft: false });
+    for (const [language, heading, closeName] of [
+      ['es', 'Fondo esmerilado', 'Cerrar panel de control'],
+      ['en', 'Frosted Background', 'Close control panel'],
+      ['zh-CN', '毛玻璃背景', '关闭控制面板'],
+    ]) {
+      assert.equal(await page.locator('#language').isEnabled(), true, 'language stays usable during background operations');
+      await page.locator('#language').selectOption(language);
+      assert.deepEqual(await page.evaluate(() => window.__messages.at(-1)), { type: 'setLanguage', language });
+      assert.equal(await page.locator('html').getAttribute('lang'), language, 'text changes before the host responds');
+      assert.equal(await page.locator('h1').textContent(), heading);
+      assert.equal(await page.getByRole('button', { name: closeName }).getAttribute('title'), closeName);
+      assert.equal(await page.locator('#preview-error').textContent(), dictionaries[language]['此视频无法预览，请尝试 WebM 格式。'], 'an existing preview error changes language in place');
+      assert.equal(await page.locator('video').evaluate(video => video === window.__previewNode), true);
+      assert.equal(await page.locator('video').evaluate(video => video.currentTime), languageTime);
+      assert.deepEqual(await page.evaluate(() => window.__saved), languageDraft, 'language does not change the saved effect draft');
+      await sendState({ language });
+      assert.equal(await page.locator('video').evaluate(video => video === window.__previewNode), true, 'host language echo does not remount media');
+      assert.equal(await page.locator('#playbackRate').inputValue(), '1.5');
+    }
+    await sendState({ busy: false });
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    await page.locator('#pauseWhenUnfocused').focus();
+    await page.keyboard.press('Space');
+    assert.equal(await page.locator('#pauseWhenUnfocused').isChecked(), false);
+    await page.locator('video').evaluate(async video => { video.loop = false; video.currentTime = video.duration / 4; await video.play(); });
+    await page.waitForFunction(() => document.querySelector('video').currentTime > document.querySelector('video').duration / 3);
+    const playingTime = await page.locator('video').evaluate(video => video.currentTime);
+    await page.locator('#language').selectOption('es');
+    assert.equal(await page.locator('video').evaluate(video => video === window.__previewNode), true, 'a playing video keeps its node');
+    assert.ok(await page.locator('video').evaluate(video => video.currentTime) >= playingTime, 'playing video does not restart when the language changes');
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.locator('#pauseWhenUnfocused').focus();
+    await page.keyboard.press('Space');
+    assert.equal(await page.locator('#pauseWhenUnfocused').isChecked(), true);
+    await sendState({ busy: false, language: 'es', needsReload: true, enabled: true, update: { ...update, pendingVersion: '0.6.0' } });
+    assert.equal(await page.locator('#available-version').textContent(), 'v0.6.0 · Recarga pendiente');
+    assert.equal(await page.locator('#fit-description').textContent(), dictionaries.es['完整画面压缩到编辑区，不裁剪；可能改变比例']);
+    assert.equal(await page.locator('#status-text').textContent(), 'Recarga pendiente');
+    await sendState({ notice: '<strong>Ajustes guardados</strong>', error: '<img onerror=alert(1)>Error externo' });
+    assert.equal(await page.locator('#notice').textContent(), '<strong>Ajustes guardados</strong>');
+    assert.equal(await page.locator('#error img, #notice strong').count(), 0, 'localized host feedback remains plain text');
+    await page.setViewportSize({ width: 280, height: 620 });
+    await page.evaluate(() => window.scrollTo(0, 0));
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, 'Spanish has no horizontal overflow at 280px');
+    assert.equal(await page.locator('.fit-control label > span').evaluateAll(labels => labels.every(el => el.scrollWidth <= el.clientWidth)), true, 'Spanish fit labels remain readable');
+    const spanishAction = await page.locator('#apply').boundingBox();
+    assert.ok(spanishAction.y >= 0 && spanishAction.y + spanishAction.height <= 620, 'Spanish apply button stays visible');
+    await page.getByRole('button', { name: 'Cerrar panel de control' }).focus();
+    await page.keyboard.press('Enter');
+    assert.deepEqual(await page.evaluate(() => window.__messages.at(-1)), { type: 'closePanel' });
+
+    // Reopening uses the host's persisted language, before any state message;
+    // a restored dirty draft remains separate from that UI preference.
+    const reopenFile = path.join(directory, 'reopened.html');
+    fs.writeFileSync(reopenFile, renderPanelHtml({
+      cspSource: 'file:', nonce: 'panel-test-nonce', language: 'es',
+      scriptUri: pathToFileURL(path.resolve(__dirname, '../media/panel.js')).href,
+      styleUri: pathToFileURL(path.resolve(__dirname, '../media/panel.css')).href,
+      i18nUri: pathToFileURL(path.resolve(__dirname, '../media/i18n.js')).href,
+    }));
+    const reopened = await browser.newPage({ viewport: { width: 280, height: 620 } });
+    await reopened.addInitScript(saved => {
+      window.__saved = saved;
+      window.acquireVsCodeApi = () => ({ getState: () => window.__saved, setState: value => { window.__saved = value; }, postMessage() {} });
+    }, languageDraft);
+    await reopened.goto(pathToFileURL(reopenFile).href);
+    assert.equal(await reopened.locator('html').getAttribute('lang'), 'es');
+    assert.equal(await reopened.locator('#language').inputValue(), 'es');
+    assert.equal(await reopened.locator('h1').textContent(), 'Fondo esmerilado');
+    await reopened.evaluate(message => window.dispatchEvent(new MessageEvent('message', { data: message })), { ...state, resetDraft: false });
+    assert.equal(await reopened.locator('#playbackRate').inputValue(), '1.5', 'reopened draft survives the first state message');
+    await reopened.close();
+    await sendState({ language: 'zh-CN', needsReload: false, update: null });
+
     // Distinct color bands touch all four source edges. Sample the composited
     // preview screenshot, not just object-fit styles, to catch cropping/zoom.
     async function verifyVisibleEdges(kind) {
@@ -209,7 +316,7 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     const closeBounds = await page.locator('#close-panel').boundingBox();
     assert.ok(closeBounds.x >= 0 && closeBounds.x + closeBounds.width <= 280 && closeBounds.y >= 0 && closeBounds.y + closeBounds.height <= 620, 'close control stays visible in the narrow header');
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, 'no horizontal overflow at 280×620');
-    assert.equal(await page.locator('.fit-control span').evaluateAll(labels => labels.length === 3 && labels.every(el => el.scrollWidth <= el.clientWidth)), true, 'three layout options fit the narrow sidebar without clipping labels');
+    assert.equal(await page.locator('.fit-control label > span').evaluateAll(labels => labels.length === 3 && labels.every(el => el.scrollWidth <= el.clientWidth)), true, 'three layout options fit the narrow sidebar without clipping labels');
     assert.equal(await page.locator('#preview-media img').evaluate(el => getComputedStyle(el).objectFit), 'fill', 'stretch survives panel resizing');
     const actionBounds = await page.locator('#apply').boundingBox();
     assert.ok(actionBounds.y >= 0 && actionBounds.y + actionBounds.height <= 620, 'sticky apply action remains inside the short viewport');

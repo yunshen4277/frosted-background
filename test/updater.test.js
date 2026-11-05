@@ -19,7 +19,7 @@ async function settle() {
 
 function harness(t, options = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'frosted-updater-test-'));
-  const state = new Map(Object.entries(options.state || {}));
+  const state = new Map(Object.entries({ language: 'zh-CN', ...(options.state || {}) }));
   const configuration = { updateMode: options.mode || 'automatic' };
   const timers = new Map();
   const calls = { find: [], download: [], command: [], info: [], warning: [], error: [], changes: [], log: [], writes: [], configuration: [], exclusive: 0 };
@@ -326,4 +326,81 @@ test('background update failures update status and logs without showing warning 
   assert.equal(env.calls.warning.length, 0);
   assert.equal(env.calls.error.length, 0);
   assert.equal(env.calls.command.length, 0);
+});
+
+test('English is the default update language and Spanish is honored immediately after selection', async t => {
+  const env = harness(t, { state: { language: undefined }, release: null });
+  assert.equal(env.controller.getState().message, 'Updates come from this extension’s GitHub releases.');
+  env.state.set('language', 'es');
+  env.controller.refreshLanguage();
+  assert.equal(env.calls.changes.at(-1).message, 'Las actualizaciones proceden de las versiones de esta extensión en GitHub.');
+  assert.equal(env.calls.find.length, 0, 'language changes never initiate a check');
+  await env.controller.check(true);
+  assert.equal(env.controller.getState().message, 'Tienes la última versión publicada.');
+  env.state.set('language', 'unsupported');
+  env.controller.refreshLanguage();
+  assert.equal(env.calls.changes.at(-1).message, 'You have the latest release.');
+  assert.equal(env.calls.find.length, 1);
+});
+
+test('switching language during an update re-renders checking, installing and pending states without restarting work', async t => {
+  const finding = deferred();
+  const downloading = deferred();
+  const env = harness(t, { state: { language: undefined }, find: () => finding.promise, download: () => downloading.promise });
+  const checking = env.controller.check(true);
+  assert.equal(env.controller.getState().message, 'Checking GitHub for updates…');
+  env.state.set('language', 'es');
+  env.controller.refreshLanguage();
+  assert.equal(env.calls.changes.at(-1).message, 'Buscando actualizaciones en GitHub…');
+  assert.equal(env.calls.find.length, 1);
+  finding.resolve(env.release);
+  await settle();
+  assert.equal(env.controller.getState().message, 'Descargando y verificando 0.3.1…');
+  env.state.set('language', 'zh-CN');
+  env.controller.refreshLanguage();
+  assert.equal(env.calls.changes.at(-1).message, '正在下载并验证 0.3.1…');
+  downloading.resolve({ filePath: env.filePath, version: '0.3.1' });
+  await checking;
+  env.state.set('language', 'es');
+  env.controller.refreshLanguage();
+  assert.equal(env.calls.changes.at(-1).message, 'La versión 0.3.1 está instalada. Recarga la ventana para cargarla.');
+  assert.equal(env.controller.getState().pendingVersion, '0.3.1');
+  assert.equal(env.calls.find.length, 1);
+  assert.equal(env.calls.download.length, 1);
+  assert.equal(env.calls.command.filter(call => call[0] === 'workbench.extensions.installExtension').length, 1);
+  assert.equal(env.calls.command.some(call => call[0] === 'workbench.action.reloadWindow'), false);
+});
+
+test('an update failure can be translated again without retrying or displaying another notification', async t => {
+  const env = harness(t, { state: { language: undefined }, find: async () => { throw new Error('更新文件 SHA-256 校验失败，未安装。'); } });
+  await env.controller.check(true);
+  assert.match(env.controller.getState().message, /failed SHA-256 verification/);
+  assert.equal(env.calls.warning.length, 1);
+  env.state.set('language', 'es');
+  env.controller.refreshLanguage();
+  assert.match(env.calls.changes.at(-1).message, /falló la verificación SHA-256/);
+  assert.doesNotMatch(env.calls.changes.at(-1).message, /[\u3400-\u9fff]/);
+  assert.equal(env.calls.find.length, 1);
+  assert.equal(env.calls.warning.length, 1);
+  assert.equal(env.calls.download.length, 0);
+});
+
+test('an install prompt keeps its displayed action valid when language changes before the response', async t => {
+  const answer = deferred();
+  const env = harness(t, {
+    state: { language: undefined }, mode: 'notify',
+    info: (...args) => args.includes('Install Update') ? answer.promise : undefined
+  });
+  const checking = env.controller.check(true);
+  await settle();
+  assert.equal(env.calls.info[0][1], 'Install Update');
+  env.state.set('language', 'es');
+  env.controller.refreshLanguage();
+  assert.equal(env.calls.changes.at(-1).message, 'La versión 0.3.1 está disponible.');
+  answer.resolve('Install Update');
+  await checking;
+  assert.equal(env.calls.download.length, 1);
+  assert.equal(env.calls.info.at(-1)[1], 'Recargar ventana');
+  assert.match(env.calls.info.at(-1)[0], /La actualización de Fondo esmerilado está instalada/);
+  assert.equal(env.controller.getState().status, 'pending');
 });

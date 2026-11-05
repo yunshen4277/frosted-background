@@ -11,7 +11,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 async function settle() { for (let index = 0; index < 5; index++) await tick(); }
 
 function harness(options = {}) {
-  const calls = { messages: [], choose: [], apply: [], restore: [], reload: [], closePanel: [], log: [] };
+  const calls = { messages: [], choose: [], apply: [], restore: [], reload: [], closePanel: [], log: [], languageChanged: [], writes: [] };
   const saved = new Map(Object.entries(options.state || {}));
   let onMessage;
   let onDispose;
@@ -25,7 +25,15 @@ function harness(options = {}) {
     extensionUri: uri(path.resolve(__dirname, '..')),
     asAbsolutePath: filename => path.resolve(__dirname, '..', filename),
     subscriptions: [],
-    globalState: { get: (key, fallback) => saved.has(key) ? saved.get(key) : fallback }
+    globalState: {
+      get: (key, fallback) => saved.has(key) ? saved.get(key) : fallback,
+      update: async (key, value) => {
+        calls.writes.push({ key, value });
+        if (options.optimisticState) saved.set(key, value);
+        if (options.update) await options.update(key, value);
+        saved.set(key, value);
+      }
+    }
   };
   const webview = {
     cspSource: 'vscode-webview://test',
@@ -62,12 +70,13 @@ function harness(options = {}) {
     },
     reload: async () => { calls.reload.push(true); },
     closePanel: async () => { calls.closePanel.push(true); },
+    onLanguageChanged: () => { calls.languageChanged.push(saved.get('language')); },
     log: error => calls.log.push(error),
     isBusy: () => options.busy === true
   });
   provider.resolveWebviewView(view);
   return {
-    provider, webview, calls, saved,
+    provider, webview, calls, saved, view,
     send: async message => { await onMessage(message); await settle(); },
     dispose: () => provider.dispose(),
     close: () => onDispose?.(),
@@ -254,6 +263,125 @@ test('canceled consent keeps the selected draft and does not reset controls or r
   assert.equal(env.latestState().busy, false);
   assert.equal(env.calls.reload.length, 0);
   env.dispose();
+});
+
+test('language defaults to English and persists the selected language when the view reopens', async () => {
+  const env = harness();
+  await env.send({ type: 'ready' });
+  assert.equal(env.latestState().language, 'en');
+  assert.match(env.webview.html, /<html lang="en">/);
+  assert.equal(env.view.title, 'Background Controls');
+  await env.send({ type: 'setLanguage', language: 'es' });
+  assert.equal(env.saved.get('language'), 'es');
+  assert.equal(env.latestState().language, 'es');
+  assert.deepEqual(env.calls.languageChanged, ['es']);
+  env.close();
+  env.provider.resolveWebviewView(env.view);
+  assert.match(env.webview.html, /<html lang="es">/);
+  const reopened = harness({ state: Object.fromEntries(env.saved) });
+  await reopened.send({ type: 'ready' });
+  assert.equal(reopened.latestState().language, 'es');
+  for (const invalid of ['de', 'zh', '<script>', null, {}, ['en']]) await env.send({ type: 'setLanguage', language: invalid });
+  assert.deepEqual(env.calls.writes, [{ key: 'language', value: 'es' }]);
+  reopened.dispose();
+  env.dispose();
+});
+
+test('language can change while applying without altering the draft or operation lock', async () => {
+  let finish;
+  const env = harness({ state: { mediaPath: 'D:/saved.png', enabled: true }, apply: () => new Promise(resolve => { finish = resolve; }) });
+  env.provider.mediaPath = 'D:/draft.webm';
+  const applying = env.provider.receive({ type: 'apply', config: { ...DEFAULTS, blur: 23 } });
+  await settle();
+  await env.provider.receive({ type: 'setLanguage', language: 'zh-CN' });
+  assert.equal(env.latestState().language, 'zh-CN');
+  assert.equal(env.latestState().busy, true);
+  assert.equal(env.latestState().resetDraft, false);
+  assert.equal(env.provider.mediaPath, 'D:/draft.webm');
+  assert.equal(env.saved.get('mediaPath'), 'D:/saved.png');
+  assert.equal(env.calls.apply.length, 1);
+  assert.equal(env.calls.restore.length + env.calls.reload.length, 0);
+  assert.deepEqual(env.calls.writes, [{ key: 'language', value: 'zh-CN' }]);
+  finish({ needsReload: true });
+  await applying;
+  assert.equal(env.latestState().language, 'zh-CN');
+  assert.equal(env.latestState().busy, false);
+  env.dispose();
+});
+
+test('quick language choices save in order and keep the last choice', async () => {
+  let finishFirst;
+  const env = harness({ update: (_key, value) => value === 'es' ? new Promise(resolve => { finishFirst = resolve; }) : undefined });
+  const first = env.provider.receive({ type: 'setLanguage', language: 'es' });
+  await settle();
+  const second = env.provider.receive({ type: 'setLanguage', language: 'zh-CN' });
+  await settle();
+  assert.equal(env.latestState().language, 'zh-CN');
+  assert.equal(env.calls.writes.length, 1);
+  finishFirst();
+  await Promise.all([first, second]);
+  assert.equal(env.saved.get('language'), 'zh-CN');
+  assert.deepEqual(env.calls.languageChanged, ['zh-CN']);
+  assert.equal(env.latestState().resetDraft, false);
+  env.dispose();
+});
+
+test('failed language saving restores the saved choice and keeps feedback and media usable', async () => {
+  const env = harness({ state: { language: 'en', mediaPath: 'D:/saved.png' }, update: async () => { throw new Error('Storage unavailable'); } });
+  env.provider.notice = 'Keep notice';
+  await env.provider.receive({ type: 'setLanguage', language: 'es' });
+  assert.equal(env.latestState().language, 'en');
+  assert.match(env.latestState().error, /Storage unavailable/);
+  assert.equal(env.latestState().notice, 'Keep notice');
+  assert.equal(env.latestState().resetDraft, false);
+  assert.equal(env.latestState().busy, false);
+  assert.deepEqual(env.calls.languageChanged, ['en']);
+  assert.equal(env.calls.apply.length + env.calls.restore.length + env.calls.reload.length, 0);
+  env.dispose();
+});
+
+test('existing panel notices and errors change language without repeating an action', async () => {
+  const env = harness({ choose: 'D:/wallpaper.png' });
+  await env.provider.receive({ type: 'apply', config: DEFAULTS });
+  const englishError = env.latestState().error;
+  await env.provider.receive({ type: 'setLanguage', language: 'zh-CN' });
+  assert.equal(env.latestState().error, '请先选择一张图片或一段视频。');
+  assert.notEqual(env.latestState().error, englishError);
+  await env.provider.receive({ type: 'chooseMedia', kind: 'image' });
+  const chineseNotice = env.latestState().notice;
+  await env.provider.receive({ type: 'setLanguage', language: 'es' });
+  assert.notEqual(env.latestState().notice, chineseNotice);
+  assert.equal(env.calls.choose.length, 1);
+  assert.equal(env.calls.apply.length, 0);
+  assert.equal(env.latestState().media.name, 'wallpaper.png');
+  env.dispose();
+});
+
+test('failed Memento disk writes roll back its optimistic in-memory language', async () => {
+  const env = harness({ state: { language: 'zh-CN' }, optimisticState: true,
+    update: async (_key, language) => { if (language === 'es') throw new Error('Disk write failed'); } });
+  await env.provider.receive({ type: 'setLanguage', language: 'es' });
+  assert.equal(env.latestState().language, 'zh-CN');
+  assert.equal(env.saved.get('language'), 'zh-CN', 'native notifications must also read the restored choice');
+  assert.equal(env.latestState().resetDraft, false);
+  assert.match(env.latestState().error, /Disk write failed/);
+  await env.provider.receive({ type: 'setLanguage', language: 'en' });
+  assert.equal(env.latestState().language, 'en');
+  assert.equal(env.saved.get('language'), 'en');
+  assert.equal(env.latestState().error, null);
+  env.dispose();
+  // If an earlier queued choice succeeds, a later failure must also refresh
+  // native labels to that successful choice rather than leave the old locale.
+  const rapid = harness({ state: { language: 'en' }, optimisticState: true,
+    update: async (_key, language) => { if (language === 'zh-CN') throw new Error('Disk write failed'); } });
+  await Promise.all([
+    rapid.provider.receive({ type: 'setLanguage', language: 'es' }),
+    rapid.provider.receive({ type: 'setLanguage', language: 'zh-CN' }),
+  ]);
+  assert.equal(rapid.saved.get('language'), 'es');
+  assert.equal(rapid.latestState().language, 'es');
+  assert.deepEqual(rapid.calls.languageChanged, ['es']);
+  rapid.dispose();
 });
 
 test('disposed provider ignores later webview requests', async () => {

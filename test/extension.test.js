@@ -12,7 +12,7 @@ const extensionSource = fs.readFileSync(extensionFile, 'utf8');
 
 function harness(options = {}) {
   const handlers = new Map();
-  const state = new Map(Object.entries({ lastAppliedExtensionVersion: '0.2.0', ...(options.state || {}) }));
+  const state = new Map(Object.entries({ language: 'zh-CN', lastAppliedExtensionVersion: '0.2.0', ...(options.state || {}) }));
   const configuration = { ...(options.config || {}) };
   const timers = new Map();
   const calls = { apply: [], reapply: [], restore: [], status: [], open: [], warning: [], info: [], error: [], command: [], state: [], progress: [], log: [], configurationWrites: [], providers: [], statusBars: [] };
@@ -107,6 +107,7 @@ function harness(options = {}) {
       if (name === './config') return require('../src/config');
       if (name === './panel') return require('../src/panel');
       if (name === './updater') return require('../src/updater');
+      if (name === './localization') return require('../src/localization');
       return require(name);
     },
     setTimeout: options.captureTimers ? (callback, delay) => {
@@ -654,4 +655,100 @@ test('closing the background while startup inspection is pending prevents a stal
   await settle();
   assert.equal(env.calls.reapply.length, 0, 'an earlier startup snapshot must not undo the user closing the background');
   assert.equal(env.state.get('lastAppliedExtensionVersion'), '0.2.0');
+});
+
+test('an absent or unsupported language uses English for native controls and consent', async t => {
+  for (const language of [undefined, 'fr', { toString: () => 'es' }]) {
+    await t.test(String(language), async child => {
+      const env = harness({
+        state: { language }, files: [{ scheme: 'file', fsPath: 'D:/wallpaper.png' }],
+        consent: 'Enable Background', info: 'Reload Now'
+      });
+      child.after(() => env.dispose());
+      await env.run('selectImage');
+      assert.equal(env.calls.open[0].title, 'Choose a background image');
+      assert.equal(env.calls.open[0].openLabel, 'Use as Background');
+      assert.ok(env.calls.open[0].filters.Image);
+      assert.match(env.calls.warning[0][0], /needs to modify/);
+      assert.match(env.calls.warning[0][1].detail, /installation integrity warning/);
+      assert.equal(env.calls.statusBars[0].text, '$(color-mode) Frosted');
+      assert.equal(env.calls.progress[0].title, 'Applying Frosted Background…');
+      assert.equal(env.calls.apply.length, 1);
+      assert.deepEqual(env.calls.command, [['workbench.action.reloadWindow']]);
+    });
+  }
+});
+
+test('saved Spanish is used by native file dialogs, status and recovery notices', async t => {
+  const env = harness({
+    state: { language: 'es', injectionConsent: true },
+    files: [{ scheme: 'file', fsPath: 'D:/loop.webm' }]
+  });
+  t.after(() => env.dispose());
+  await env.run('selectVideo');
+  assert.match(env.calls.open[0].title, /Elige un vídeo de fondo/);
+  assert.equal(env.calls.open[0].openLabel, 'Usar como fondo');
+  assert.deepEqual(Array.from(env.calls.open[0].filters['Vídeo']), ['mp4', 'webm']);
+  assert.equal(env.calls.statusBars[0].tooltip, 'Abrir los controles del fondo');
+  await env.run('status');
+  assert.match(env.calls.info.at(-1)[0], /Fondo esmerilado: Aplicado; última selección: loop.webm/);
+  await env.run('restore');
+  assert.match(env.calls.info.at(-1)[0], /Se ha restaurado la interfaz original/);
+  assert.equal(env.calls.info.at(-1)[1], 'Recargar ahora');
+});
+
+test('changing the saved language refreshes status and update text without applying the background', async t => {
+  const env = harness({ state: { language: undefined, mediaPath: 'D:/wallpaper.png' } });
+  t.after(() => env.dispose());
+  const panel = attachPanel(env);
+  await panel.send({ type: 'ready' });
+  assert.match(panel.latest().update.message, /No GitHub release repository/);
+  await env.context.globalState.update('language', 'es');
+  env.calls.providers[0].provider.callbacks.onLanguageChanged();
+  await settle();
+  assert.equal(env.calls.statusBars[0].text, '$(color-mode) Fondo');
+  assert.match(panel.latest().update.message, /No se ha configurado/);
+  assert.equal(panel.latest().media.name, 'wallpaper.png');
+  assert.equal(env.calls.apply.length, 0);
+  assert.equal(env.calls.restore.length, 0);
+  assert.equal(env.calls.configurationWrites.length, 0);
+  assert.equal(env.calls.command.length, 0);
+  await env.run('selectImage');
+  assert.equal(env.calls.open[0].title, 'Elige una imagen de fondo');
+});
+
+test('common patch errors are translated while their technical details are retained', async t => {
+  const permission = harness({
+    state: { language: 'es', injectionConsent: true, mediaPath: 'D:/wallpaper.png' },
+    apply: async () => { throw Object.assign(new Error('Read-only installation'), { code: 'EACCES' }); }
+  });
+  t.after(() => permission.dispose());
+  await permission.run('apply');
+  assert.match(permission.calls.error[0][0], /No se puede escribir en la carpeta de instalación/);
+  assert.match(permission.calls.error[0][0], /Read-only installation/);
+  assert.equal(permission.calls.error[0][1], 'Ver registro');
+  const invalid = harness({
+    state: { language: undefined, injectionConsent: true, mediaPath: 'D:/wallpaper.png' },
+    apply: async () => { throw new Error('背景文件过大，请选择不超过 500 MB 的文件。'); }
+  });
+  t.after(() => invalid.dispose());
+  await invalid.run('apply');
+  assert.match(invalid.calls.error[0][0], /Choose a file no larger than 500 MB/);
+  assert.doesNotMatch(invalid.calls.error[0][0], /[\u3400-\u9fff]/);
+});
+
+test('a reload action already displayed remains valid after changing the language', async t => {
+  let choose;
+  const answer = new Promise(resolve => { choose = resolve; });
+  const env = harness({
+    state: { language: undefined, injectionConsent: true, mediaPath: 'D:/wallpaper.png' }, info: () => answer
+  });
+  t.after(() => env.dispose());
+  await env.run('apply');
+  assert.equal(env.calls.info[0][1], 'Reload Now');
+  await env.context.globalState.update('language', 'es');
+  env.calls.providers[0].provider.callbacks.onLanguageChanged();
+  choose('Reload Now');
+  await settle();
+  assert.deepEqual(env.calls.command, [['workbench.action.reloadWindow']]);
 });
