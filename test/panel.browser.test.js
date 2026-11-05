@@ -32,6 +32,166 @@ test('panel localization catalog covers markup and defaults to English without a
   assert.equal(t('en', '__proto__'), '__proto__');
 });
 
+test('live controls coalesce edits, preserve newer drafts across acknowledgements, and use one Apply action', {
+  skip: !process.env.PLAYWRIGHT_MODULE,
+  timeout: 30000,
+}, async () => {
+  const { chromium } = require(process.env.PLAYWRIGHT_MODULE);
+  const executablePath = process.env.BROWSER_EXECUTABLE || [
+    'C:/Program Files/Google/Chrome/Application/chrome.exe',
+    'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+  ].find(value => fs.existsSync(value));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'frosted-live-panel-test-'));
+  const fixtureFile = path.join(directory, 'panel.html');
+  fs.writeFileSync(fixtureFile, renderPanelHtml({
+    cspSource: 'file:', nonce: 'live-panel-test-nonce',
+    scriptUri: pathToFileURL(path.resolve(__dirname, '../media/panel.js')).href,
+    styleUri: pathToFileURL(path.resolve(__dirname, '../media/panel.css')).href,
+    i18nUri: pathToFileURL(path.resolve(__dirname, '../media/i18n.js')).href,
+  }));
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true, executablePath });
+    const page = await browser.newPage({ viewport: { width: 280, height: 620 } });
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.addInitScript(() => {
+      window.__messages = [];
+      window.__violations = [];
+      window.acquireVsCodeApi = () => ({
+        getState: () => window.__saved,
+        setState: value => { window.__saved = value; },
+        postMessage: value => window.__messages.push(value),
+      });
+      document.addEventListener('securitypolicyviolation', event => window.__violations.push(event.violatedDirective));
+    });
+    await page.goto(pathToFileURL(fixtureFile).href);
+    await page.clock.install({ time: new Date('2030-01-01T00:00:00Z') });
+    await page.clock.pauseAt(new Date('2030-01-01T00:01:00Z'));
+    const media = { kind: 'image', name: 'wallpaper.png', uri: pathToFileURL(path.resolve(__dirname, 'fixtures/wallpaper.png')).href };
+    let state = { type: 'state', language: 'en', config: { ...DEFAULTS }, defaults: DEFAULTS, media, enabled: true, busy: false, needsReload: false, liveEnabled: true, liveApplying: false, liveAck: 0, resetDraft: false, error: null, notice: null };
+    const sendState = async changes => {
+      state = { ...state, ...changes };
+      await page.evaluate(message => window.dispatchEvent(new MessageEvent('message', { data: message })), state);
+    };
+    const liveMessages = () => page.evaluate(() => window.__messages.filter(message => message.type === 'liveConfig'));
+    const changeBlur = async value => { await page.locator('#blur').fill(String(value)); await page.locator('#blur').dispatchEvent('input'); };
+    await sendState();
+    await changeBlur(20);
+    await page.clock.runFor(100);
+    await changeBlur(21);
+    await page.clock.runFor(100);
+    await changeBlur(22);
+    await page.clock.runFor(249);
+    assert.deepEqual(await liveMessages(), [], 'rapid edits wait for the full 250ms debounce');
+    await page.clock.runFor(1);
+    const first = (await liveMessages())[0];
+    assert.equal(first.requestId, 1);
+    assert.equal(first.config.blur, 22);
+    assert.equal(await page.locator('#blur').isEnabled(), true, 'an unacknowledged live request never disables sliders');
+    assert.equal(await page.locator('#apply').isEnabled(), false, 'manual Apply waits for the active live request');
+    assert.equal(await page.locator('#panel').getAttribute('aria-busy'), 'false');
+
+    await changeBlur(31);
+    await page.locator('input[name="fit"][value="fill"]').check();
+    await page.locator('#position').selectOption('center top');
+    await page.clock.runFor(250);
+    assert.equal((await liveMessages()).length, 1, 'a newer edit queues behind the unacknowledged request');
+    await sendState({ liveApplying: true, language: 'es' });
+    assert.equal(await page.locator('#blur').isEnabled(), true);
+    assert.equal(await page.locator('#blur').inputValue(), '31');
+    await page.locator('#language').selectOption('zh-CN');
+    assert.equal(await page.locator('#draft-label').textContent(), dictionaries['zh-CN']['正在自动应用最新效果…']);
+    await sendState({ language: 'zh-CN', liveApplying: false, liveAck: first.requestId, config: first.config, resetDraft: true });
+    const second = (await liveMessages())[1];
+    assert.equal(second.requestId, 2);
+    assert.equal(second.config.blur, 31);
+    assert.equal(second.config.fit, 'fill');
+    assert.equal(second.config.position, 'center top');
+    assert.equal(await page.locator('#blur').inputValue(), '31', 'the first acknowledgement cannot replace a newer draft');
+    assert.equal(await page.evaluate(() => window.__saved.dirty), true);
+    await sendState({ liveAck: first.requestId, config: first.config, resetDraft: true });
+    assert.equal(await page.locator('#blur').inputValue(), '31', 'a repeated older acknowledgement cannot reset the in-flight draft');
+    await sendState({ liveAck: second.requestId, config: second.config, resetDraft: true });
+    assert.equal(await page.evaluate(() => window.__saved.dirty), false);
+    assert.equal(await page.locator('#draft-label').textContent(), dictionaries['zh-CN']['效果调整会自动生效，无需点击应用。']);
+    await sendState({ liveAck: first.requestId, config: first.config, resetDraft: true });
+    assert.equal(await page.locator('#blur').inputValue(), '31', 'late snapshots cannot roll back an already-acknowledged draft');
+    await sendState({ liveAck: second.requestId, config: second.config, resetDraft: false });
+
+    await changeBlur(40);
+    await page.clock.runFor(250);
+    const third = (await liveMessages())[2];
+    await sendState({ liveAck: third.requestId, resetDraft: false, error: '<strong>Save failed</strong>' });
+    assert.equal(await page.locator('#blur').inputValue(), '40');
+    assert.equal(await page.evaluate(() => window.__saved.dirty), true);
+    assert.equal(await page.locator('#apply').isEnabled(), true);
+    assert.equal(await page.locator('#error strong').count(), 0);
+    for (const language of ['en', 'es', 'zh-CN']) {
+      await page.locator('#language').selectOption(language);
+      assert.equal(await page.locator('#draft-label').textContent(), dictionaries[language]['自动应用失败，请点击应用重试。']);
+      assert.equal(await page.locator('#apply-label').textContent(), dictionaries[language]['应用']);
+    }
+    await page.clock.runFor(1000);
+    assert.equal((await liveMessages()).length, 3, 'a failed request does not enter an automatic retry loop');
+    await page.locator('#apply').click();
+    assert.deepEqual(await page.evaluate(() => window.__messages.at(-1)), { type: 'apply', config: third.config, reloadAfterApply: true });
+    await sendState({ busy: false, config: third.config, resetDraft: true, error: null });
+
+    await page.locator('#opacity').fill('0.55');
+    await page.locator('#opacity').dispatchEvent('input');
+    await page.locator('#choose-image').click();
+    await page.clock.runFor(250);
+    assert.equal((await liveMessages()).length, 3, 'queued settings wait while the native file picker is open');
+    await sendState({ busy: false, resetDraft: false });
+    const fourth = (await liveMessages())[3];
+    assert.equal(fourth.config.opacity, 0.55, 'canceling the picker preserves the pending change for the existing background');
+    await sendState({ config: fourth.config, liveAck: fourth.requestId, resetDraft: true });
+    await page.locator('#opacity').fill('0.65');
+    await page.locator('#opacity').dispatchEvent('input');
+    await page.locator('#choose-video').click();
+    const choosing = await page.evaluate(() => window.__messages.at(-1));
+    assert.equal(choosing.type, 'chooseMedia');
+    assert.equal(choosing.kind, 'video');
+    assert.equal(choosing.config.opacity, 0.65, 'media selection applies the current full draft');
+    assert.equal(Object.keys(choosing.config).length, Object.keys(DEFAULTS).length);
+    await page.clock.runFor(1000);
+    assert.equal((await liveMessages()).length, 4, 'media selection holds the queued effect change until the picker returns');
+    assert.equal(await page.evaluate(() => window.__messages.filter(message => message.type === 'reload').length), 0, 'media selection never triggers an automatic reload');
+    await sendState({ config: choosing.config, resetDraft: true });
+    await page.clock.runFor(250);
+    assert.equal((await liveMessages()).length, 4, 'successful media selection consumes its matching queued change without duplicate writes');
+
+    await sendState({ liveEnabled: false, enabled: false, resetDraft: false, language: 'en' });
+    await changeBlur(12);
+    await page.clock.runFor(1000);
+    assert.equal((await liveMessages()).length, 4, 'first setup retains the manual fallback');
+    await page.locator('#apply').click();
+    const initialApply = await page.evaluate(() => window.__messages.at(-1));
+    assert.equal(initialApply.reloadAfterApply, true);
+    assert.equal(initialApply.config.blur, 12);
+    await sendState({ config: initialApply.config, enabled: true, needsReload: true, resetDraft: true });
+    assert.equal(await page.locator('#apply-label').textContent(), 'Apply');
+    assert.equal(await page.locator('#draft-label').textContent(), dictionaries.en['点击应用将重载窗口，完成背景设置。']);
+    assert.equal(await page.locator('#reload').count(), 0);
+    await page.locator('#apply').click();
+    assert.deepEqual(await page.evaluate(() => window.__messages.at(-1)), { type: 'reload' });
+
+    await sendState({ media: null, enabled: false, busy: false, update: { currentVersion: '0.7.0', pendingVersion: '0.8.0', mode: 'automatic' } });
+    assert.equal(await page.locator('#apply').isEnabled(), true, 'a prepared extension update can be applied without a background file');
+    assert.equal(await page.locator('#draft-label').textContent(), dictionaries.en['点击应用将重载窗口，完成插件更新。']);
+    await page.locator('#apply').click();
+    assert.deepEqual(await page.evaluate(() => window.__messages.at(-1)), { type: 'reload' });
+    assert.equal(await page.evaluate(() => window.__saved.liveRequestId), fourth.requestId, 'request IDs persist across webview recreation');
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    assert.deepEqual(await page.evaluate(() => window.__violations), []);
+    assert.deepEqual(errors, []);
+  } finally {
+    if (browser) await browser.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('sidebar previews drafts, sends explicit actions, and stays usable across widths and themes', {
   skip: !process.env.PLAYWRIGHT_MODULE,
   timeout: 30000,
@@ -95,7 +255,7 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     await page.locator('#blur').dispatchEvent('input');
     assert.equal(await page.locator('#blur-value').textContent(), '31 px');
     assert.match(await page.locator('#preview-media img').evaluate(el => getComputedStyle(el).filter), /blur\(10\.54px\)/);
-    assert.equal(await page.evaluate(() => window.__messages.filter(item => item.type === 'apply').length), 0, 'sliders only update the local preview');
+    assert.equal(await page.evaluate(() => window.__messages.filter(item => ['apply', 'liveConfig'].includes(item.type)).length), 0, 'before first setup, sliders update only the local preview');
     const savedDraft = await page.evaluate(() => window.__saved);
     await sendState({ busy: true });
     assert.equal(await page.getByRole('button', { name: '关闭控制面板' }).isEnabled(), true);
@@ -133,11 +293,12 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     assert.deepEqual(await page.evaluate(() => window.__messages.at(-1)), { type: 'setUpdateMode', mode: 'off' });
     await sendState({ update: { ...update, pendingVersion: '0.6.0' }, needsReload: true });
     assert.equal(await page.locator('#available-version').textContent(), 'v0.6.0 · 待重载');
-    assert.equal(await page.locator('#reload').isVisible(), true);
+    assert.equal(await page.locator('#reload').count(), 0, 'reload is combined into the primary Apply action');
+    assert.match(await page.locator('#draft-label').textContent(), /点击应用将重载窗口/);
     assert.equal(await page.locator('#blur').inputValue(), '31');
     await sendState({ update: null, needsReload: false });
     await page.locator('#choose-image').click();
-    assert.deepEqual(await page.evaluate(() => window.__messages.at(-1)), { type: 'chooseMedia', kind: 'image' });
+    assert.deepEqual(await page.evaluate(() => window.__messages.at(-1)), { type: 'chooseMedia', kind: 'image', config: savedDraft.draft });
     await sendState({ media: { ...media, name: '<img onerror=alert(1)>.png' } });
     assert.equal(await page.locator('#blur').inputValue(), '31', 'selecting a file preserves unsaved settings');
     assert.equal(await page.locator('#media-name').textContent(), '<img onerror=alert(1)>.png');
@@ -161,15 +322,16 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     await page.locator('#apply').click();
     const applying = await page.evaluate(() => window.__messages.at(-1));
     assert.equal(applying.type, 'apply');
+    assert.equal(applying.reloadAfterApply, true);
     assert.equal(applying.config.blur, 5);
     assert.equal(applying.config.fit, 'fill');
     assert.equal(applying.config.position, 'center top');
     assert.equal(Object.keys(applying.config).length, Object.keys(DEFAULTS).length);
     assert.equal(await page.locator('#apply').isEnabled(), false);
     await sendState({ config: applying.config, resetDraft: true, enabled: true, needsReload: true, notice: '背景已准备好，重载窗口后生效。' });
-    assert.equal(await page.locator('#draft-label').getAttribute('class'), 'draft-label');
-    assert.equal(await page.locator('#reload').isVisible(), true);
-    await page.locator('#reload').click();
+    assert.equal(await page.locator('#draft-label').getAttribute('class'), 'draft-label requires-reload');
+    assert.match(await page.locator('#draft-label').textContent(), /点击应用将重载窗口/);
+    await page.locator('#apply').click();
     assert.deepEqual(await page.evaluate(() => window.__messages.at(-1)), { type: 'reload' });
 
     await sendState({ resetDraft: false, needsReload: false, notice: null });
@@ -236,7 +398,7 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     await sendState({ busy: false, language: 'es', needsReload: true, enabled: true, update: { ...update, pendingVersion: '0.6.0' } });
     assert.equal(await page.locator('#available-version').textContent(), 'v0.6.0 · Recarga pendiente');
     assert.equal(await page.locator('#fit-description').textContent(), dictionaries.es['完整画面压缩到编辑区，不裁剪；可能改变比例']);
-    assert.equal(await page.locator('#status-text').textContent(), 'Recarga pendiente');
+    assert.equal(await page.locator('#status-text').textContent(), 'Aplicar para finalizar');
     await sendState({ notice: '<strong>Ajustes guardados</strong>', error: '<img onerror=alert(1)>Error externo' });
     assert.equal(await page.locator('#notice').textContent(), '<strong>Ajustes guardados</strong>');
     assert.equal(await page.locator('#error img, #notice strong').count(), 0, 'localized host feedback remains plain text');

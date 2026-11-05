@@ -11,7 +11,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 async function settle() { for (let index = 0; index < 5; index++) await tick(); }
 
 function harness(options = {}) {
-  const calls = { messages: [], choose: [], apply: [], restore: [], reload: [], closePanel: [], log: [], languageChanged: [], writes: [] };
+  const calls = { messages: [], choose: [], apply: [], live: [], restore: [], reload: [], closePanel: [], log: [], languageChanged: [], writes: [] };
   const saved = new Map(Object.entries(options.state || {}));
   let onMessage;
   let onDispose;
@@ -51,6 +51,14 @@ function harness(options = {}) {
   };
   const provider = new BackgroundPanel(vscode, context, {
     readConfig: () => ({ ...DEFAULTS, ...(options.config || {}) }),
+    isLiveEnabled: () => options.liveEnabled === true,
+    needsBootstrap: () => options.needsBootstrap === true,
+    liveConfig: async config => {
+      calls.live.push(clone(config));
+      if (options.liveConfig) return options.liveConfig(config);
+      options.config = config;
+      return { needsReload: false, resetDraft: true };
+    },
     chooseMedia: async kind => {
       calls.choose.push(kind);
       return typeof options.choose === 'function' ? options.choose(kind) : options.choose;
@@ -60,7 +68,7 @@ function harness(options = {}) {
       if (options.apply) return options.apply(mediaPath, config);
       saved.set('mediaPath', mediaPath);
       saved.set('enabled', true);
-      return { needsReload: true, notice: 'Applied' };
+      return { needsReload: true, noticeKey: '首次启用或升级后需要重载一次，之后更换背景和调整效果将自动生效。' };
     },
     restore: async () => {
       calls.restore.push(true);
@@ -116,18 +124,16 @@ test('applying cannot select a path supplied by webview content', async () => {
   env.dispose();
 });
 
-test('native file selection becomes the draft and apply passes only normalized visual settings', async () => {
+test('native file selection automatically applies only normalized visual settings', async () => {
   const file = 'D:/照片/background & spaces.png';
   const env = harness({ choose: file });
-  await env.send({ type: 'chooseMedia', kind: 'image', mediaPath: 'C:/ignored.png' });
-  assert.deepEqual(env.calls.choose, ['image']);
-  assert.equal(env.calls.apply.length, 0, 'choosing a file only updates the draft');
   await env.send({
-    type: 'apply', mediaPath: 'C:/ignored.png',
+    type: 'chooseMedia', kind: 'image', mediaPath: 'C:/ignored.png',
     config: { blur: 999, opacity: -1, fit: 'contain', brightness: NaN, position: 'url(evil)',
       source: 'https://example.com/video', mediaPath: 'C:/ignored.png', rendererPath: 'C:/injected.js',
       respectReducedMotion: false, pauseWhenUnfocused: 'false' }
   });
+  assert.deepEqual(env.calls.choose, ['image']);
   assert.deepEqual(env.calls.apply, [{ mediaPath: file, config: {
     ...DEFAULTS, blur: 60, opacity: 0.05, fit: 'contain', respectReducedMotion: false
   } }]);
@@ -150,8 +156,7 @@ test('stretch layout survives the panel host normalization for both media kinds'
   for (const kind of ['image', 'video']) {
     const mediaPath = kind === 'video' ? 'D:/stretch.webm' : 'D:/stretch.png';
     const env = harness({ choose: mediaPath });
-    await env.send({ type: 'chooseMedia', kind });
-    await env.send({ type: 'apply', config: { ...DEFAULTS, fit: 'fill', blur: 21, position: 'center bottom' } });
+    await env.send({ type: 'chooseMedia', kind, config: { ...DEFAULTS, fit: 'fill', blur: 21, position: 'center bottom' } });
     assert.deepEqual(env.calls.apply, [{ mediaPath, config: { ...DEFAULTS, fit: 'fill', blur: 21, position: 'center bottom' } }]);
     env.dispose();
   }
@@ -163,8 +168,7 @@ test('failed apply preserves selected draft for retry and releases the busy stat
     choose: 'D:/new.png', state: { mediaPath: 'D:/previous.png', enabled: true },
     apply: async () => { if (failure) throw new Error('Read-only installation'); return { needsReload: true }; }
   });
-  await env.send({ type: 'chooseMedia', kind: 'image' });
-  await env.send({ type: 'apply', config: { ...DEFAULTS, blur: 22 } });
+  await env.send({ type: 'chooseMedia', kind: 'image', config: { ...DEFAULTS, blur: 22 } });
   assert.equal(env.calls.apply.length, 1);
   assert.equal(env.saved.get('mediaPath'), 'D:/previous.png');
   assert.equal(env.calls.log.length, 1);
@@ -254,8 +258,7 @@ test('restore and reload call the dedicated host callbacks without accepting inj
 
 test('canceled consent keeps the selected draft and does not reset controls or request reload', async () => {
   const env = harness({ choose: 'D:/draft.png', apply: async () => ({ cancelled: true }) });
-  await env.send({ type: 'chooseMedia', kind: 'image' });
-  await env.send({ type: 'apply', config: { ...DEFAULTS, blur: 25 } });
+  await env.send({ type: 'chooseMedia', kind: 'image', config: { ...DEFAULTS, blur: 25 } });
   assert.equal(env.calls.apply.length, 1);
   assert.equal(env.latestState().media.name, 'draft.png');
   assert.equal(env.latestState().resetDraft, false);
@@ -352,7 +355,7 @@ test('existing panel notices and errors change language without repeating an act
   await env.provider.receive({ type: 'setLanguage', language: 'es' });
   assert.notEqual(env.latestState().notice, chineseNotice);
   assert.equal(env.calls.choose.length, 1);
-  assert.equal(env.calls.apply.length, 0);
+  assert.equal(env.calls.apply.length, 1);
   assert.equal(env.latestState().media.name, 'wallpaper.png');
   env.dispose();
 });
@@ -393,4 +396,113 @@ test('disposed provider ignores later webview requests', async () => {
   assert.equal(env.calls.choose.length, 0);
   assert.equal(env.calls.apply.length, 0);
   assert.equal(env.calls.restore.length, 0);
+});
+
+test('the combined Apply action reloads only after a successful bootstrap apply', async () => {
+  for (const result of [{ needsReload: true }, { needsReload: false }, { cancelled: true }, { needsReload: true, resetDraft: false }]) {
+    const env = harness({ state: { mediaPath: 'D:/saved.png' }, apply: async () => result });
+    await env.send({ type: 'apply', config: DEFAULTS, reloadAfterApply: true });
+    assert.equal(env.calls.reload.length, result.needsReload && !result.cancelled && result.resetDraft !== false ? 1 : 0);
+    env.dispose();
+  }
+  const env = harness({ state: { mediaPath: 'D:/saved.png' }, apply: async () => { throw new Error('Disk failure'); } });
+  await env.send({ type: 'apply', config: DEFAULTS, reloadAfterApply: true });
+  assert.equal(env.calls.reload.length, 0);
+  assert.match(env.latestState().error, /Disk failure/);
+  env.dispose();
+});
+
+test('live settings are acknowledged, normalized, and never trigger media copies or reloads', async () => {
+  const env = harness({ liveEnabled: true, state: { mediaPath: 'D:/saved.png', enabled: true } });
+  await env.send({ type: 'liveConfig', requestId: 1, config: { blur: 999, source: 'https://example.test/a', fit: 'fill' } });
+  assert.deepEqual(env.calls.live, [{ ...DEFAULTS, blur: 60, fit: 'fill' }]);
+  assert.equal(env.latestState().liveAck, 1);
+  assert.equal(env.latestState().liveApplying, false);
+  assert.equal(env.latestState().resetDraft, true);
+  assert.equal(env.calls.apply.length + env.calls.reload.length, 0);
+  await env.send({ type: 'liveConfig', requestId: 1, config: DEFAULTS });
+  await env.send({ type: 'liveConfig', requestId: NaN, config: DEFAULTS });
+  await env.send({ type: 'liveConfig', requestId: 2, config: [] });
+  assert.equal(env.calls.live.length, 1);
+  env.dispose();
+});
+
+test('live settings stay serialized and media selection waits for the active write', async () => {
+  let release;
+  const events = [];
+  const env = harness({ liveEnabled: true, state: { mediaPath: 'D:/saved.png', enabled: true },
+    liveConfig: async () => { events.push('live start'); await new Promise(resolve => { release = resolve; }); events.push('live end'); return { needsReload: false }; },
+    choose: () => { events.push('choose'); return 'D:/new.webm'; }
+  });
+  const write = env.provider.receive({ type: 'liveConfig', requestId: 1, config: { ...DEFAULTS, blur: 22 } });
+  await settle();
+  assert.equal(env.latestState().busy, false);
+  assert.equal(env.latestState().liveApplying, true);
+  await env.provider.receive({ type: 'closePanel' });
+  assert.equal(env.calls.closePanel.length, 1);
+  const choose = env.provider.receive({ type: 'chooseMedia', kind: 'video', config: { ...DEFAULTS, blur: 25 } });
+  await settle();
+  assert.deepEqual(events, ['live start']);
+  release();
+  await Promise.all([write, choose]);
+  assert.deepEqual(events, ['live start', 'live end', 'choose']);
+  assert.equal(env.calls.apply[0].config.blur, 25);
+  assert.equal(env.latestState().liveAck, 1);
+  env.dispose();
+});
+
+test('failed live writes acknowledge without clearing the draft and permit a later retry', async () => {
+  let fail = true;
+  const env = harness({ liveEnabled: true, state: { mediaPath: 'D:/saved.png', enabled: true }, liveConfig: async () => {
+    if (fail) throw new Error('Disk full');
+    return { needsReload: false, resetDraft: true };
+  } });
+  await env.send({ type: 'liveConfig', requestId: 4, config: { blur: 20 } });
+  assert.equal(env.latestState().liveAck, 4);
+  assert.equal(env.latestState().resetDraft, false);
+  assert.match(env.latestState().error, /Disk full/);
+  fail = false;
+  await env.send({ type: 'liveConfig', requestId: 5, config: { blur: 28 } });
+  assert.equal(env.latestState().liveAck, 5);
+  assert.equal(env.latestState().error, null);
+  assert.equal(env.calls.live.length, 2);
+  env.dispose();
+});
+
+test('a failed new media selection cannot live-edit the previous background through its draft', async () => {
+  const env = harness({ liveEnabled: true, choose: 'D:/bad.webm', state: { mediaPath: 'D:/saved.png', enabled: true }, apply: async () => { throw new Error('Copy failed'); } });
+  await env.send({ type: 'chooseMedia', kind: 'video', config: DEFAULTS });
+  assert.equal(env.latestState().liveEnabled, false);
+  await env.send({ type: 'liveConfig', requestId: 1, config: { blur: 28 } });
+  assert.equal(env.calls.live.length, 0);
+  assert.equal(env.latestState().liveAck, 1);
+  assert.equal(env.latestState().resetDraft, false);
+  env.dispose();
+});
+
+test('failed reselection of the same source path also blocks live edits until retry succeeds', async () => {
+  let fail = true;
+  const env = harness({ liveEnabled: true, choose: 'D:/saved.png', state: { mediaPath: 'D:/saved.png', enabled: true }, apply: async () => {
+    if (fail) throw new Error('Copy failed');
+    return { needsReload: false };
+  } });
+  await env.send({ type: 'chooseMedia', kind: 'image', config: DEFAULTS });
+  assert.equal(env.latestState().liveEnabled, false);
+  await env.send({ type: 'liveConfig', requestId: 1, config: { blur: 28 } });
+  assert.equal(env.calls.live.length, 0);
+  fail = false;
+  await env.send({ type: 'apply', config: DEFAULTS });
+  assert.equal(env.latestState().liveEnabled, true);
+  env.dispose();
+});
+
+test('foreground success clears an earlier live-write conflict from the same message turn', async () => {
+  const env = harness({ liveEnabled: true, choose: 'D:/new.png', state: { mediaPath: 'D:/saved.png', enabled: true } });
+  const live = env.provider.receive({ type: 'liveConfig', requestId: 1, config: { blur: 28 } });
+  const choose = env.provider.receive({ type: 'chooseMedia', kind: 'image', config: { ...DEFAULTS, blur: 28 } });
+  await Promise.all([live, choose]);
+  assert.equal(env.calls.apply.length, 1);
+  assert.equal(env.latestState().error, null);
+  assert.equal(env.latestState().liveAck, 1);
+  env.dispose();
 });

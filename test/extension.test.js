@@ -15,7 +15,7 @@ function harness(options = {}) {
   const state = new Map(Object.entries({ language: 'zh-CN', lastAppliedExtensionVersion: '0.2.0', ...(options.state || {}) }));
   const configuration = { ...(options.config || {}) };
   const timers = new Map();
-  const calls = { apply: [], reapply: [], restore: [], status: [], open: [], warning: [], info: [], error: [], command: [], state: [], progress: [], log: [], configurationWrites: [], providers: [], statusBars: [] };
+  const calls = { apply: [], reapply: [], updateConfig: [], restore: [], status: [], open: [], warning: [], info: [], error: [], command: [], state: [], progress: [], log: [], configurationWrites: [], providers: [], statusBars: [] };
   const uri = file => ({ scheme: 'file', fsPath: file, path: file.replace(/\\/g, '/'), toString: () => 'file:///' + file.replace(/\\/g, '/') });
   const context = {
     subscriptions: [],
@@ -28,6 +28,11 @@ function harness(options = {}) {
     }
   };
   const patcher = {
+    updateConfig: async data => {
+      calls.updateConfig.push(data);
+      if (options.updateConfig) return options.updateConfig(data);
+      return { workbenchPath: 'test/workbench.html', liveProtocol: 1 };
+    },
     apply: async data => {
       calls.apply.push(data);
       if (options.apply) return options.apply(data);
@@ -46,7 +51,7 @@ function harness(options = {}) {
     status: async data => {
       calls.status.push(data);
       if (options.status) return options.status(data);
-      return { installed: options.installed ?? true, workbenchPath: 'test/workbench.html' };
+      return { installed: options.installed ?? true, liveProtocol: options.liveProtocol, workbenchPath: 'test/workbench.html' };
     }
   };
   const vscode = {
@@ -55,7 +60,7 @@ function harness(options = {}) {
     StatusBarAlignment: { Left: 1, Right: 2 },
     ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
     version: '1.144.1',
-    env: { uiKind: options.web ? 2 : 1, appRoot: 'test/app-root' },
+    env: { uiKind: options.web ? 2 : 1, appRoot: 'test/app-root', sessionId: options.sessionId || 'test-window-session' },
     Uri: { file: uri, joinPath: (base, ...segments) => uri(path.join(base.fsPath, ...segments)) },
     commands: {
       registerCommand: (name, callback) => { handlers.set(name, callback); return { dispose() {} }; },
@@ -129,6 +134,103 @@ function harness(options = {}) {
 
 async function settle() { for (let index = 0; index < 5; index++) await new Promise(resolve => setImmediate(resolve)); }
 
+test('a loaded live renderer applies new media and settings without reload or repeated media copies', async () => {
+  const env = harness({ version: '0.7.0', liveProtocol: 1, captureTimers: true,
+    files: [{ scheme: 'file', fsPath: 'D:/new.webm' }],
+    state: { enabled: true, mediaPath: 'D:/old.png', injectionConsent: true, lastAppliedExtensionVersion: '0.7.0' }
+  });
+  const panel = attachPanel(env);
+  await settle();
+  await panel.send({ type: 'chooseMedia', kind: 'video', config: { ...DEFAULTS, blur: 25 } });
+  assert.equal(env.calls.apply.length, 1);
+  assert.equal(panel.latest().needsReload, false);
+  assert.equal(panel.latest().liveEnabled, true);
+  await panel.send({ type: 'liveConfig', requestId: 1, config: { ...DEFAULTS, blur: 30, fit: 'fill' } });
+  assert.equal(env.calls.updateConfig.length, 1);
+  assert.equal(env.calls.updateConfig[0].config.blur, 30);
+  assert.equal(env.calls.apply.length, 1);
+  assert.equal(env.configuration.blur, 30);
+  assert.equal(panel.latest().liveAck, 1);
+  assert.equal(env.calls.command.length, 0);
+  assert.equal(env.calls.info.length, 0);
+  await panel.send({ type: 'restore' });
+  assert.equal(panel.latest().needsReload, false);
+  assert.equal(panel.latest().liveEnabled, false);
+  assert.equal(env.calls.command.length, 0);
+  env.dispose();
+});
+
+test('publishing a live bootstrap cannot mark the running legacy window ready before reload', async () => {
+  const env = harness({ version: '0.7.0', liveProtocol: undefined, captureTimers: true,
+    state: { enabled: true, mediaPath: 'D:/old.png', injectionConsent: true, lastAppliedExtensionVersion: '0.7.0' }
+  });
+  const panel = attachPanel(env);
+  await settle();
+  await panel.send({ type: 'apply', config: DEFAULTS });
+  assert.equal(panel.latest().needsReload, true);
+  assert.equal(panel.latest().liveEnabled, false);
+  await panel.send({ type: 'liveConfig', requestId: 1, config: { blur: 24 } });
+  assert.equal(env.calls.updateConfig.length, 0);
+  assert.equal(panel.latest().liveAck, 1);
+  await panel.send({ type: 'apply', config: DEFAULTS, reloadAfterApply: true });
+  assert.deepEqual(env.calls.command, [['workbench.action.reloadWindow']]);
+  env.dispose();
+});
+
+test('live settings save failures keep retry feedback without asking for reload', async () => {
+  const env = harness({ version: '0.7.0', liveProtocol: 1, captureTimers: true,
+    state: { enabled: true, mediaPath: 'D:/saved.png', injectionConsent: true, lastAppliedExtensionVersion: '0.7.0' },
+    updateConfiguration: async () => { throw new Error('Settings locked'); }
+  });
+  const panel = attachPanel(env);
+  await settle();
+  await panel.send({ type: 'liveConfig', requestId: 7, config: { ...DEFAULTS, blur: 29 } });
+  assert.equal(env.calls.updateConfig.length, 1);
+  assert.equal(panel.latest().needsReload, false);
+  assert.equal(panel.latest().resetDraft, false);
+  assert.equal(panel.latest().liveAck, 7);
+  assert.match(panel.latest().error, /Settings locked/);
+  assert.equal(env.calls.command.length, 0);
+  env.dispose();
+});
+
+test('extension-host restart keeps the bootstrap requirement until the workbench session changes', async () => {
+  const before = harness({ version: '0.7.0', liveProtocol: undefined, captureTimers: true, sessionId: 'window-before-reload',
+    state: { enabled: true, mediaPath: 'D:/saved.png', injectionConsent: true, lastAppliedExtensionVersion: '0.7.0' } });
+  const panel = attachPanel(before);
+  await settle();
+  await panel.send({ type: 'apply', config: DEFAULTS });
+  const saved = Object.fromEntries(before.state);
+  assert.equal(saved['bootstrapRequired:window-before-reload'], true);
+  before.dispose();
+  for (const [sessionId, ready] of [['window-before-reload', false], ['window-after-reload', true]]) {
+    const next = harness({ version: '0.7.0', liveProtocol: 1, captureTimers: true, sessionId, state: saved });
+    const nextPanel = attachPanel(next);
+    await settle();
+    await nextPanel.send({ type: 'ready' });
+    assert.equal(nextPanel.latest().liveEnabled, ready);
+    assert.equal(nextPanel.latest().needsReload, !ready);
+    assert.equal(next.calls.command.length, 0);
+    next.dispose();
+  }
+});
+
+test('a window opened while disabled still requires reload after another window enables the bootstrap', async () => {
+  const before = harness({ version: '0.7.0', captureTimers: true, sessionId: 'previously-disabled-window', state: { enabled: false } });
+  await settle();
+  const saved = Object.fromEntries(before.state);
+  assert.equal(saved['bootstrapRequired:previously-disabled-window'], true);
+  before.dispose();
+  const restarted = harness({ version: '0.7.0', liveProtocol: 1, captureTimers: true, sessionId: 'previously-disabled-window',
+    state: { ...saved, enabled: true, injectionConsent: true, mediaPath: 'D:/saved.png', lastAppliedExtensionVersion: '0.7.0' } });
+  const panel = attachPanel(restarted);
+  await settle();
+  await panel.send({ type: 'ready' });
+  assert.equal(panel.latest().liveEnabled, false);
+  assert.equal(panel.latest().needsReload, true);
+  restarted.dispose();
+});
+
 function attachPanel(env) {
   let receive;
   const messages = [];
@@ -158,7 +260,7 @@ test('canceling either file picker never patches or requests first-use consent',
       assert.equal(env.calls.open.length, 1);
       assert.equal(env.calls.apply.length, 0);
       assert.equal(env.calls.warning.length, 0);
-      assert.equal(env.calls.state.length, 0);
+      assert.equal(env.calls.state.filter(([key]) => !key.startsWith('bootstrapRequired:')).length, 0);
       env.dispose();
     }
   }
@@ -231,7 +333,7 @@ test('failed restore keeps enabled state so the user can retry recovery', async 
   await env.run('restore');
   assert.equal(env.calls.restore.length, 1);
   assert.equal(env.state.get('enabled'), true);
-  assert.equal(env.calls.state.length, 0);
+  assert.equal(env.calls.state.filter(([key]) => !key.startsWith('bootstrapRequired:')).length, 0);
   assert.equal(env.calls.error.length, 1);
   assert.equal(env.calls.command.length, 0);
   env.dispose();
@@ -364,9 +466,7 @@ test('panel apply patches once, saves only known global settings and suppresses 
     state: { injectionConsent: true, enabled: true, mediaPath: 'D:/previous.png' }
   });
   const panel = attachPanel(env);
-  await panel.send({ type: 'chooseMedia', kind: 'image' });
-  assert.equal(env.calls.apply.length, 0);
-  await panel.send({ type: 'apply', mediaPath: 'C:/ignored.png', config: { ...DEFAULTS, blur: 22, opacity: 0.6, source: 'file:///C:/injected.js' } });
+  await panel.send({ type: 'chooseMedia', kind: 'image', mediaPath: 'C:/ignored.png', config: { ...DEFAULTS, blur: 22, opacity: 0.6, source: 'file:///C:/injected.js' } });
   assert.equal(env.calls.apply.length, 1);
   assert.equal(env.calls.progress.length, 1);
   assert.equal(env.calls.apply[0].mediaPath, file);
@@ -393,8 +493,7 @@ test('panel patch failures preserve previous applied state, selected draft and s
     apply: async () => { throw new Error('Write failed'); }
   });
   const panel = attachPanel(env);
-  await panel.send({ type: 'chooseMedia', kind: 'image' });
-  await panel.send({ type: 'apply', config: { ...DEFAULTS, blur: 24 } });
+  await panel.send({ type: 'chooseMedia', kind: 'image', config: { ...DEFAULTS, blur: 24 } });
   assert.equal(env.calls.apply.length, 1);
   assert.equal(env.calls.configurationWrites.length, 0);
   assert.equal(env.state.get('mediaPath'), 'D:/previous.png');

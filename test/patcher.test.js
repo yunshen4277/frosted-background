@@ -3,6 +3,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
+const nativeFs = require('node:fs');
+const crypto = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
 const patcher = require('../src/patcher');
@@ -100,10 +102,13 @@ test('config is HTML-escaped and authoritative source cannot be overridden', asy
   await patcher.apply({ ...data, config: { label: tricky, source: 'https://example.com/x', kind: 'video', enabled: false } });
   const html = await fs.readFile(data.workbenchPath, 'utf8');
   assert.equal(html.includes('<script>alert'), false);
-  assert.equal(decodeConfig(html).label, tricky);
+  assert.equal(decodeConfig(html).label, undefined, 'only supported normalized configuration is persisted');
   assert.equal(decodeConfig(html).kind, 'image');
   assert.equal(decodeConfig(html).enabled, true);
   assert.equal(decodeConfig(html).source.includes('https:'), false);
+  const escaped = patcher.inject(ORIGINAL, 'renderer-test.js', { label: tricky });
+  assert.equal(escaped.includes('<script>alert'), false);
+  assert.equal(decodeConfig(escaped).label, tricky, 'the injection writer still escapes every JSON attribute value');
 });
 
 test('video uses an owned standalone player without altering the workbench CSP', async t => {
@@ -339,4 +344,312 @@ test('explicit cached reapply settings are normalized and cannot replace the med
   assert.equal(updated.blur, 60);
   assert.equal(updated.position, 'center center');
   assert.equal(updated.source, previous.source);
+});
+
+function assetDirectory(data) {
+  return path.join(path.dirname(data.workbenchPath), patcher.ASSET_DIRECTORY);
+}
+
+function livePath(data) {
+  return path.join(assetDirectory(data), patcher.LIVE_STATE_FILE);
+}
+
+async function liveState(data) {
+  return JSON.parse(await fs.readFile(livePath(data), 'utf8'));
+}
+
+test('apply publishes an authoritative live envelope and a new revision without changing the CSP', async t => {
+  const data = await fixture(t);
+  const result = await patcher.apply({ ...data, config: { ...data.config, liveState: 'https://example.com/state.json' } });
+  assert.equal(result.liveProtocol, 1);
+  const html = await fs.readFile(data.workbenchPath, 'utf8');
+  const payload = decodeConfig(html);
+  const first = await liveState(data);
+  assert.equal(payload.liveState, './frosted-background-assets/live-state.json');
+  assert.equal(first.protocol, 1);
+  assert.match(first.revision, /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+  assert.deepEqual(first.settings, payload);
+  assert.deepEqual(Object.fromEntries(Object.keys(DEFAULTS).map(key => [key, payload[key]])), { ...DEFAULTS, ...data.config }, 'partial caller configuration becomes a complete normalized live payload');
+  assert.equal(patcher.stripInjection(html), ORIGINAL);
+  assert.equal((await patcher.status(data)).liveProtocol, 1);
+  await patcher.apply({ ...data, config: { ...data.config, liveState: 'https://example.com/state.json' } });
+  const second = await liveState(data);
+  assert.notEqual(second.revision, first.revision);
+  assert.deepEqual(second.settings, first.settings);
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), html);
+});
+
+test('updating image configuration never reads, hashes or copies cached media and preserves the source', async t => {
+  const data = await fixture(t);
+  await patcher.apply({ ...data, config: { ...DEFAULTS, opacity: 0.61, fit: 'contain' } });
+  const before = await liveState(data);
+  const beforeHtml = await fs.readFile(data.workbenchPath, 'utf8');
+  const names = (await fs.readdir(assetDirectory(data))).sort();
+  const mediaPath = path.join(path.dirname(data.workbenchPath), before.settings.source);
+  await fs.unlink(data.mediaPath);
+  const read = fs.readFile;
+  t.mock.method(fs, 'readFile', async (filename, ...args) => {
+    assert.notEqual(String(filename), mediaPath, 'configuration changes must not read the cached media');
+    return read(filename, ...args);
+  });
+  t.mock.method(nativeFs, 'createReadStream', () => assert.fail('configuration changes must not stream media'));
+  t.mock.method(fs, 'copyFile', () => assert.fail('configuration changes must not copy media'));
+  t.mock.method(crypto, 'createHash', () => assert.fail('configuration changes must not hash media'));
+  const result = await patcher.updateConfig({ appRoot: data.appRoot, config: { blur: 200, source: 'https://example.com/evil.mp4', kind: 'video', enabled: false, liveState: '../evil.json', videoPlayer: '../evil.html', unknown: 1 } });
+  assert.equal(result.liveProtocol, 1);
+  const after = await liveState(data);
+  const afterHtml = await fs.readFile(data.workbenchPath, 'utf8');
+  assert.notEqual(after.revision, before.revision);
+  assert.equal(after.settings.source, before.settings.source);
+  assert.equal(after.settings.kind, 'image');
+  assert.equal(after.settings.enabled, true);
+  assert.equal(after.settings.liveState, patcher.LIVE_STATE_SOURCE);
+  assert.equal(after.settings.videoPlayer, undefined);
+  assert.equal(after.settings.unknown, undefined);
+  assert.equal(after.settings.blur, 60);
+  assert.equal(after.settings.opacity, 0.61);
+  assert.equal(after.settings.fit, 'contain');
+  assert.deepEqual(after.settings, decodeConfig(afterHtml));
+  assert.equal(/src="([^"]+)" data-frosted-config/.exec(afterHtml)[1], /src="([^"]+)" data-frosted-config/.exec(beforeHtml)[1]);
+  assert.deepEqual((await fs.readdir(assetDirectory(data))).sort(), names);
+  assert.equal(patcher.stripInjection(afterHtml), ORIGINAL);
+});
+
+test('video parameter updates validate the player files while leaving the video and player identity unchanged', async t => {
+  const data = await fixture(t);
+  const video = path.join(data.appRoot, 'clip.mp4');
+  await fs.writeFile(video, 'video fixture');
+  await patcher.apply({ ...data, mediaPath: video, config: { ...DEFAULTS, playbackRate: 1 } });
+  const before = await liveState(data);
+  const cachedVideo = path.join(path.dirname(data.workbenchPath), before.settings.source);
+  await fs.unlink(video);
+  const read = fs.readFile;
+  t.mock.method(fs, 'readFile', async (filename, ...args) => {
+    assert.notEqual(String(filename), cachedVideo);
+    return read(filename, ...args);
+  });
+  t.mock.method(nativeFs, 'createReadStream', () => assert.fail('video updates must not open the media stream'));
+  await patcher.updateConfig({ appRoot: data.appRoot, config: { playbackRate: 1.75, blur: 3, fit: 'fill' } });
+  const updated = await liveState(data);
+  assert.equal(updated.settings.source, before.settings.source);
+  assert.equal(updated.settings.videoPlayer, before.settings.videoPlayer);
+  assert.equal(updated.settings.playbackRate, 1.75);
+  assert.equal(updated.settings.fit, 'fill');
+  const page = await fs.readFile(path.join(path.dirname(data.workbenchPath), updated.settings.videoPlayer), 'utf8');
+  const playerName = /src="\.\/(video-player-[a-f0-9]{64}\.js)"/.exec(page)[1];
+  await fs.unlink(path.join(assetDirectory(data), playerName));
+  const html = await fs.readFile(data.workbenchPath, 'utf8');
+  await assert.rejects(patcher.updateConfig({ appRoot: data.appRoot, config: { blur: 10 } }), { code: 'ENOENT' });
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), html);
+  assert.deepEqual(await liveState(data), updated);
+  assert.equal((await patcher.status(data)).liveProtocol, undefined);
+});
+
+test('legacy cached backgrounds gain the live protocol only after a renderer reapply', async t => {
+  const data = await fixture(t);
+  await patcher.apply({ ...data, config: { ...DEFAULTS, blur: 23, fit: 'fill' } });
+  const html = await fs.readFile(data.workbenchPath, 'utf8');
+  const previous = decodeConfig(html);
+  delete previous.liveState;
+  await fs.writeFile(data.workbenchPath, replaceConfig(html, previous));
+  await fs.unlink(livePath(data));
+  await fs.unlink(data.mediaPath);
+  assert.equal((await patcher.status(data)).installed, true);
+  assert.equal((await patcher.status(data)).liveProtocol, undefined);
+  await assert.rejects(patcher.updateConfig({ appRoot: data.appRoot, config: { blur: 10 } }), /尚不支持实时调整/);
+  const result = await patcher.reapply({ appRoot: data.appRoot, rendererPath: data.rendererPath });
+  assert.equal(result.liveProtocol, 1);
+  assert.equal((await patcher.status(data)).liveProtocol, 1);
+  const live = await liveState(data);
+  assert.equal(live.settings.source, previous.source);
+  assert.equal(live.settings.blur, 23);
+  assert.equal(live.settings.fit, 'fill');
+  assert.equal(live.settings.liveState, patcher.LIVE_STATE_SOURCE);
+});
+
+test('failed live publication restores HTML and keeps the previous envelope and assets', async t => {
+  const data = await fixture(t);
+  await patcher.apply(data);
+  const htmlBefore = await fs.readFile(data.workbenchPath, 'utf8');
+  const liveBefore = await fs.readFile(livePath(data), 'utf8');
+  const namesBefore = (await fs.readdir(assetDirectory(data))).sort();
+  await fs.writeFile(data.mediaPath, 'new image data');
+  const rename = fs.rename;
+  t.mock.method(fs, 'rename', async (from, to) => {
+    if (to === livePath(data)) throw Object.assign(new Error('simulated live-state permission failure'), { code: 'EPERM' });
+    return rename(from, to);
+  });
+  await assert.rejects(patcher.apply(data), /无法写入/);
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), htmlBefore);
+  assert.equal(await fs.readFile(livePath(data), 'utf8'), liveBefore);
+  assert.deepEqual((await fs.readdir(assetDirectory(data))).sort(), namesBefore);
+  await assert.rejects(patcher.updateConfig({ appRoot: data.appRoot, config: { blur: 50 } }), /无法写入/);
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), htmlBefore);
+  assert.equal(await fs.readFile(livePath(data), 'utf8'), liveBefore);
+  assert.deepEqual((await fs.readdir(assetDirectory(data))).sort(), namesBefore);
+});
+
+test('failed first live publication restores the original workbench and removes unreferenced staged assets', async t => {
+  const data = await fixture(t);
+  const rename = fs.rename;
+  t.mock.method(fs, 'rename', async (from, to) => {
+    if (to === livePath(data)) throw new Error('cannot publish live state');
+    return rename(from, to);
+  });
+  await assert.rejects(patcher.apply(data), /cannot publish/);
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
+  await assert.rejects(fs.access(livePath(data)), { code: 'ENOENT' });
+  assert.ok((await fs.readdir(assetDirectory(data))).every(name => name === '.owner.json' || /^backup-[a-f0-9]{64}\.html$/.test(name)));
+});
+
+test('a failed HTML rollback never deletes assets still referenced by the persisted workbench', async t => {
+  const data = await fixture(t);
+  await patcher.apply(data);
+  const liveBefore = await fs.readFile(livePath(data), 'utf8');
+  const oldPayload = JSON.parse(liveBefore).settings;
+  await fs.writeFile(data.mediaPath, 'new asset that must survive');
+  const rename = fs.rename;
+  let htmlWrites = 0;
+  t.mock.method(fs, 'rename', async (from, to) => {
+    if (to === livePath(data)) throw new Error('live commit failed');
+    if (to === data.workbenchPath && ++htmlWrites === 2) throw new Error('HTML rollback failed');
+    return rename(from, to);
+  });
+  await assert.rejects(patcher.apply(data), error => error.message === 'live commit failed' && error.rollbackError?.message === 'HTML rollback failed');
+  const current = decodeConfig(await fs.readFile(data.workbenchPath, 'utf8'));
+  assert.notEqual(current.source, oldPayload.source);
+  assert.equal(await fs.readFile(path.join(path.dirname(data.workbenchPath), current.source), 'utf8'), 'new asset that must survive');
+  await fs.access(path.join(path.dirname(data.workbenchPath), oldPayload.source));
+  assert.equal(await fs.readFile(livePath(data), 'utf8'), liveBefore);
+  assert.equal((await patcher.status(data)).liveProtocol, undefined, 'mismatched documents do not advertise live capability');
+});
+
+test('live publication rollback preserves an external workbench edit and its referenced assets', async t => {
+  const data = await fixture(t);
+  await patcher.apply(data);
+  await fs.writeFile(data.mediaPath, 'changed image fixture');
+  const rename = fs.rename;
+  t.mock.method(fs, 'rename', async (from, to) => {
+    if (to === livePath(data)) {
+      const current = await fs.readFile(data.workbenchPath, 'utf8');
+      await fs.writeFile(data.workbenchPath, current.replace('<body>', '<body data-foreign="keep">'));
+      throw new Error('simulated external race');
+    }
+    return rename(from, to);
+  });
+  await assert.rejects(patcher.apply(data), error => error.message === 'simulated external race' && /其他程序修改/.test(error.rollbackError?.message));
+  const html = await fs.readFile(data.workbenchPath, 'utf8');
+  assert.match(html, /data-foreign="keep"/);
+  assert.equal(await fs.readFile(path.join(path.dirname(data.workbenchPath), decodeConfig(html).source), 'utf8'), 'changed image fixture');
+});
+
+test('restore commits a retained disabled tombstone before deleting any owned media', async t => {
+  const data = await fixture(t);
+  await patcher.apply(data);
+  const before = await liveState(data);
+  const unlink = fs.unlink;
+  let inspected = false;
+  t.mock.method(fs, 'unlink', async filename => {
+    if (/^media-[a-f0-9]{64}\./.test(path.basename(filename))) {
+      inspected = true;
+      assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
+      assert.deepEqual((await liveState(data)).settings, { enabled: false });
+    }
+    return unlink(filename);
+  });
+  const result = await patcher.restore(data);
+  assert.equal(result.liveProtocol, 1);
+  assert.equal(inspected, true);
+  const tombstone = await liveState(data);
+  assert.equal(tombstone.protocol, 1);
+  assert.notEqual(tombstone.revision, before.revision);
+  assert.deepEqual(tombstone.settings, { enabled: false });
+  assert.equal((await patcher.status(data)).installed, false);
+  assert.equal((await patcher.status(data)).liveProtocol, undefined);
+  assert.equal((await patcher.restore(data)).liveProtocol, 1);
+  await assert.rejects(patcher.updateConfig({ appRoot: data.appRoot, config: { blur: 5 } }), /没有可复用/);
+  await patcher.apply(data);
+  assert.equal((await liveState(data)).settings.enabled, true, 'the stable channel supports re-enabling after restore');
+});
+
+test('failed restore tombstone publication rolls back HTML and never cleans referenced assets', async t => {
+  const data = await fixture(t);
+  await patcher.apply(data);
+  const html = await fs.readFile(data.workbenchPath, 'utf8');
+  const live = await fs.readFile(livePath(data), 'utf8');
+  const names = (await fs.readdir(assetDirectory(data))).sort();
+  const rename = fs.rename;
+  t.mock.method(fs, 'rename', async (from, to) => {
+    if (to === livePath(data)) throw new Error('tombstone failed');
+    return rename(from, to);
+  });
+  await assert.rejects(patcher.restore(data), /tombstone failed/);
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), html);
+  assert.equal(await fs.readFile(livePath(data), 'utf8'), live);
+  assert.deepEqual((await fs.readdir(assetDirectory(data))).sort(), names);
+});
+
+test('legacy restore writes a tombstone without claiming a legacy renderer can update live', async t => {
+  const data = await fixture(t);
+  await patcher.apply(data);
+  const html = await fs.readFile(data.workbenchPath, 'utf8');
+  const payload = decodeConfig(html);
+  delete payload.liveState;
+  await fs.writeFile(data.workbenchPath, replaceConfig(html, payload));
+  await fs.unlink(livePath(data));
+  const result = await patcher.restore(data);
+  assert.equal(result.liveProtocol, undefined);
+  assert.deepEqual((await liveState(data)).settings, { enabled: false });
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
+});
+
+test('config updates refuse unowned paths, invalid live pointers and mismatched documents without writes', async t => {
+  const data = await fixture(t);
+  await patcher.apply(data);
+  const original = await fs.readFile(data.workbenchPath, 'utf8');
+  const live = await fs.readFile(livePath(data), 'utf8');
+  const payload = decodeConfig(original);
+  const changes = [
+    { source: '../outside.jpg' }, { source: 'file:///outside.jpg' },
+    { liveState: './frosted-background-assets/../live-state.json' },
+    { liveState: 'https://example.com/state.json' },
+    { videoPlayer: './frosted-background-assets/foreign.html' },
+    { blur: 47 }
+  ];
+  for (const change of changes) {
+    const altered = replaceConfig(original, { ...payload, ...change });
+    await fs.writeFile(data.workbenchPath, altered);
+    await assert.rejects(patcher.updateConfig({ appRoot: data.appRoot, config: { blur: 7 } }));
+    assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), altered);
+    assert.equal(await fs.readFile(livePath(data), 'utf8'), live);
+    assert.equal((await patcher.status(data)).liveProtocol, undefined);
+  }
+});
+
+test('a corrupt or nonregular stable state file is never overwritten or followed', async t => {
+  const data = await fixture(t);
+  await patcher.apply(data);
+  const html = await fs.readFile(data.workbenchPath, 'utf8');
+  const live = await fs.readFile(livePath(data), 'utf8');
+  for (const invalid of ['not json', JSON.stringify({ protocol: 1, revision: 'not-a-uuid', settings: { enabled: false } }), JSON.stringify({ protocol: 2, revision: crypto.randomUUID(), settings: { enabled: false } })]) {
+    await fs.writeFile(livePath(data), invalid);
+    assert.equal((await patcher.status(data)).liveProtocol, undefined);
+    await assert.rejects(patcher.updateConfig({ appRoot: data.appRoot, config: { blur: 3 } }), /实时背景配置无效/);
+    await assert.rejects(patcher.apply(data), /实时背景配置无效/);
+    await assert.rejects(patcher.restore(data), /实时背景配置无效/);
+    assert.equal(await fs.readFile(livePath(data), 'utf8'), invalid);
+    assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), html);
+  }
+  await fs.writeFile(livePath(data), live);
+  const lstat = fs.lstat;
+  t.mock.method(fs, 'lstat', async filename => {
+    const info = await lstat(filename);
+    if (filename === livePath(data)) return { ...info, isFile: () => true, isSymbolicLink: () => true };
+    return info;
+  });
+  await assert.rejects(patcher.apply(data), /不是有效的普通文件/);
+  await assert.rejects(patcher.updateConfig({ appRoot: data.appRoot, config: { blur: 3 } }), /不是有效的普通文件/);
+  await assert.rejects(patcher.restore(data), /不是有效的普通文件/);
+  assert.equal(await fs.readFile(livePath(data), 'utf8'), live);
+  assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), html);
 });

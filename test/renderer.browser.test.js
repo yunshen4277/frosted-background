@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { pathToFileURL } = require('node:url');
+const { randomUUID } = require('node:crypto');
 
 // Optional integration suite: PLAYWRIGHT_MODULE=/path/to/playwright node --test test/renderer.browser.test.js
 // No Playwright dependency is shipped in the extension.
@@ -406,6 +407,233 @@ test('renderer fits the editor, preserves interaction and manages image/video li
   } finally {
     if (browser) await browser.close();
     fs.rmSync(fixtureDirectory, { recursive: true, force: true });
+  }
+});
+
+test('live state swaps media without reload, preserves video settings updates and tears down obsolete work', {
+  skip: !process.env.PLAYWRIGHT_MODULE,
+  timeout: 60000,
+}, async () => {
+  const { chromium } = require(process.env.PLAYWRIGHT_MODULE);
+  const executablePath = process.env.BROWSER_EXECUTABLE || [
+    'C:/Program Files/Google/Chrome/Application/chrome.exe',
+    'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+  ].find(value => fs.existsSync(value));
+  const renderer = fs.readFileSync(path.join(__dirname, '../media/renderer.js'));
+  const playerScript = fs.readFileSync(path.join(__dirname, '../media/video-player.js'));
+  const imageName = `media-${'1'.repeat(64)}.png`;
+  const imageName2 = `media-${'2'.repeat(64)}.png`;
+  const videoName = `media-${'3'.repeat(64)}.webm`;
+  const slowVideoName = `media-${'4'.repeat(64)}.webm`;
+  const playerName = `video-host-${'5'.repeat(64)}.html`;
+  const assets = './frosted-background-assets/';
+  const playerHtml = '<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'self\'; connect-src \'self\'; media-src blob:; style-src \'unsafe-inline\';"><body><script src="./video-player.js" defer></script></body>';
+  const initial = {
+    enabled: true, kind: 'image', source: assets + imageName, liveState: assets + 'live-state.json',
+    blur: 14, opacity: 0.35, tintOpacity: 0.18, saturation: 1, brightness: 1,
+    fit: 'cover', position: 'center center', playbackRate: 1, pauseWhenUnfocused: true, respectReducedMotion: true,
+  };
+  const image2 = { ...initial, source: assets + imageName2, blur: 7 };
+  const video = { ...initial, kind: 'video', source: assets + videoName, videoPlayer: assets + playerName };
+  const envelope = settings => ({ protocol: 1, revision: randomUUID(), settings });
+  let body = JSON.stringify(envelope(initial));
+  let status = 200;
+  let holdState = false;
+  let releaseState;
+  let releaseSlowVideo;
+  let slowVideoStarted;
+  const slowVideoRequested = new Promise(resolve => { slowVideoStarted = resolve; });
+  const slowVideoReleased = new Promise(resolve => { releaseSlowVideo = resolve; });
+  const requests = [];
+  const errors = [];
+  const fixture = settings => `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self'; media-src 'self'; frame-src 'self'; connect-src 'self';"><style>
+    :root{--vscode-editor-background:#181818} body{margin:0}.part.editor{position:absolute;inset:20px;background:#181818}
+    .content,.editor-group-container,.editor-instance,.monaco-editor{width:100%;height:100%;background:#181818}.title{height:32px;background:#222}
+    .editor-container{height:calc(100% - 32px)}textarea{background:transparent;color:white;border:0}
+  </style><main class="part editor"><div class="content"><div class="editor-group-container"><div class="title">app.js</div><div class="editor-container"><div class="editor-instance"><div class="monaco-editor"><textarea>unsaved work</textarea></div></div></div></div></div></main><script src="./renderer.js" data-frosted-config="${JSON.stringify(settings).replace(/"/g, '&quot;')}"></script>`;
+  const files = new Map([
+    ['/renderer.js', ['text/javascript', renderer]],
+    [`/frosted-background-assets/${imageName}`, ['image/png', fs.readFileSync(path.join(__dirname, 'fixtures/edges.png'))]],
+    [`/frosted-background-assets/${imageName2}`, ['image/png', fs.readFileSync(path.join(__dirname, 'fixtures/wallpaper.png'))]],
+    [`/frosted-background-assets/${videoName}`, ['video/webm', fs.readFileSync(path.join(__dirname, 'fixtures/colors.webm'))]],
+    [`/frosted-background-assets/${slowVideoName}`, ['video/webm', fs.readFileSync(path.join(__dirname, 'fixtures/edges.webm'))]],
+    [`/frosted-background-assets/${playerName}`, ['text/html', playerHtml]],
+    ['/frosted-background-assets/video-player.js', ['text/javascript', playerScript]],
+  ]);
+  const browser = await chromium.launch({ headless: true, executablePath, args: ['--allow-file-access-from-files'] });
+  const localDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'frosted-live-test-'));
+  try {
+    const page = await browser.newPage({ viewport: { width: 700, height: 480 } });
+    page.on('pageerror', error => errors.push(error.message));
+    await page.addInitScript(() => {
+      window.__cspViolations = [];
+      window.__blobEvents = [];
+      window.__liveAborts = 0;
+      window.__messageListeners = new Set();
+      document.addEventListener('securitypolicyviolation', event => window.__cspViolations.push(event.effectiveDirective));
+      const add = window.addEventListener.bind(window), remove = window.removeEventListener.bind(window);
+      window.addEventListener = (type, listener, options) => { if (type === 'message') window.__messageListeners.add(listener); return add(type, listener, options); };
+      window.removeEventListener = (type, listener, options) => { if (type === 'message') window.__messageListeners.delete(listener); return remove(type, listener, options); };
+      const create = URL.createObjectURL.bind(URL), revoke = URL.revokeObjectURL.bind(URL);
+      URL.createObjectURL = value => { const url = create(value); top.__blobEvents.push({ event: 'create', url }); return url; };
+      URL.revokeObjectURL = url => { top.__blobEvents.push({ event: 'revoke', url }); revoke(url); };
+      const nativeFetch = window.fetch.bind(window);
+      window.fetch = (url, options) => {
+        if (String(url).includes('/live-state.json')) options.signal.addEventListener('abort', () => window.__liveAborts++, { once: true });
+        return nativeFetch(url, options);
+      };
+      window.__documentToken = Math.random();
+    });
+    await page.route('https://live.test/**', async route => {
+      const url = new URL(route.request().url());
+      if (url.pathname === '/index.html') return route.fulfill({ contentType: 'text/html', body: fixture(initial) });
+      if (url.pathname === '/frosted-background-assets/live-state.json') {
+        requests.push(url.href);
+        if (holdState) await new Promise(resolve => { releaseState = resolve; });
+        return route.fulfill({ status, contentType: 'application/json', body }).catch(() => {});
+      }
+      if (url.pathname.endsWith(slowVideoName)) { slowVideoStarted(); await slowVideoReleased; }
+      const asset = files.get(url.pathname);
+      return route.fulfill(asset ? { contentType: asset[0], body: asset[1] } : { status: 404, body: '' }).catch(() => {});
+    });
+    const publish = settings => { status = 200; body = JSON.stringify(envelope(settings)); };
+    const nextPoll = async () => {
+      await page.waitForResponse(value => value.url().includes('/live-state.json'));
+      // Invalid responses may be deliberately aborted by the size/schema guard;
+      // awaiting Playwright's response.finished() can then never settle.
+      await page.waitForTimeout(50);
+    };
+    await page.goto('https://live.test/index.html');
+    await page.waitForSelector('.frosted-background-ready');
+    const documentToken = await page.evaluate(() => window.__documentToken);
+    await page.locator('textarea').fill('keep my unsaved code');
+    publish({ ...initial, fit: 'fill', blur: 3, opacity: 0.6 });
+    await page.waitForFunction(() => document.querySelector('img').style.objectFit === 'fill' && document.querySelector('img').style.opacity === '0.6');
+    assert.equal(await page.locator('.frosted-background-layer').evaluate(el => el.getBoundingClientRect().top), 52, 'live fill excludes the opaque title');
+    publish(video);
+    await page.waitForSelector('iframe.frosted-background-media');
+    const frame = page.frames().find(value => value.url().includes(playerName));
+    await frame.waitForFunction(() => document.querySelector('video').readyState >= 2 && !document.querySelector('video').paused);
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await frame.waitForFunction(() => document.querySelector('video').paused);
+    await frame.locator('video').evaluate(element => { element.currentTime = 0.5; window.__originalVideo = element; });
+    await frame.waitForFunction(() => !document.querySelector('video').seeking);
+    await page.locator('iframe').evaluate(element => { window.__originalFrame = element; });
+    const videoTime = await frame.locator('video').evaluate(element => element.currentTime);
+    publish({ ...video, fit: 'contain', blur: 22, opacity: 0.55, tintOpacity: 0.4, brightness: 0.8, saturation: 0.6, playbackRate: 1.5, position: 'left center' });
+    await frame.waitForFunction(() => document.querySelector('video').style.objectFit === 'contain' && document.querySelector('video').playbackRate === 1.5);
+    assert.equal(await page.evaluate(() => document.querySelector('iframe') === window.__originalFrame), true);
+    assert.equal(await frame.evaluate(() => document.querySelector('video') === window.__originalVideo), true);
+    assert.equal(await frame.locator('video').evaluate(element => element.currentTime), videoTime, 'settings-only changes preserve playback position');
+    assert.match(await page.locator('iframe').getAttribute('style'), /blur\(22px\)/);
+    assert.equal(await page.locator('.frosted-background-tint').evaluate(el => el.style.opacity), '0.4');
+    publish({ ...video, fit: 'fill', blur: 0 });
+    await frame.waitForFunction(() => document.querySelector('video').style.objectFit === 'fill');
+    await page.setViewportSize({ width: 410, height: 300 });
+    assert.equal(await page.locator('.frosted-background-layer').evaluate(el => el.getBoundingClientRect().top), 52);
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    await frame.waitForFunction(() => !document.querySelector('video').paused && document.querySelector('video').currentTime !== 0.5);
+    publish(image2);
+    await page.waitForFunction(name => document.querySelector('img')?.src.endsWith(name) && document.querySelector('.frosted-background-ready'), imageName2);
+    const lifecycle = await page.evaluate(() => window.__blobEvents);
+    assert.equal(lifecycle.filter(event => event.event === 'create').length, 1);
+    assert.deepEqual(lifecycle.filter(event => event.event === 'revoke').map(event => event.url), lifecycle.filter(event => event.event === 'create').map(event => event.url), 'obsolete video Blob is revoked before its frame is removed');
+    assert.equal(await page.evaluate(() => window.__messageListeners.size), 0, 'obsolete player message listeners are removed');
+    await page.locator('img').evaluate(element => { window.__stableImage = element; });
+    // A broken/oversized state file or a remote/foreign media address must not
+    // replace the last valid background or cause external resource requests.
+    for (const invalid of [
+      '{partial json', JSON.stringify({ ...envelope(initial), protocol: 2 }),
+      JSON.stringify({ ...envelope(initial), revision: 'not-a-uuid' }),
+      JSON.stringify(envelope({ ...initial, source: 'https://untrusted.invalid/private.png' })),
+      JSON.stringify(envelope({ ...initial, source: './another-directory/media-' + '1'.repeat(64) + '.png' })),
+      JSON.stringify(envelope({ ...initial, blur: 'not a number' })),
+      JSON.stringify({ ...envelope(initial), oversized: 'x'.repeat(70 * 1024) }),
+    ]) {
+      body = invalid;
+      await nextPoll();
+      assert.equal(await page.evaluate(() => document.querySelector('img') === window.__stableImage), true, 'invalid state preserves the previous media instance');
+    }
+    status = 404;
+    await nextPoll();
+    assert.equal(await page.evaluate(() => document.querySelector('img') === window.__stableImage), true, 'transient missing state preserves the background');
+    publish({ ...video, source: assets + slowVideoName });
+    await slowVideoRequested;
+    publish(initial);
+    await page.waitForFunction(name => document.querySelector('img')?.src.endsWith(name) && document.querySelector('.frosted-background-ready'), imageName);
+    releaseSlowVideo();
+    await page.waitForTimeout(100);
+    assert.equal(await page.locator('iframe').count(), 0, 'a superseded video load cannot resurrect its player');
+    assert.equal(await page.evaluate(() => window.__blobEvents.filter(event => event.event === 'create').length), 1, 'superseded fetch does not create a late video Blob');
+    assert.equal(await page.evaluate(() => window.__messageListeners.size), 0);
+    publish({ enabled: false });
+    await page.waitForFunction(() => !document.querySelector('.frosted-background-layer'));
+    assert.equal(await page.locator('.frosted-background-ready').count(), 0);
+    assert.notEqual(await page.locator('.monaco-editor').evaluate(el => getComputedStyle(el).backgroundColor), 'rgba(0, 0, 0, 0)', 'disabled tombstone restores normal editor styling');
+    publish({ ...image2, opacity: 0.75 });
+    await page.waitForFunction(() => document.querySelector('img')?.style.opacity === '0.75' && document.querySelector('.frosted-background-ready'));
+    assert.equal(await page.locator('textarea').inputValue(), 'keep my unsaved code');
+    assert.equal(await page.evaluate(() => window.__documentToken), documentToken, 'all changes happen in the original document');
+    assert.equal(new Set(requests).size, requests.length, 'every poll uses a unique cache-busting URL');
+    assert.deepEqual(await page.evaluate(() => window.__cspViolations), [], 'live state does not require workbench CSP changes');
+    holdState = true;
+    await page.waitForRequest(request => request.url().includes('/live-state.json'));
+    const previousAborts = await page.evaluate(() => window.__liveAborts);
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+    const lastRequestCount = requests.length;
+    releaseState?.();
+    await page.waitForTimeout(650);
+    assert.equal(requests.length, lastRequestCount, 'pagehide stops the polling timer');
+    assert.equal(await page.evaluate(() => window.__liveAborts), previousAborts + 1, 'pagehide aborts the pending local read');
+    assert.equal(await page.locator('.frosted-background-layer, #frosted-background-style').count(), 0);
+
+    // Standalone Chromium file: lacks VS Code's supportFetchAPI protocol flag.
+    // Bridge only this exact local JSON path through XHR; still read real bytes
+    // and exercise the production polling/parser/renderer with an opaque origin.
+    fs.mkdirSync(path.join(localDirectory, 'frosted-background-assets'));
+    fs.writeFileSync(path.join(localDirectory, 'index.html'), fixture({ enabled: false, liveState: initial.liveState }));
+    fs.writeFileSync(path.join(localDirectory, 'renderer.js'), renderer);
+    fs.writeFileSync(path.join(localDirectory, 'frosted-background-assets', imageName), files.get(`/frosted-background-assets/${imageName}`)[1]);
+    const localStatePath = path.join(localDirectory, 'frosted-background-assets/live-state.json');
+    fs.writeFileSync(localStatePath, JSON.stringify(envelope(initial)));
+    const localPage = await browser.newPage();
+    localPage.on('pageerror', error => errors.push(error.message));
+    await localPage.addInitScript(({ stateURL }) => {
+      const original = window.fetch.bind(window);
+      window.__stateReads = 0;
+      window.fetch = (input, options = {}) => {
+        const url = new URL(input, location.href); url.search = '';
+        if (url.href !== stateURL) return original(input, options);
+        return new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          const abort = () => { xhr.abort(); reject(new DOMException('Aborted', 'AbortError')); };
+          if (options.signal?.aborted) return abort();
+          xhr.open('GET', String(input)); xhr.responseType = 'arraybuffer';
+          options.signal?.addEventListener('abort', abort, { once: true });
+          xhr.onload = () => {
+            options.signal?.removeEventListener('abort', abort);
+            window.__stateReads++;
+            if (xhr.status !== 0 && xhr.status !== 200) { reject(new Error('Local read failed')); return; }
+            resolve(new Response(xhr.response, { headers: { 'Content-Type': 'application/json' } }));
+          };
+          xhr.onerror = () => { options.signal?.removeEventListener('abort', abort); reject(new Error('Local read failed')); };
+          xhr.send();
+        });
+      };
+    }, { stateURL: pathToFileURL(localStatePath).href });
+    await localPage.goto(pathToFileURL(path.join(localDirectory, 'index.html')).href);
+    await localPage.waitForSelector('.frosted-background-ready');
+    fs.writeFileSync(localStatePath, JSON.stringify(envelope({ ...initial, fit: 'fill', blur: 9 })));
+    await localPage.waitForFunction(() => document.querySelector('img')?.style.filter.includes('blur(9px)') && document.querySelector('img').style.objectFit === 'fill');
+    fs.writeFileSync(localStatePath, JSON.stringify(envelope({ enabled: false })));
+    await localPage.waitForFunction(() => !document.querySelector('.frosted-background-layer'));
+    assert.ok(await localPage.evaluate(() => window.__stateReads) >= 3);
+    await localPage.close();
+    assert.deepEqual(errors, [], 'live updates cause no uncaught runtime errors');
+  } finally {
+    releaseSlowVideo(); releaseState?.();
+    await browser.close();
+    fs.rmSync(localDirectory, { recursive: true, force: true });
   }
 });
 
