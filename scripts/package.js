@@ -25,13 +25,19 @@ function xml(value) {
   })[character]);
 }
 
-function manifestFor(pkg) {
+function manifestFor(pkg, catalog = require('../package.nls.json')) {
+  const localized = value => {
+    const key = typeof value === 'string' && /^%([^%]+)%$/.exec(value)?.[1];
+    if (!key) return value;
+    if (typeof catalog[key] !== 'string' || !catalog[key].trim()) throw new Error(`Missing default localization: ${key}`);
+    return catalog[key];
+  };
   return `<?xml version="1.0" encoding="utf-8"?>
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
   <Metadata>
     <Identity Language="en-US" Id="${xml(pkg.name)}" Version="${xml(pkg.version)}" Publisher="${xml(pkg.publisher)}" />
-    <DisplayName>${xml(pkg.displayName || pkg.name)}</DisplayName>
-    <Description xml:space="preserve">${xml(pkg.description || '')}</Description>
+    <DisplayName>${xml(localized(pkg.displayName || pkg.name))}</DisplayName>
+    <Description xml:space="preserve">${xml(localized(pkg.description || ''))}</Description>
     <Tags>${xml((pkg.keywords || []).join(','))}</Tags>
     <Categories>${xml((pkg.categories || []).join(','))}</Categories>
     <GalleryFlags>Public</GalleryFlags>
@@ -87,6 +93,20 @@ async function listFiles(directory, relative = '') {
   return files;
 }
 
+function selectPackageFiles(files, pkg) {
+  const catalogs = ['package.nls.json', 'package.nls.zh-cn.json', 'package.nls.es.json'];
+  const packaged = files.filter(name =>
+    ['package.json', ...catalogs, 'README.md', 'LICENSE', 'CHANGELOG.md'].includes(name)
+    || name.startsWith('src/') || name.startsWith('media/'));
+  const required = ['package.json', ...catalogs, 'README.md', 'LICENSE', pkg.main.replace(/^\.\//, ''), 'media/renderer.js',
+    'src/panel.js', 'src/panel-ui.js', 'media/panel.js', 'media/panel.css', 'media/background-icon.svg', 'media/video-player.js',
+    'src/updater.js', 'src/github-update.js', 'src/localization.js', 'media/i18n.js'];
+  for (const file of required) {
+    if (!packaged.includes(file)) throw new Error(`Missing package file: ${file}`);
+  }
+  return packaged;
+}
+
 async function main(args = process.argv.slice(2)) {
   const JSZip = getJSZip(args);
   const root = path.resolve(__dirname, '..');
@@ -101,19 +121,13 @@ async function main(args = process.argv.slice(2)) {
   }
   if (!pkg.engines?.vscode || !pkg.main) throw new Error('Missing VS Code engine or extension entry point.');
   const files = await listFiles(root);
-  const packaged = files.filter(name =>
-    ['package.json', 'package.nls.json', 'package.nls.zh-cn.json', 'README.md', 'LICENSE', 'CHANGELOG.md'].includes(name)
-    || name.startsWith('src/') || name.startsWith('media/'));
-  const required = ['package.json', 'README.md', 'LICENSE', pkg.main.replace(/^\.\//, ''), 'media/renderer.js',
-    'src/panel.js', 'src/panel-ui.js', 'media/panel.js', 'media/panel.css', 'media/background-icon.svg', 'media/video-player.js', 'src/updater.js', 'src/github-update.js'];
-  for (const file of required) {
-    if (!packaged.includes(file)) throw new Error(`Missing package file: ${file}`);
-  }
+  const packaged = selectPackageFiles(files, pkg);
+  const catalog = JSON.parse(await fs.readFile(path.join(root, 'package.nls.json'), 'utf8'));
   const vsix = new JSZip();
   const source = new JSZip();
   // A fixed entry timestamp keeps unchanged packages reproducible.
   const options = { date: new Date('2026-01-01T00:00:00.000Z'), unixPermissions: 0o100644 };
-  vsix.file('extension.vsixmanifest', manifestFor(pkg), options);
+  vsix.file('extension.vsixmanifest', manifestFor(pkg, catalog), options);
   vsix.file('[Content_Types].xml', contentTypes, options);
   for (const name of files) {
     const bytes = await fs.readFile(path.join(root, name));
@@ -137,4 +151,4 @@ if (require.main === module) {
   main().catch(error => { console.error(error.message); process.exitCode = 1; });
 }
 
-module.exports = { main, manifestFor, listFiles };
+module.exports = { main, manifestFor, listFiles, selectPackageFiles };
