@@ -2,6 +2,9 @@
   'use strict';
 
   const vscode = acquireVsCodeApi();
+  const { normalizeLanguage, t } = window.FrostedI18n;
+  let language = normalizeLanguage(document.documentElement.lang);
+  const translate = (key, params) => t(language, key, params);
   const fallback = {
     blur: 14, opacity: 0.35, tintOpacity: 0.18, saturation: 1, brightness: 1,
     fit: 'cover', position: 'center center', playbackRate: 1,
@@ -34,6 +37,7 @@
   let currentMedia = null;
   let mediaIdentity = '';
   let videoReady = false;
+  let previewErrorKey = null;
   const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 
   function persistDraft() {
@@ -47,6 +51,24 @@
     return `${Math.round(value * 100)}%`;
   }
 
+  function renderLanguage() {
+    document.documentElement.lang = language;
+    byId('language').value = language;
+    for (const element of document.querySelectorAll('[data-i18n]')) {
+      element.textContent = translate(element.dataset.i18n);
+    }
+    for (const attribute of ['aria-label', 'title']) {
+      for (const element of document.querySelectorAll(`[data-i18n-${attribute}]`)) {
+        element.setAttribute(attribute, translate(element.getAttribute(`data-i18n-${attribute}`)));
+      }
+    }
+    if (previewErrorKey) byId('preview-error').textContent = translate(previewErrorKey);
+    // Only text changes. The current image/video element, time, and draft stay
+    // intact; updateMedia has an identity guard for authoritative host echoes.
+    updateMedia();
+    renderControls();
+  }
+
   function renderControls() {
     for (const [key, [min, max]] of Object.entries(ranges)) {
       const input = byId(key);
@@ -56,11 +78,11 @@
       byId(`${key}-value`).textContent = formatValue(key, draft[key]);
     }
     for (const input of document.querySelectorAll('input[name="fit"]')) input.checked = input.value === draft.fit;
-    byId('fit-description').textContent = {
+    byId('fit-description').textContent = translate({
       cover: '等比铺满，允许裁剪边缘',
       contain: '完整显示画面，可能留白',
       fill: '完整画面压缩到编辑区，不裁剪；可能改变比例',
-    }[draft.fit];
+    }[draft.fit]);
     byId('position').value = draft.position;
     for (const key of ['pauseWhenUnfocused', 'respectReducedMotion']) byId(key).checked = draft[key];
     for (const button of document.querySelectorAll('[data-preset]')) {
@@ -107,8 +129,8 @@
     const media = state.media;
     const valid = media && typeof media.uri === 'string' && ['image', 'video'].includes(media.kind);
     const identity = valid ? `${media.kind}:${media.uri}` : '';
-    byId('media-kind').textContent = valid ? (media.kind === 'video' ? '视频' : '图片') : '未选择背景';
-    byId('media-name').textContent = valid && typeof media.name === 'string' ? media.name : '从本机选择文件';
+    byId('media-kind').textContent = translate(valid ? (media.kind === 'video' ? '视频' : '图片') : '未选择背景');
+    byId('media-name').textContent = valid && typeof media.name === 'string' ? media.name : translate('从本机选择文件');
     byId('media-name').title = valid && typeof media.name === 'string' ? media.name : '';
     byId('video-section').hidden = !valid || media.kind !== 'video';
     byId('preview-empty').hidden = Boolean(valid);
@@ -119,6 +141,7 @@
     if (currentMedia?.tagName === 'VIDEO') { currentMedia.pause(); currentMedia.removeAttribute('src'); currentMedia.load(); }
     byId('preview-media').replaceChildren();
     currentMedia = null;
+    previewErrorKey = null;
     byId('preview-error').hidden = true;
     if (!valid) return;
     const element = document.createElement(media.kind === 'video' ? 'video' : 'img');
@@ -136,7 +159,8 @@
     }
     element.addEventListener('error', () => {
       if (element !== currentMedia) return;
-      byId('preview-error').textContent = media.kind === 'video' ? '此视频无法预览，请尝试 WebM 格式。' : '无法读取预览，请重新选择图片。';
+      previewErrorKey = media.kind === 'video' ? '此视频无法预览，请尝试 WebM 格式。' : '无法读取预览，请重新选择图片。';
+      byId('preview-error').textContent = translate(previewErrorKey);
       byId('preview-error').hidden = false;
     });
     element.src = media.uri;
@@ -146,7 +170,7 @@
   function renderActions() {
     const busy = Boolean(state.busy);
     byId('panel').setAttribute('aria-busy', String(busy));
-    for (const input of document.querySelectorAll('input, select, [data-preset], #reset, #choose-image, #choose-video')) input.disabled = busy;
+    for (const input of document.querySelectorAll('input, select:not(#language), [data-preset], #reset, #choose-image, #choose-video')) input.disabled = busy;
     byId('apply').disabled = busy || !state.media;
     byId('restore').disabled = busy || (!state.enabled && !state.needsReload);
     byId('reload').disabled = busy;
@@ -157,19 +181,19 @@
       byId('current-version').textContent = typeof update.currentVersion === 'string' ? `v${update.currentVersion}` : '';
       byId('update-mode').value = ['automatic', 'notify', 'off'].includes(update.mode) ? update.mode : 'off';
       byId('check-updates').disabled = busy || ['checking', 'installing', 'unconfigured'].includes(update.status);
-      byId('check-updates').textContent = update.status === 'checking' ? '正在检查…' : update.status === 'installing' ? '正在更新…' : '检查更新';
+      byId('check-updates').textContent = translate(update.status === 'checking' ? '正在检查…' : update.status === 'installing' ? '正在更新…' : '检查更新');
       const pendingVersion = typeof update.pendingVersion === 'string' ? update.pendingVersion : '';
       const availableVersion = typeof update.availableVersion === 'string' ? update.availableVersion : '';
-      byId('available-version').textContent = pendingVersion ? `v${pendingVersion} · 待重载` : availableVersion ? `发现 v${availableVersion}` : '';
+      byId('available-version').textContent = pendingVersion ? translate('v{version} · 待重载', { version: pendingVersion }) : availableVersion ? translate('发现 v{version}', { version: availableVersion }) : '';
       byId('available-version').hidden = !pendingVersion && !availableVersion;
       byId('update-message').textContent = typeof update.message === 'string' ? update.message : '';
       byId('update-message').classList.toggle('is-error', update.status === 'error');
     }
-    byId('apply-label').textContent = busy ? '正在处理…' : '应用到编辑区';
+    byId('apply-label').textContent = translate(busy ? '正在处理…' : '应用到编辑区');
     const statusText = busy ? '处理中' : state.needsReload ? '待重载' : state.enabled ? '已启用' : '未启用';
-    byId('status-text').textContent = statusText;
+    byId('status-text').textContent = translate(statusText);
     byId('status').classList.toggle('is-active', Boolean(state.enabled || state.needsReload));
-    byId('draft-label').textContent = dirty ? '● 效果已调整，尚未应用到编辑区' : state.needsReload ? (update?.pendingVersion ? '插件更新已准备好，重载窗口后生效' : '背景已准备好，重载窗口后生效') : state.media ? '预览效果不会影响代码清晰度' : '把喜欢的风景，放进代码里';
+    byId('draft-label').textContent = translate(dirty ? '● 效果已调整，尚未应用到编辑区' : state.needsReload ? (update?.pendingVersion ? '插件更新已准备好，重载窗口后生效' : '背景已准备好，重载窗口后生效') : state.media ? '预览效果不会影响代码清晰度' : '把喜欢的风景，放进代码里');
     byId('draft-label').classList.toggle('is-dirty', dirty);
     for (const key of ['error', 'notice']) {
       const message = typeof state[key] === 'string' ? state[key] : '';
@@ -212,12 +236,18 @@
   // Closing is a view-only action: do not acquire the operation lock or modify
   // saved drafts, the selected media, or the background's enabled state.
   byId('close-panel').addEventListener('click', () => vscode.postMessage({ type: 'closePanel' }));
+  byId('language').addEventListener('change', event => {
+    language = normalizeLanguage(event.target.value);
+    renderLanguage();
+    vscode.postMessage({ type: 'setLanguage', language });
+  });
   byId('update-mode').addEventListener('change', event => sendAction({ type: 'setUpdateMode', mode: event.target.value }));
   byId('check-updates').addEventListener('click', () => sendAction({ type: 'checkUpdates' }));
 
   window.addEventListener('message', event => {
     const message = event.data;
     if (!message || message.type !== 'state') return;
+    language = normalizeLanguage(message.language);
     applied = normalize(message.config);
     defaults = normalize(message.defaults);
     // Host settings may change outside this panel. Follow them whenever there
@@ -229,15 +259,14 @@
       needsReload: Boolean(message.needsReload),
       update: message.update && typeof message.update === 'object' ? message.update : null,
     };
-    updateMedia();
     persistDraft();
-    renderControls();
+    renderLanguage();
   });
   reducedMotion.addEventListener('change', syncPlayback);
   document.addEventListener('visibilitychange', syncPlayback);
   window.addEventListener('focus', syncPlayback);
   window.addEventListener('blur', syncPlayback);
   window.addEventListener('pagehide', () => { if (currentMedia?.tagName === 'VIDEO') currentMedia.pause(); });
-  renderControls();
+  renderLanguage();
   vscode.postMessage({ type: 'ready' });
 })();
