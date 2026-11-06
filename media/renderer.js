@@ -13,7 +13,6 @@
 
   // Reinstallation must never accumulate observers, video decoders or styles.
   window.__frostedBackgroundCleanup?.();
-  const regionTools = window.FrostedRegions;
   const number = (value, fallback, min, max) => {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
@@ -31,8 +30,6 @@
     pauseWhenUnfocused: settings.pauseWhenUnfocused !== false,
     respectReducedMotion: settings.respectReducedMotion !== false,
     paused: settings.paused === true,
-    sourceType: settings.sourceType === 'hls' ? 'hls' : undefined,
-    regions: regionTools?.normalizeRegions(settings.regions) || { enabled: false, items: [] },
   });
   const origin = new URL(document.baseURI);
   const ownedDirectory = new URL('./frosted-background-assets/', origin);
@@ -44,27 +41,25 @@
     if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new Error('Invalid settings.');
     if (settings.enabled === false) return { enabled: false };
     if (typeof settings.source !== 'string' || !settings.source || (strict && (settings.enabled !== true || !['image', 'video'].includes(settings.kind)))) throw new Error('Missing media source.');
-    const streaming = settings.sourceType === 'hls';
-    if (settings.sourceType !== undefined && !streaming) throw new Error('Unsupported background source type.');
-    if (streaming && settings.kind !== 'video') throw new Error('HLS sources must be videos.');
-    const normalizedStream = streaming ? window.FrostedSource?.normalizeRemoteSource({ type: 'hls', kind: 'video', url: settings.source }) : undefined;
-    if (streaming && !normalizedStream) throw new Error('HLS source validation is unavailable.');
-    const source = new URL(streaming ? normalizedStream.url : settings.source, origin);
-    if (!streaming && !sameOrigin(source)) throw new Error('Only local workbench media is supported.');
-    if (!streaming && strict && (source.search || source.hash || source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1) !== ownedDirectory.pathname ||
+    // Retired link backgrounds become disabled without fetching any resource.
+    // Continue polling so a later local selection can replace the old state.
+    if (settings.sourceType !== undefined || /^(?:https?:)?\/\//i.test(settings.source)) return { enabled: false };
+    const source = new URL(settings.source, origin);
+    if (!sameOrigin(source)) throw new Error('Only local workbench media is supported.');
+    if (strict && (source.search || source.hash || source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1) !== ownedDirectory.pathname ||
         !/^media-[a-f0-9]{64}\.(png|jpe?g|gif|webp|bmp|avif|mp4|webm)$/.test(source.pathname.slice(source.pathname.lastIndexOf('/') + 1)) ||
         /\.(mp4|webm)$/.test(source.pathname) !== (settings.kind === 'video'))) throw new Error('Media is not an owned cached asset.');
     let videoPlayer;
     if (settings.kind === 'video' && settings.videoPlayer) {
       videoPlayer = new URL(settings.videoPlayer, origin);
-      const directory = streaming ? ownedDirectory.pathname : source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1);
-      if (!sameOrigin(videoPlayer) || videoPlayer.search || videoPlayer.hash || (!streaming && (source.search || source.hash)) ||
+      const directory = source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1);
+      if (!sameOrigin(videoPlayer) || videoPlayer.search || videoPlayer.hash || source.search || source.hash ||
           !/\/frosted-background-assets\/$/.test(directory) ||
           videoPlayer.pathname.slice(0, videoPlayer.pathname.lastIndexOf('/') + 1) !== directory ||
           !/^video-host-[a-f0-9]{64}\.html$/.test(videoPlayer.pathname.slice(videoPlayer.pathname.lastIndexOf('/') + 1)) ||
-          (!streaming && !/^media-[a-f0-9]{64}\.(mp4|webm)$/.test(source.pathname.slice(source.pathname.lastIndexOf('/') + 1)))) throw new Error('Invalid local video player.');
+          !/^media-[a-f0-9]{64}\.(mp4|webm)$/.test(source.pathname.slice(source.pathname.lastIndexOf('/') + 1))) throw new Error('Invalid local video player.');
     }
-    if ((strict || streaming) && settings.kind === 'video' && !videoPlayer) throw new Error('Missing local video player.');
+    if (strict && settings.kind === 'video' && !videoPlayer) throw new Error('Missing local video player.');
     if (settings.paused !== undefined && typeof settings.paused !== 'boolean') throw new Error('Invalid manual playback setting.');
     if (strict) {
       if (settings.liveState !== undefined && new URL(settings.liveState, origin).href !== ownedState.href) throw new Error('Live state location cannot change.');
@@ -157,7 +152,6 @@
   let pollRequest;
   let revision;
   let pollSequence = 0;
-  let themeFrame = 0;
 
   const listen = (target, name, callback, options) => {
     target.addEventListener(name, callback, options);
@@ -167,10 +161,6 @@
   function mount(host) {
     const { source, videoPlayer } = active;
     let config = active.config;
-    let compositor;
-    let regionCanvas;
-    const hasRegions = () => Boolean(regionTools && config.regions.enabled && config.regions.items.length);
-    const tintColor = () => getComputedStyle(tint).backgroundColor || '#1e1e1e';
     const layer = document.createElement('div');
     layer.className = 'frosted-background-layer';
     layer.setAttribute('aria-hidden', 'true');
@@ -183,33 +173,15 @@
     const tint = document.createElement('div');
     tint.className = 'frosted-background-tint';
     function applyMediaStyles() {
-      const regional = hasRegions();
-      const overscan = !regional && config.fit === 'cover' ? config.blur * 3 : 0;
+      const overscan = config.fit === 'cover' ? config.blur * 3 : 0;
       Object.assign(media.style, {
         left: `${-overscan}px`, top: `${-overscan}px`,
         width: `calc(100% + ${overscan * 2}px)`, height: `calc(100% + ${overscan * 2}px)`,
         objectFit: config.fit, objectPosition: config.position,
-        filter: regional ? 'none' : `blur(${config.blur}px) saturate(${config.saturation}) brightness(${config.brightness})`,
-        opacity: regional ? '1' : String(config.opacity), border: '0',
-        visibility: regional && !framedVideo ? 'hidden' : '',
+        filter: `blur(${config.blur}px) saturate(${config.saturation}) brightness(${config.brightness})`,
+        opacity: String(config.opacity), border: '0',
       });
-      tint.style.opacity = regional ? '0' : String(config.tintOpacity);
-    }
-    function updateImageRegions() {
-      if (framedVideo) return;
-      if (hasRegions()) {
-        if (!compositor) {
-          regionCanvas = document.createElement('canvas');
-          regionCanvas.className = 'frosted-background-canvas';
-          Object.assign(regionCanvas.style, { position: 'absolute', inset: '0', width: '100%', height: '100%', pointerEvents: 'none' });
-          layer.insertBefore(regionCanvas, tint);
-          compositor = regionTools.createCompositor({ source: media, canvas: regionCanvas });
-        }
-        compositor.update({ ...config, tintColor: tintColor() });
-      } else {
-        compositor?.dispose(); compositor = undefined;
-        regionCanvas?.remove(); regionCanvas = undefined;
-      }
+      tint.style.opacity = String(config.tintOpacity);
     }
     applyMediaStyles();
     layer.append(media, tint);
@@ -278,7 +250,7 @@
       else if (config.kind === 'video') media.pause();
       const safe = diagnostic && typeof diagnostic === 'object' ? {
         stage: ['read', 'decode', 'compatibility'].includes(diagnostic.stage) ? diagnostic.stage : 'decode',
-        sourceType: ['local', 'webm', 'mp4', 'hls'].includes(diagnostic.sourceType) ? diagnostic.sourceType : 'local',
+        sourceType: ['local', 'webm', 'mp4'].includes(diagnostic.sourceType) ? diagnostic.sourceType : 'local',
         code: [1, 2, 3, 4].includes(diagnostic.code) ? diagnostic.code : undefined,
         readyState: Number.isInteger(diagnostic.readyState) && diagnostic.readyState >= 0 && diagnostic.readyState <= 4 ? diagnostic.readyState : undefined,
         networkState: Number.isInteger(diagnostic.networkState) && diagnostic.networkState >= 0 && diagnostic.networkState <= 3 ? diagnostic.networkState : undefined,
@@ -289,7 +261,7 @@
     const initializePlayer = () => {
       if (stopped || failed) return;
       playerBooted = true;
-      postPlayer({ action: 'initialize', source: source.href, ...config, tintColor: tintColor(), playing: shouldPlay() });
+      postPlayer({ action: 'initialize', source: source.href, ...config, playing: shouldPlay() });
       updatePlayback();
     };
     const receivePlayer = event => {
@@ -333,7 +305,6 @@
       media.decoding = 'async';
     }
     if (!framedVideo) media.src = source.href;
-    updateImageRegions();
 
     // Complete compression must fit the pixels the user can actually see.
     // The workbench part also includes opaque tabs/breadcrumbs, and Monaco's
@@ -433,15 +404,9 @@
         config = next;
         applyMediaStyles();
         observeLayout();
-        updateImageRegions();
-        if (framedVideo && playerBooted) postPlayer({ action: 'settings', ...config, tintColor: tintColor() });
+        if (framedVideo && playerBooted) postPlayer({ action: 'settings', ...config });
         else if (config.kind === 'video' && !framedVideo) media.playbackRate = config.playbackRate;
         updatePlayback();
-      },
-      updateTheme() {
-        if (!hasRegions()) return;
-        updateImageRegions();
-        if (framedVideo && playerBooted) postPlayer({ action: 'settings', ...config, tintColor: tintColor() });
       },
       retryPlayback() {
         playbackBlocked = false;
@@ -450,7 +415,6 @@
       },
       dispose() {
         stopped = true;
-        compositor?.dispose();
         cancelAnimationFrame(geometryFrame);
         layoutObserver?.disconnect();
         resize.disconnect();
@@ -502,12 +466,12 @@
 
   function applySettings(next) {
     const sameMedia = active.enabled && next.enabled && active.source.href === next.source.href &&
-      active.videoPlayer?.href === next.videoPlayer?.href && active.config.kind === next.config.kind && active.config.sourceType === next.config.sourceType;
+      active.videoPlayer?.href === next.videoPlayer?.href && active.config.kind === next.config.kind;
     active = next;
     if (sameMedia) {
       for (const [host, state] of hosts) {
         // This path runs only for a new valid publication, never for repeated
-        // polls. Explicit Apply can retry a failed stream without replacing a
+        // polls. Explicit Apply can retry failed media without replacing a
         // healthy decoder or resetting its playback position.
         if (state.failed) { state.dispose(); hosts.delete(host); }
         else state.updateSettings(next.config);
@@ -590,15 +554,6 @@
     }
   });
   observer.observe(document.documentElement, { childList: true, subtree: true });
-  const themeObserver = new MutationObserver(() => {
-    if (!themeFrame && !disposed) themeFrame = requestAnimationFrame(() => {
-      themeFrame = 0;
-      for (const state of hosts.values()) state.updateTheme();
-    });
-  });
-  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['style', 'class'] });
-  if (document.body) themeObserver.observe(document.body, { attributes: true, attributeFilter: ['style', 'class'] });
-  themeObserver.observe(document.head, { childList: true, subtree: true, characterData: true });
 
   const updateAll = () => { for (const state of hosts.values()) state.updatePlayback(); };
   const retryAll = () => { for (const state of hosts.values()) state.retryPlayback(); };
@@ -614,8 +569,6 @@
     clearTimeout(pollTimer);
     pollRequest?.abort();
     cancelAnimationFrame(pendingFrame);
-    cancelAnimationFrame(themeFrame);
-    themeObserver.disconnect();
     observer.disconnect();
     for (const remove of removers) remove();
     for (const state of hosts.values()) state.dispose();

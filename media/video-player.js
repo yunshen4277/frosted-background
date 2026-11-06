@@ -1,5 +1,5 @@
-/* Isolated video document. Local files use Blob media; an HLS-only document
-   permits HTTPS streaming without changing the workbench CSP. No Node access. */
+/* Isolated local video document. Blob media and WebM compatibility playback
+   preserve the workbench CSP. No Node access or remote media loading. */
 (() => {
   'use strict';
   const channel = new URLSearchParams(location.hash.slice(1)).get('frosted-channel');
@@ -25,13 +25,6 @@
   let webmFallback;
   let recoveringWebm = false;
   let sourceKind = 'local';
-  let compositor;
-  let regionCanvas;
-  let hls;
-  let recoveryTimer;
-  let networkRecoveries = 0;
-  let mediaRecoveries = 0;
-  const regionTools = window.FrostedRegions;
   const video = document.createElement('video');
   video.muted = video.defaultMuted = true;
   video.loop = video.playsInline = true;
@@ -69,8 +62,6 @@
   function fail(error, stage = 'decode', reason) {
     if (disposed || failed) return;
     failed = true;
-    clearTimeout(recoveryTimer); recoveryTimer = undefined;
-    if (hls) { const current = hls; hls = undefined; current.destroy(); }
     const code = [1, 2, 3, 4].includes(video.error?.code) ? video.error.code : undefined;
     const diagnostic = { stage, sourceType: sourceKind, code, readyState: video.readyState, networkState: video.networkState,
       ...(/^WEBM_(READ|FORMAT|UNSUPPORTED|DECODE|LIMIT|TIMEOUT)$/.test(reason || '') ? { reason } : {}) };
@@ -95,7 +86,7 @@
     if (objectURL) { URL.revokeObjectURL(objectURL); objectURL = undefined; }
     return true;
   }
-  const videoError = error => { if (!hls && !recoveringWebm && !retryWebm(video.error)) fail(error); };
+  const videoError = error => { if (!recoveringWebm && !retryWebm(video.error)) fail(error); };
   video.addEventListener('error', videoError);
 
   function applySettings(data) {
@@ -103,71 +94,7 @@
     video.style.objectFit = ['cover', 'contain', 'fill'].includes(data.fit) ? data.fit : 'cover';
     video.style.objectPosition = typeof data.position === 'string' && data.position.length < 80 ? data.position : 'center center';
     video.playbackRate = typeof data.playbackRate === 'number' && Number.isFinite(data.playbackRate) ? Math.max(0.25, Math.min(2, data.playbackRate)) : 1;
-    const regions = regionTools?.normalizeRegions(data.regions);
-    const active = Boolean(regions?.enabled && regions.items.length);
-    video.style.visibility = active ? 'hidden' : '';
-    if (active) {
-      if (!compositor) {
-        regionCanvas = document.createElement('canvas');
-        regionCanvas.className = 'frosted-background-canvas';
-        Object.assign(regionCanvas.style, { position: 'absolute', inset: '0', width: '100%', height: '100%', pointerEvents: 'none' });
-        document.body.appendChild(regionCanvas);
-        compositor = regionTools.createCompositor({ source: video, canvas: regionCanvas });
-      }
-      compositor.update({ ...data, regions });
-    } else {
-      compositor?.dispose(); compositor = undefined;
-      regionCanvas?.remove(); regionCanvas = undefined;
-    }
     updatePlayback();
-  }
-
-  function streamingURL(value) {
-    const normalized = window.FrostedSource?.normalizeRemoteSource({ type: 'hls', kind: 'video', url: value });
-    if (!normalized) throw playerError('HTTPS stream validation is unavailable.');
-    return normalized.url;
-  }
-
-  function initializeStream(url) {
-    video.loop = false;
-    video.crossOrigin = 'anonymous';
-    const Hls = window.Hls;
-    if (Hls?.isSupported()) {
-      const retry = { maxNumRetry: 2, retryDelayMs: 500, maxRetryDelayMs: 2000 };
-      const policy = { default: { maxTimeToFirstByteMs: 10000, maxLoadTimeMs: 20000, timeoutRetry: { ...retry }, errorRetry: { ...retry } } };
-      hls = new Hls({
-        enableWorker: false, debug: false, enableInterstitialPlayback: false,
-        maxBufferLength: 20, maxMaxBufferLength: 60, backBufferLength: 10,
-        manifestLoadPolicy: policy, playlistLoadPolicy: policy, fragLoadPolicy: policy,
-        xhrSetup(xhr, address) { streamingURL(address); xhr.withCredentials = false; },
-        fetchSetup(context, init) { return new Request(streamingURL(context.url), { ...init, credentials: 'omit' }); },
-      });
-      const player = hls;
-      player.on(Hls.Events.MANIFEST_PARSED, () => { if (!disposed && !failed && hls === player) updatePlayback(); });
-      player.on(Hls.Events.ERROR, (_event, data) => {
-        if (disposed || failed || hls !== player || !data?.fatal || recoveryTimer) return;
-        let recover, delay;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRecoveries < 2) {
-          delay = 1000 * 2 ** networkRecoveries++;
-          recover = () => { player.loadSource(url); player.startLoad(); };
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries++ < 1) {
-          delay = 500; recover = () => player.recoverMediaError();
-        }
-        if (!recover) { fail(playerError('The HLS stream could not be played. Check the link, CORS permissions and supported codecs, then select the stream again.')); return; }
-        recoveryTimer = setTimeout(() => {
-          recoveryTimer = undefined;
-          if (disposed || failed || hls !== player) return;
-          try { recover(); } catch { fail(playerError('The HLS stream could not recover. Select the stream again to retry.')); }
-        }, delay);
-      });
-      sourceAssigned = true;
-      player.loadSource(url);
-      player.attachMedia(video);
-      updatePlayback();
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      sourceAssigned = true;
-      video.src = url; video.load(); updatePlayback();
-    } else throw playerError('This VS Code build does not support HLS playback.');
   }
 
   async function initialize(data) {
@@ -178,18 +105,15 @@
       const own = new URL(location.href);
       const directory = own.pathname.slice(0, own.pathname.lastIndexOf('/') + 1);
       const basename = source.pathname.slice(source.pathname.lastIndexOf('/') + 1);
-      const streaming = data.sourceType === 'hls';
-      sourceKind = streaming ? 'hls' : basename.endsWith('.webm') ? 'webm' : 'mp4';
-      if (data.sourceType !== undefined && !streaming) throw playerError('Unsupported video source type.');
-      const streamURL = streaming ? streamingURL(data.source) : undefined;
-      if (!streaming && (source.protocol !== own.protocol || source.host !== own.host || source.username || source.password || source.search || source.hash ||
+      sourceKind = basename.endsWith('.webm') ? 'webm' : 'mp4';
+      if (data.sourceType !== undefined) throw playerError('Only local video files are supported.');
+      if (source.protocol !== own.protocol || source.host !== own.host || source.username || source.password || source.search || source.hash ||
           source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1) !== directory ||
-          !/\/frosted-background-assets\/$/.test(directory) || !/^media-[a-f0-9]{64}\.(mp4|webm)$/.test(basename))) {
+          !/\/frosted-background-assets\/$/.test(directory) || !/^media-[a-f0-9]{64}\.(mp4|webm)$/.test(basename)) {
         throw playerError('Video source must be an owned cached media asset beside this player.');
       }
       applySettings(data);
       desiredPlaying = data.playing === true;
-      if (streaming) { initializeStream(streamURL); return; }
       // VS Code's vscode-file protocol supports fetch but is not registered for
       // streaming media. Decode a local Blob instead of handing that protocol
       // directly to Chromium's video demuxer.
@@ -243,11 +167,7 @@
   function cleanup() {
     if (disposed) return;
     disposed = true;
-    clearTimeout(recoveryTimer); recoveryTimer = undefined;
-    if (hls) { const current = hls; hls = undefined; current.destroy(); }
     webmFallback?.dispose(); webmFallback = undefined; recoveringWebm = false;
-    compositor?.dispose(); compositor = undefined;
-    regionCanvas?.remove(); regionCanvas = undefined;
     controller.abort();
     video.pause();
     video.removeEventListener('loadeddata', markReady);
