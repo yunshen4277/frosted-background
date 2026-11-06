@@ -15,7 +15,7 @@ function harness(options = {}) {
   const state = new Map(Object.entries({ language: 'zh-CN', lastAppliedExtensionVersion: '0.2.0', ...(options.state || {}) }));
   const configuration = { ...(options.config || {}) };
   const timers = new Map();
-  const calls = { apply: [], reapply: [], updateConfig: [], restore: [], status: [], open: [], warning: [], info: [], error: [], command: [], state: [], progress: [], log: [], configurationWrites: [], providers: [], statusBars: [], external: [], remote: [] };
+  const calls = { apply: [], reapply: [], updateConfig: [], restore: [], status: [], open: [], warning: [], info: [], error: [], command: [], state: [], progress: [], log: [], configurationWrites: [], providers: [], statusBars: [], external: [], remote: [], youtube: [] };
   const uri = file => ({ scheme: 'file', fsPath: file, path: file.replace(/\\/g, '/'), toString: () => 'file:///' + file.replace(/\\/g, '/') });
   const context = {
     subscriptions: [],
@@ -116,6 +116,7 @@ function harness(options = {}) {
       if (name === './localization') return require('../src/localization');
       if (name === '../media/source') return require('../media/source');
       if (name === './remote-media') return { resolveMediaLink: async (...args) => { calls.remote.push(args.slice(0, 2)); if (options.resolveMediaLink) return options.resolveMediaLink(...args); return options.remoteMedia; } };
+      if (name === './youtube-media') return { resolveYouTubeLink: async (...args) => { calls.youtube.push(args.slice(0, 2)); if (options.resolveYouTubeLink) return options.resolveYouTubeLink(...args); return options.youtubeMedia; } };
       return require(name);
     },
     setTimeout: options.captureTimers ? (callback, delay) => {
@@ -137,12 +138,12 @@ function harness(options = {}) {
 
 async function settle() { for (let index = 0; index < 5; index++) await new Promise(resolve => setImmediate(resolve)); }
 
-test('platform links open only the official page without changing or applying the background', async t => {
+test('Twitch links open only the official page without changing or applying the background', async t => {
   const env = harness({ state: { mediaPath: 'D:/existing.png', language: 'en' } });
   t.after(() => env.dispose());
   const panel = attachPanel(env); await settle();
-  await panel.send({ type: 'chooseUrl', kind: 'auto', url: 'https://youtu.be/dQw4w9WgXcQ?si=tracking', config: DEFAULTS });
-  assert.deepEqual(env.calls.external, ['https://www.youtube.com/watch?v=dQw4w9WgXcQ']);
+  await panel.send({ type: 'chooseUrl', kind: 'auto', url: 'https://www.twitch.tv/nasa', config: DEFAULTS });
+  assert.deepEqual(env.calls.external, ['https://www.twitch.tv/nasa']);
   assert.equal(env.calls.apply.length, 0);
   assert.equal(env.calls.warning.length, 0);
   assert.equal(env.calls.remote.length, 0);
@@ -151,6 +152,53 @@ test('platform links open only the official page without changing or applying th
   await panel.send({ type: 'chooseUrl', kind: 'auto', url: 'https://account:secret@www.twitch.tv/nasa', config: DEFAULTS });
   assert.equal(env.calls.external.length, 1);
   assert.doesNotMatch(panel.latest().error, /secret/);
+});
+
+test('YouTube links cache and apply a local video in the editor without opening a browser', async t => {
+  const env = harness({ version: '0.11.0', liveProtocol: 1, youtubeMedia: 'D:/YouTube-1aBvGJHetUM.webm',
+    state: { enabled: true, mediaPath: 'D:/old.png', injectionConsent: true, lastAppliedExtensionVersion: '0.11.0' } });
+  t.after(() => env.dispose());
+  const panel = attachPanel(env); await settle();
+  await panel.send({ type: 'chooseUrl', kind: 'video', url: 'https://youtu.be/1aBvGJHetUM?si=tracking', config: { ...DEFAULTS, paused: true, blur: 12, fit: 'fill' } });
+  assert.deepEqual(env.calls.youtube, [['https://www.youtube.com/watch?v=1aBvGJHetUM', 'video']]);
+  assert.equal(env.calls.external.length, 0);
+  assert.equal(env.calls.remote.length, 0);
+  assert.equal(env.calls.apply.length, 1);
+  assert.equal(env.calls.apply[0].mediaPath, 'D:/YouTube-1aBvGJHetUM.webm');
+  assert.equal(env.calls.apply[0].config.paused, true);
+  assert.equal(env.calls.apply[0].config.blur, 12);
+  assert.equal(env.calls.apply[0].config.fit, 'fill');
+  assert.equal(env.state.get('mediaPath'), 'D:/YouTube-1aBvGJHetUM.webm');
+  assert.equal(env.state.get('mediaSource'), undefined);
+  assert.equal(panel.latest().media.kind, 'video');
+  assert.equal(panel.latest().needsReload, false);
+  assert.equal(env.calls.command.length, 0);
+});
+
+test('YouTube load failure preserves the background and does not fall back to opening a browser', async t => {
+  const env = harness({ resolveYouTubeLink: async () => { throw new Error('YouTube video unavailable'); }, state: { mediaPath: 'D:/old.png' } });
+  t.after(() => env.dispose());
+  const panel = attachPanel(env); await settle();
+  await panel.send({ type: 'chooseUrl', kind: 'auto', url: 'https://youtu.be/1aBvGJHetUM', config: DEFAULTS });
+  assert.equal(env.calls.apply.length, 0);
+  assert.equal(env.calls.external.length, 0);
+  assert.equal(env.state.get('mediaPath'), 'D:/old.png');
+  assert.match(panel.latest().error, /YouTube/);
+  assert.equal(panel.latest().busy, false);
+});
+
+test('extension disposal cancels YouTube loading and prevents late media application', async () => {
+  let finish, signal;
+  const env = harness({ resolveYouTubeLink: async (_url, _kind, options) => {
+    signal = options.signal; return new Promise(resolve => { finish = resolve; });
+  }, state: { mediaPath: 'D:/old.png', injectionConsent: true } });
+  const panel = attachPanel(env); await settle();
+  const work = panel.send({ type: 'chooseUrl', kind: 'auto', url: 'https://youtu.be/1aBvGJHetUM', config: DEFAULTS });
+  await settle();
+  env.dispose(); assert.equal(signal.aborted, true);
+  finish('D:/late.webm'); await work;
+  assert.equal(env.calls.apply.length, 0);
+  assert.equal(env.state.get('mediaPath'), 'D:/old.png');
 });
 
 test('HLS selection persists separately, live pause keeps the source, and local selection clears it', async t => {

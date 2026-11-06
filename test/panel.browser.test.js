@@ -116,15 +116,38 @@ test('external links and explicit pause preserve one preview player and clean up
     assert.equal(await page.locator('#media-origin').textContent(), 'https://media.example.com');
     assert.ok(!(await page.locator('.media-caption').textContent()).includes('private-value'));
     assert.equal(await page.evaluate(() => document.querySelector('video') === window.__originalVideo), true);
-    for (const url of ['https://youtu.be/abcdefghijk', 'https://www.twitch.tv/example_channel']) {
-      await page.locator('#source-url').fill(url);
-      assert.equal(await page.locator('#source-kind').isDisabled(), true);
-      assert.equal(await page.locator('#choose-url').textContent(), 'Open page');
-      assert.equal(await page.locator('#source-hint').textContent(), dictionaries.en['此链接将在官方浏览器页面打开，不会用作背景。']);
-      await page.locator('#choose-url').click();
-      await sendState({ busy: false });
-      assert.equal(await page.evaluate(() => document.querySelector('video') === window.__originalVideo), true, 'opening an official platform page leaves the background player intact');
+    const youtubeUrl = 'https://youtu.be/abcdefghijk';
+    await page.locator('#source-url').fill(youtubeUrl);
+    for (const language of ['en', 'zh-CN', 'es']) {
+      await page.locator('#language').selectOption(language);
+      assert.equal(await page.locator('#source-kind').isEnabled(), true, 'YouTube permits auto or video selection');
+      assert.equal(await page.locator('#choose-url').textContent(), dictionaries[language]['载入背景']);
+      assert.equal(await page.locator('#source-hint').textContent(), dictionaries[language]['YouTube 视频会先缓存，再作为背景播放。首次使用会下载辅助工具。']);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${language} YouTube explanation fits 280px`);
+      assert.equal(await page.evaluate(() => document.querySelector('video') === window.__originalVideo), true);
     }
+    await page.locator('#language').selectOption('en');
+    for (const kind of ['auto', 'video']) {
+      await page.locator('#source-kind').selectOption(kind);
+      await page.locator('#choose-url').click();
+      const request = (await chooseMessages()).at(-1);
+      assert.equal(request.url, youtubeUrl); assert.equal(request.kind, kind);
+      assert.equal(request.config.paused, true); assert.equal(request.config.blur, 29);
+      assert.equal(await page.locator('#choose-url').textContent(), 'Loading…');
+      await sendState({ busy: false, language: 'en', config: request.config, media: { kind: 'video', name: 'Cached YouTube video.webm', uri: pathToFileURL(path.resolve(__dirname, 'fixtures/edges.webm')).href, sourceUrl: 'https://www.youtube.com/watch?v=abcdefghijk' } });
+      await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2);
+      assert.equal(await page.locator('video').evaluate(video => video.paused && video.loop), true, 'the cached YouTube result uses ordinary local playback and preserves pause');
+      assert.equal(await page.locator('#media-origin').textContent(), 'https://www.youtube.com');
+    }
+    assert.equal(await page.evaluate(() => document.querySelector('video') === window.__originalVideo), false, 'the cached YouTube result replaces the background source');
+    await page.evaluate(() => { window.__youtubeVideo = document.querySelector('video'); });
+    await page.locator('#source-url').fill('https://www.twitch.tv/example_channel');
+    assert.equal(await page.locator('#source-kind').isDisabled(), true);
+    assert.equal(await page.locator('#choose-url').textContent(), 'Open page');
+    assert.equal(await page.locator('#source-hint').textContent(), dictionaries.en['此链接将在官方浏览器页面打开，不会用作背景。']);
+    await page.locator('#choose-url').click();
+    await sendState({ busy: false });
+    assert.equal(await page.evaluate(() => document.querySelector('video') === window.__youtubeVideo), true, 'opening Twitch leaves the cached background player intact');
 
     // Use the real vendor above for packaging/CSP coverage, then a deterministic
     // adapter for lifecycle and private URL checks without contacting a stream.
