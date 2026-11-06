@@ -268,7 +268,7 @@
       host.classList.add('frosted-background-ready');
       updatePlayback();
     };
-    const onError = error => {
+    const onError = (error, diagnostic) => {
       if (stopped) return;
       failed = true;
       layer.dataset.state = 'error';
@@ -276,7 +276,15 @@
       host.classList.remove('frosted-background-ready');
       if (framedVideo) postPlayer({ action: 'playback', playing: false });
       else if (config.kind === 'video') media.pause();
-      console.warn('[Frosted Background] Media could not be decoded. The normal editor background has been restored.', typeof error === 'string' ? error : media.error?.message || '');
+      const safe = diagnostic && typeof diagnostic === 'object' ? {
+        stage: ['read', 'decode', 'compatibility'].includes(diagnostic.stage) ? diagnostic.stage : 'decode',
+        sourceType: ['local', 'webm', 'mp4', 'hls'].includes(diagnostic.sourceType) ? diagnostic.sourceType : 'local',
+        code: [1, 2, 3, 4].includes(diagnostic.code) ? diagnostic.code : undefined,
+        readyState: Number.isInteger(diagnostic.readyState) && diagnostic.readyState >= 0 && diagnostic.readyState <= 4 ? diagnostic.readyState : undefined,
+        networkState: Number.isInteger(diagnostic.networkState) && diagnostic.networkState >= 0 && diagnostic.networkState <= 3 ? diagnostic.networkState : undefined,
+        reason: /^WEBM_(READ|FORMAT|UNSUPPORTED|DECODE|LIMIT|TIMEOUT)$/.test(diagnostic.reason || '') ? diagnostic.reason : undefined,
+      } : undefined;
+      console.warn('[Frosted Background] Media could not be decoded. The normal editor background has been restored.', typeof error === 'string' ? error : 'Media load failed.', safe || '');
     };
     const initializePlayer = () => {
       if (stopped || failed) return;
@@ -290,7 +298,7 @@
       if (!data || data.type !== 'frosted-background-player' || data.channel !== channel || stopped) return;
       if (data.event === 'booted') initializePlayer();
       else if (data.event === 'media-ready') onReady();
-      else if (data.event === 'error') onError(typeof data.detail === 'string' ? data.detail.slice(0, 300) : 'Player load failed.');
+      else if (data.event === 'error') onError(typeof data.detail === 'string' ? data.detail.slice(0, 300) : 'Player load failed.', data.diagnostic);
       else if (data.event === 'playback-blocked') console.warn('[Frosted Background] Video playback is paused; focus or click the editor to retry.');
     };
     if (framedVideo) {

@@ -22,6 +22,9 @@
   let playPending = false;
   let playbackBlocked = false;
   let objectURL;
+  let webmFallback;
+  let recoveringWebm = false;
+  let sourceKind = 'local';
   let compositor;
   let regionCanvas;
   let hls;
@@ -43,16 +46,18 @@
   Object.assign(video.style, { position: 'absolute', inset: '0', width: '100%', height: '100%', display: 'block', pointerEvents: 'none' });
   document.body.appendChild(video);
 
-  function send(event, detail) {
-    if (!disposed) parent.postMessage({ type: MESSAGE, channel, event, detail }, targetOrigin);
+  const playerError = message => Object.assign(new Error(message), { frostedSafe: true });
+  function send(event, detail, diagnostic) {
+    if (!disposed) parent.postMessage({ type: MESSAGE, channel, event, detail, ...(diagnostic ? { diagnostic } : {}) }, targetOrigin);
   }
   function updatePlayback() {
-    if (disposed || failed || !sourceAssigned) return;
+    if (disposed || failed || !sourceAssigned || recoveringWebm) return;
     if (!desiredPlaying || manuallyPaused) { video.pause(); return; }
     if (playPending || playbackBlocked || !video.paused) return;
     playPending = true;
     Promise.resolve(video.play()).catch(error => {
       if (disposed || error.name === 'AbortError') return;
+      if (recoveringWebm || retryWebm(video.error)) return;
       playbackBlocked = true;
       send('playback-blocked', 'Automatic playback was blocked; click or focus the editor to retry.');
     }).finally(() => {
@@ -61,22 +66,36 @@
       else if (ready && video.paused && !playbackBlocked && !failed) updatePlayback();
     });
   }
-  function fail(error) {
+  function fail(error, stage = 'decode', reason) {
     if (disposed || failed) return;
     failed = true;
     clearTimeout(recoveryTimer); recoveryTimer = undefined;
     if (hls) { const current = hls; hls = undefined; current.destroy(); }
+    const code = [1, 2, 3, 4].includes(video.error?.code) ? video.error.code : undefined;
+    const diagnostic = { stage, sourceType: sourceKind, code, readyState: video.readyState, networkState: video.networkState,
+      ...(/^WEBM_(READ|FORMAT|UNSUPPORTED|DECODE|LIMIT|TIMEOUT)$/.test(reason || '') ? { reason } : {}) };
+    webmFallback?.dispose(); webmFallback = undefined; recoveringWebm = false;
     video.pause();
-    send('error', error instanceof Error ? error.message : `Video decoder error ${video.error?.code || 'unknown'}.`);
+    // Only our fixed messages cross the frame boundary; native errors can
+    // contain a local path, signed URL or platform-specific resource detail.
+    send('error', error?.frostedSafe === true ? error.message : code ? `Video decoder error ${code}.` : 'The video could not be loaded.', diagnostic);
   }
   function markReady() {
-    if (disposed || failed || video.readyState < 2 || !video.videoWidth) return;
+    if (disposed || failed || recoveringWebm || video.readyState < 2 || !video.videoWidth) return;
     if (!ready) { ready = true; send('media-ready'); }
     updatePlayback();
   }
   video.addEventListener('loadeddata', markReady);
   video.addEventListener('canplay', markReady);
-  const videoError = error => { if (!hls) fail(error); };
+  function retryWebm(error) {
+    // The helper stays active throughout MSE playback. A later autoplay-policy
+    // rejection has no decoder error and must not restart the recovery gate.
+    if (error?.code !== 4 || disposed || failed || !webmFallback || !webmFallback.retry(error)) return false;
+    recoveringWebm = true; playbackBlocked = false; ready = false;
+    if (objectURL) { URL.revokeObjectURL(objectURL); objectURL = undefined; }
+    return true;
+  }
+  const videoError = error => { if (!hls && !recoveringWebm && !retryWebm(video.error)) fail(error); };
   video.addEventListener('error', videoError);
 
   function applySettings(data) {
@@ -105,7 +124,7 @@
 
   function streamingURL(value) {
     const normalized = window.FrostedSource?.normalizeRemoteSource({ type: 'hls', kind: 'video', url: value });
-    if (!normalized) throw new Error('HTTPS stream validation is unavailable.');
+    if (!normalized) throw playerError('HTTPS stream validation is unavailable.');
     return normalized.url;
   }
 
@@ -134,11 +153,11 @@
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries++ < 1) {
           delay = 500; recover = () => player.recoverMediaError();
         }
-        if (!recover) { fail(new Error('The HLS stream could not be played. Check the link, CORS permissions and supported codecs, then select the stream again.')); return; }
+        if (!recover) { fail(playerError('The HLS stream could not be played. Check the link, CORS permissions and supported codecs, then select the stream again.')); return; }
         recoveryTimer = setTimeout(() => {
           recoveryTimer = undefined;
           if (disposed || failed || hls !== player) return;
-          try { recover(); } catch { fail(new Error('The HLS stream could not recover. Select the stream again to retry.')); }
+          try { recover(); } catch { fail(playerError('The HLS stream could not recover. Select the stream again to retry.')); }
         }, delay);
       });
       sourceAssigned = true;
@@ -148,7 +167,7 @@
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       sourceAssigned = true;
       video.src = url; video.load(); updatePlayback();
-    } else throw new Error('This VS Code build does not support HLS playback.');
+    } else throw playerError('This VS Code build does not support HLS playback.');
   }
 
   async function initialize(data) {
@@ -160,12 +179,13 @@
       const directory = own.pathname.slice(0, own.pathname.lastIndexOf('/') + 1);
       const basename = source.pathname.slice(source.pathname.lastIndexOf('/') + 1);
       const streaming = data.sourceType === 'hls';
-      if (data.sourceType !== undefined && !streaming) throw new Error('Unsupported video source type.');
+      sourceKind = streaming ? 'hls' : basename.endsWith('.webm') ? 'webm' : 'mp4';
+      if (data.sourceType !== undefined && !streaming) throw playerError('Unsupported video source type.');
       const streamURL = streaming ? streamingURL(data.source) : undefined;
       if (!streaming && (source.protocol !== own.protocol || source.host !== own.host || source.username || source.password || source.search || source.hash ||
           source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1) !== directory ||
           !/\/frosted-background-assets\/$/.test(directory) || !/^media-[a-f0-9]{64}\.(mp4|webm)$/.test(basename))) {
-        throw new Error('Video source must be an owned cached media asset beside this player.');
+        throw playerError('Video source must be an owned cached media asset beside this player.');
       }
       applySettings(data);
       desiredPlaying = data.playing === true;
@@ -174,19 +194,38 @@
       // streaming media. Decode a local Blob instead of handing that protocol
       // directly to Chromium's video demuxer.
       const response = await fetch(source.href, { signal: controller.signal, credentials: 'omit', redirect: 'error' });
-      if (!response.ok) throw new Error(`Could not read cached video (HTTP ${response.status}).`);
+      if (!response.ok) throw playerError(`Could not read cached video (HTTP ${response.status}).`);
       const limit = 500 * 1024 * 1024;
-      if (Number(response.headers.get('content-length')) > limit) throw new Error('Cached video exceeds 500 MB.');
+      if (Number(response.headers.get('content-length')) > limit) throw playerError('Cached video exceeds 500 MB.');
       const blob = await response.blob();
       if (disposed) return;
-      if (!blob.size || blob.size > limit) throw new Error('Cached video is empty or exceeds 500 MB.');
+      if (!blob.size || blob.size > limit) throw playerError('Cached video is empty or exceeds 500 MB.');
+      if (basename.endsWith('.webm') && window.FrostedWebm) {
+        webmFallback = window.FrostedWebm.createFallback({
+          video,
+          // Reuse the bytes already fetched. No second local read or remote
+          // request is needed when this VS Code build lacks WebM demuxing.
+          load: async signal => {
+            if (disposed || signal.aborted) throw new DOMException('Aborted', 'AbortError');
+            const bytes = new Uint8Array(await blob.arrayBuffer());
+            if (disposed || signal.aborted) throw new DOMException('Aborted', 'AbortError');
+            return bytes;
+          },
+          onReady: () => {
+            if (disposed || failed) return;
+            recoveringWebm = false; playbackBlocked = false;
+            markReady(); updatePlayback();
+          },
+          onError: error => fail(playerError('The cached WebM could not be played using the compatibility decoder.'), 'compatibility', error?.code),
+        });
+      }
       objectURL = URL.createObjectURL(new Blob([blob], { type: basename.endsWith('.webm') ? 'video/webm' : 'video/mp4' }));
       sourceAssigned = true;
       video.src = objectURL;
       video.load();
       updatePlayback();
     } catch (error) {
-      if (!disposed && error.name !== 'AbortError') fail(error);
+      if (!disposed && error.name !== 'AbortError') fail(error, 'read');
     }
   }
   function receive(event) {
@@ -206,6 +245,7 @@
     disposed = true;
     clearTimeout(recoveryTimer); recoveryTimer = undefined;
     if (hls) { const current = hls; hls = undefined; current.destroy(); }
+    webmFallback?.dispose(); webmFallback = undefined; recoveringWebm = false;
     compositor?.dispose(); compositor = undefined;
     regionCanvas?.remove(); regionCanvas = undefined;
     controller.abort();

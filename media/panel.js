@@ -52,6 +52,8 @@
   let previewErrorKey = null;
   let mediaFailed = false;
   let previewLoading = false;
+  let previewLoadingKey = '正在加载直播…';
+  let webmFallback = null;
   let hlsPlayer = null;
   let nativeHls = false;
   let sourceErrorKey = null;
@@ -98,7 +100,7 @@
       }
     }
     if (previewErrorKey) byId('preview-error').textContent = translate(previewErrorKey);
-    byId('preview-loading').textContent = translate('正在加载直播…');
+    byId('preview-loading').textContent = translate(previewLoadingKey);
     // Only text changes. The current image/video element, time, and draft stay
     // intact; updateMedia has an identity guard for authoritative host echoes.
     updateMedia();
@@ -320,6 +322,7 @@
   }
 
   function renderPreview() {
+    byId('preview-loading').textContent = translate(previewLoadingKey);
     byId('preview-loading').hidden = !previewLoading || mediaFailed;
     byId('preview').style.backgroundColor = 'var(--vscode-editor-background, #111923)';
     byId('preview').classList.toggle('is-region-editing', regionEditing);
@@ -368,12 +371,14 @@
     byId('preview').classList.toggle('has-media', Boolean(valid));
     if (identity === mediaIdentity) return;
     mediaIdentity = identity;
+    disposeWebm();
     disposeHls();
     if (compositor) { compositor.dispose(); compositor = null; }
     byId('region-canvas').width = 1; byId('region-canvas').height = 1;
     byId('region-canvas').hidden = true;
     mediaFailed = false;
     previewLoading = Boolean(valid && media.type === 'hls');
+    previewLoadingKey = '正在加载直播…';
     cancelGesture(false); drawingErrorKey = null;
     if (!valid) regionEditing = false;
     videoReady = false;
@@ -400,11 +405,75 @@
     }
     element.addEventListener('error', () => {
       if (element !== currentMedia) return;
-      failPreview(element, media.type === 'hls' ? '直播无法预览，请检查播放地址、跨域权限或视频编码。' : media.kind === 'video' ? '此视频无法预览，请尝试 WebM 格式。' : '无法读取预览，请重新选择图片。');
+      if (media.kind === 'video' && media.type !== 'hls' && webmFallback && (webmFallback.active || element.error?.code === 4)) {
+        previewLoading = true; previewLoadingKey = '正在以兼容模式加载视频…';
+        if (webmFallback.retry(element.error)) { renderPreview(); return; }
+        previewLoading = false;
+      }
+      failPreview(element, media.type === 'hls' ? '直播无法预览，请检查播放地址、跨域权限或视频编码。' : media.kind === 'video' ? videoErrorKey(element.error?.code) : '无法读取预览，请重新选择图片。');
     });
     byId('preview-media').append(element);
     if (media.type === 'hls') attachHls(element, media.uri);
-    else element.src = media.uri;
+    else {
+      if (media.kind === 'video' && isWebmMedia(media) && window.FrostedWebm) {
+        const fallback = window.FrostedWebm.createFallback({
+          video: element,
+          load: signal => readVideoBytes(media.uri, signal),
+          onReady: () => { if (element === currentMedia && webmFallback === fallback) renderPreview(); },
+          onError: error => { if (element === currentMedia && webmFallback === fallback) failPreview(element, videoErrorKey(error?.code)); },
+        });
+        webmFallback = fallback;
+      }
+      element.src = media.uri;
+    }
+  }
+
+  function videoErrorKey(code) {
+    if (code === 2 || ['WEBM_READ', 'WEBM_TIMEOUT'].includes(code)) return '无法读取视频，请确认文件可访问且不超过 500 MB。';
+    if (code === 'WEBM_LIMIT') return '视频超出当前播放器的缓冲区容量，请选择较小的文件。';
+    if (code === 3 || code === 'WEBM_DECODE') return '视频解码失败，请检查文件是否损坏或更换编码。';
+    return '此视频的容器或编码不受支持。';
+  }
+
+  function isWebmMedia(media) {
+    if (typeof media.name === 'string' && /\.webm$/i.test(media.name)) return true;
+    try { return /\.webm$/i.test(decodeURIComponent(new URL(media.uri).pathname)); }
+    catch { return false; }
+  }
+
+  async function readVideoBytes(uri, signal) {
+    const limit = Math.min(window.FrostedWebm?.MAX_BYTES || 500 * 1024 * 1024, 500 * 1024 * 1024);
+    const response = await fetch(uri, { signal, credentials: 'omit' });
+    const reader = response.body?.getReader();
+    let complete = false;
+    try {
+      if (!response.ok || !reader || Number(response.headers.get('content-length')) > limit) throw new Error('Video cannot be read within the size limit');
+      const chunks = []; let total = 0;
+      while (true) {
+        signal.throwIfAborted();
+        const { value, done } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > limit) throw new Error('Video exceeds the size limit');
+        chunks.push(value);
+      }
+      signal.throwIfAborted();
+      const bytes = new Uint8Array(total); let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+      complete = true;
+      return bytes;
+    } finally {
+      if (reader) {
+        if (!complete) await reader.cancel().catch(() => {});
+        reader.releaseLock();
+      }
+    }
+  }
+
+  function disposeWebm() {
+    const fallback = webmFallback;
+    webmFallback = null;
+    fallback?.dispose();
   }
 
   function disposeHls() {
@@ -419,6 +488,7 @@
   function failPreview(element, key) {
     if (element !== currentMedia) return;
     cancelGesture(false); mediaFailed = true; previewLoading = false;
+    disposeWebm();
     disposeHls();
     previewErrorKey = key;
     byId('preview-error').textContent = translate(key);
@@ -927,6 +997,7 @@
   window.addEventListener('pagehide', () => {
     if (debounceTimer) clearTimeout(debounceTimer);
     if (currentMedia?.tagName === 'VIDEO') currentMedia.pause();
+    disposeWebm();
     disposeHls();
     if (compositor) { compositor.dispose(); compositor = null; }
   });
