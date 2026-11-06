@@ -101,7 +101,7 @@ function selectPackageFiles(files, pkg) {
   const required = ['package.json', ...catalogs, 'README.md', 'LICENSE', pkg.main.replace(/^\.\//, ''), 'media/renderer.js',
     'src/panel.js', 'src/panel-ui.js', 'media/panel.js', 'media/panel.css', 'media/background-icon.svg', 'media/video-player.js',
     'src/updater.js', 'src/github-update.js', 'src/localization.js', 'media/i18n.js', 'media/regions.js',
-    'src/remote-media.js', 'src/youtube-media.js', 'src/youtube-tools.js', 'media/source.js', 'media/vendor/hls.min.js', 'media/vendor/HLS-LICENSE.txt'];
+    'src/remote-media.js', 'src/youtube-media.js', 'src/youtube-tools.js', 'media/source.js', 'media/webm-player.js', 'media/vendor/hls.min.js', 'media/vendor/HLS-LICENSE.txt'];
   for (const file of required) {
     if (!packaged.includes(file)) throw new Error(`Missing package file: ${file}`);
   }
