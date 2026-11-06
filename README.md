@@ -2,10 +2,10 @@
 
 为 VS Code 的整个代码编辑区设置本地或外链图片、视频及 HLS 直播背景。背景单独模糊，代码文字保持清晰；窗口缩放、侧栏展开、面板调整和编辑器分屏时，背景自动跟随编辑区大小。
 
-## 安装和使用（0.10.0）
+## 安装和使用（0.11.0）
 
 1. 在 VS Code 中按 `Ctrl+Shift+P`（macOS：`Cmd+Shift+P`），运行 **Extensions: Install from VSIX… / 扩展: 从 VSIX 安装…**。
-2. 选择 `frosted-background-0.10.0.vsix`。如果安装过旧版，覆盖安装后重载窗口。
+2. 选择 `frosted-background-0.11.0.vsix`。如果安装过旧版，覆盖安装后重载窗口。
 3. 点击状态栏右下角的 **Frosted**，或者左侧活动栏的背景图标，打开控制面板。也可以运行 **Frosted Background: Open Control Panel**（中文 VS Code 中为 **毛玻璃背景: 打开控制面板**）。界面默认英文；在顶部 **Language** 下拉框选择 **简体中文** 后，可按下面的中文按钮操作。
 4. 在面板里点击 **选择图片** 或 **选择视频**，选择本机文件后自动应用。首次启用时阅读界面修改说明，再点击 **启用背景**。
 5. 首次启用或迁移新版渲染器时，面板会提示需要重载。点击唯一的 **应用 / Apply / Aplicar** 主按钮，完成应用及必要的重载；选择文件本身不会重载窗口。
@@ -30,7 +30,8 @@
 | PNG、JPEG、WebP、GIF、BMP、AVIF 图片直链 | 下载到本机缓存后自动作为背景 |
 | MP4、WebM 视频文件直链 | 下载完成后自动作为静音循环背景，支持暂停、继续和速度调整 |
 | M3U8 / HLS 视频或直播流 | 边加载边播放，沿用布局、模糊、渐变和区域效果 |
-| YouTube 视频／直播、Twitch 频道／录像／片段 | 在默认浏览器打开官方播放页，由官方播放器控制；编辑区保持当前背景 |
+| YouTube 普通公开视频 | Windows x64 上先自动缓存，再直接作为代码区视频背景，支持全部已有视觉效果和播放控制 |
+| Twitch 频道／录像／片段 | 在默认浏览器打开官方播放页，由官方播放器控制；编辑区保持当前背景 |
 
 文件地址没有扩展名时可自动读取内容类型，或手动选类型。普通图片、视频每个文件不超过 500 MiB，下载可以取消；失败时保留当前背景。HTTP、包含账号密码的 URL、本机和内网地址不受支持。
 
@@ -40,7 +41,13 @@ HLS 站点的播放列表、分片和密钥必须允许跨域访问（CORS），
 
 外链文件下载在本机扩展缓存中保留副本；HLS 原始链接（可能含临时签名）保存在本机扩展状态和当前安装的背景配置中，不写入工作区或上传到 GitHub。界面名称和下载错误不展示查询参数。HLS 播放会连接提供链接的站点及其分片服务器。
 
-YouTube 和 Twitch 使用官方网页播放，是因为其播放器有来源校验与可见性要求，不作为代码下方的毛玻璃背景。详见 [YouTube 官方要求](https://developers.google.com/youtube/terms/required-minimum-functionality) 和 [Twitch 嵌入要求](https://dev.twitch.tv/docs/embed/)；HLS 跨域要求见 [hls.js 官方文档](https://github.com/video-dev/hls.js#cors)。
+**YouTube 使用方法**：粘贴视频或 Shorts 链接，类型选“自动识别”或“视频”，点击 **载入背景 / Load background**。下载完成后直接替换编辑区背景，不再打开浏览器。已缓存视频的播放不依赖临时在线地址，可继续使用暂停、循环、缩放、模糊、分区和渐变。
+
+首次使用会从官方 GitHub Releases 下载固定版本的 yt-dlp 和 Deno（合计约 67 MB），校验后存放在本机扩展缓存中；后续使用先校验并复用工具，无需自行安装。视频优先使用不超过 720p 的 VP8/VP9 WebM 视频轨，其次使用 H.264 MP4；背景静音，不下载或合并独立音轨。单个视频不超过 500 MiB，进度可见且可以取消。辅助工具和视频不会写进代码工作区或上传到本仓库。
+
+当前 YouTube 导入支持 **Windows x64、普通公开视频**，尚不支持 YouTube 直播、频道页、播放列表批量导入、需登录或受限制的视频。平台拒绝访问或没有兼容格式时会保留原背景并提示，不会自动读取浏览器账号、Cookie 或弹出官方网页。此功能使用本机缓存视频，不嵌入 YouTube 官方播放器；Twitch 仍使用官方网页。M3U8 直播直链的跨域要求见 [hls.js 官方文档](https://github.com/video-dev/hls.js#cors)。
+
+辅助工具来源与许可：[yt-dlp 2026.10.26](https://github.com/yt-dlp/yt-dlp/releases/tag/2026.10.26)（官方 Windows 可执行包包含 GPLv3+ 组件，参见[许可说明](https://github.com/yt-dlp/yt-dlp/blob/2026.10.26/README.md#licensing)）；[Deno 2.9.8](https://github.com/denoland/deno/releases/tag/v2.9.8)（[MIT 许可](https://github.com/denoland/deno/blob/v2.9.8/LICENSE.md)）。辅助工具从官方源单独下载，不包含在 VSIX 中。
 
 ## 分区效果
 
@@ -176,9 +183,9 @@ Chrome / Playwright 回归验证的是浏览器中的编辑区模拟页面和本
 首次可以完全通过 GitHub 网页发布：
 
 1. 将源码上传到公开仓库的 `main` 分支根目录，保留 `.github/workflows`、`scripts`、`src`、`media` 和 `test` 目录；不要只上传源码 ZIP。
-2. 在仓库 **Actions → CI** 等待检查通过。确认 `package.json` 是要发布的版本（当前为 `0.10.0`，继续保持 0.x.x）。
+2. 在仓库 **Actions → CI** 等待检查通过。确认 `package.json` 是要发布的版本（当前为 `0.11.0`，继续保持 0.x.x）。
 3. 打开 **Actions → Release → Run workflow**，分支选择 **main**，再点击 **Run workflow**。无需预先创建标签或 Release。
-4. 工作流从 `package.json` 派生版本标签（当前为 `v0.10.0`），完成仓库绑定、测试、打包与校验后，为本次运行的提交创建标签和公开 Release，上传 VSIX、源码 ZIP 与 `update-manifest.json`。
+4. 工作流从 `package.json` 派生版本标签（当前为 `v0.11.0`），完成仓库绑定、测试、打包与校验后，为本次运行的提交创建标签和公开 Release，上传 VSIX、源码 ZIP 与 `update-manifest.json`。
 5. 从新建 Release 下载并手动安装一次 VSIX，此安装包才包含当前仓库的自动更新来源。
 
 后续发布时，先修改代码并增加 `package.json` 的稳定版本号（例如 `0.4.1`），提交到 `main` 并等待 CI 通过，再运行上述 Release 工作流。也可以直接创建并推送匹配版本的标签（例如 `v0.4.1`）触发发布；工作流仍会严格核对实际标签和包版本。
