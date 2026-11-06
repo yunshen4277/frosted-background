@@ -472,18 +472,20 @@
     try {
       if (sourceApi) return sourceApi.classifyLink(value, byId('source-kind').value);
       const url = validatedUrl(value);
-      const platform = ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be', 'www.youtube-nocookie.com', 'twitch.tv', 'www.twitch.tv', 'm.twitch.tv', 'player.twitch.tv', 'clips.twitch.tv'].includes(url.hostname);
-      return { type: platform ? 'platform' : byId('source-kind').value, url: url.href };
+      const platform = ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be', 'www.youtube-nocookie.com'].includes(url.hostname) ? 'YouTube'
+        : ['twitch.tv', 'www.twitch.tv', 'm.twitch.tv', 'player.twitch.tv', 'clips.twitch.tv'].includes(url.hostname) ? 'Twitch' : null;
+      return { type: platform ? 'platform' : byId('source-kind').value, platform, url: url.href };
     } catch { return null; }
   }
 
   function renderLinkControls() {
     const info = linkInfo();
-    const platform = info?.type === 'platform';
-    byId('source-kind').disabled = Boolean(state.busy || platform);
+    const youtube = info?.type === 'platform' && info.platform === 'YouTube';
+    const opensPage = info?.type === 'platform' && !youtube;
+    byId('source-kind').disabled = Boolean(state.busy || opensPage);
     byId('choose-url').disabled = Boolean(state.busy || !byId('source-url').value.trim());
-    byId('choose-url').textContent = translate(loadingUrl ? '正在载入…' : platform ? '打开网页' : '载入链接');
-    byId('source-hint').textContent = translate(platform ? '此链接将在官方浏览器页面打开，不会用作背景。' : info?.type === 'hls' || byId('source-kind').value === 'hls' ? 'HLS直播需要允许跨域访问的HTTPS播放地址。' : '支持图片、视频直链与HLS直播；YouTube和Twitch在官方网页打开。');
+    byId('choose-url').textContent = translate(loadingUrl ? '正在载入…' : youtube ? '载入背景' : opensPage ? '打开网页' : '载入链接');
+    byId('source-hint').textContent = translate(youtube ? 'YouTube 视频会先缓存，再作为背景播放。首次使用会下载辅助工具。' : opensPage ? '此链接将在官方浏览器页面打开，不会用作背景。' : info?.type === 'hls' || byId('source-kind').value === 'hls' ? 'HLS直播需要允许跨域访问的HTTPS播放地址。' : '支持图片、视频直链、YouTube 视频与 HLS 直播；Twitch 在官方网页打开。');
     byId('source-error').textContent = sourceErrorKey ? translate(sourceErrorKey) : '';
     byId('source-error').hidden = !sourceErrorKey;
   }
