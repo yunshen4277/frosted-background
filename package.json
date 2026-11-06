@@ -2,7 +2,7 @@
   "name": "frosted-background",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.11.1",
+  "version": "0.12.0",
   "frostedBackgroundUpdates": {
     "repository": "yunshen4277/frosted-background"
   },
@@ -143,89 +143,6 @@
           "default": false,
           "scope": "application",
           "description": "%setting.paused.description%"
-        },
-        "frostedBackground.regions": {
-          "type": "object",
-          "default": {
-            "enabled": false,
-            "items": []
-          },
-          "scope": "application",
-          "description": "%setting.regions.description%",
-          "additionalProperties": false,
-          "properties": {
-            "enabled": {
-              "type": "boolean"
-            },
-            "items": {
-              "type": "array",
-              "maxItems": 8,
-              "items": {
-                "type": "object",
-                "required": [
-                  "points"
-                ],
-                "additionalProperties": false,
-                "properties": {
-                  "id": {
-                    "type": "string",
-                    "maxLength": 40,
-                    "pattern": "^[a-zA-Z0-9_-]+$"
-                  },
-                  "name": {
-                    "type": "string",
-                    "maxLength": 40
-                  },
-                  "points": {
-                    "type": "array",
-                    "minItems": 3,
-                    "maxItems": 64,
-                    "items": {
-                      "type": "array",
-                      "minItems": 2,
-                      "maxItems": 2,
-                      "items": {
-                        "type": "number",
-                        "minimum": 0,
-                        "maximum": 1
-                      }
-                    }
-                  },
-                  "feather": {
-                    "type": "number",
-                    "minimum": 0,
-                    "maximum": 0.3,
-                    "default": 0
-                  },
-                  "blur": {
-                    "type": "number",
-                    "minimum": 0,
-                    "maximum": 60
-                  },
-                  "opacity": {
-                    "type": "number",
-                    "minimum": 0.05,
-                    "maximum": 1
-                  },
-                  "tintOpacity": {
-                    "type": "number",
-                    "minimum": 0,
-                    "maximum": 0.9
-                  },
-                  "brightness": {
-                    "type": "number",
-                    "minimum": 0.2,
-                    "maximum": 2
-                  },
-                  "saturation": {
-                    "type": "number",
-                    "minimum": 0,
-                    "maximum": 2
-                  }
-                }
-              }
-            }
-          }
         },
         "frostedBackground.updateMode": {
           "type": "string",

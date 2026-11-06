@@ -1,6 +1,5 @@
 {
   "setting.paused.description": "Pausa manualmente el vídeo o directo de fondo. Reanuda con el botón Reproducir del panel.",
-  "setting.regions.description": "Efectos por zonas editados en el panel. Hasta 8 zonas controlan por separado el desenfoque, la opacidad, el tinte, el brillo y la saturación, con bordes difuminados ajustables. Las coordenadas siguen la imagen o el vídeo original; las zonas posteriores tienen prioridad al superponerse.",
   "extension.displayName": "Frosted Background",
   "extension.description": "Elige una imagen o un vídeo sin sonido como fondo del editor, con efecto de cristal esmerilado ajustable y tamaño adaptable.",
   "extension.category": "Fondo esmerilado",
