@@ -308,7 +308,8 @@ async function applyChecked({ appRoot, rendererPath, mediaPath, mediaSource, con
     const regionsPath = path.join(path.dirname(rendererPath), 'regions.js');
     const regionsBytes = await readRuntimeSource(regionsPath, MAX_REGIONS_BYTES, '区域效果文件无效或缺失，请重新安装插件。');
     const sourceBytes = await readRuntimeSource(path.join(path.dirname(rendererPath), 'source.js'), MAX_SOURCE_BYTES, '媒体来源文件无效或缺失，请重新安装插件。');
-    const sharedBundle = Buffer.concat([regionsBytes, SCRIPT_SEPARATOR, sourceBytes, SCRIPT_SEPARATOR]);
+    const webmBytes = await readRuntimeSource(path.join(path.dirname(rendererPath), 'webm-player.js'), MAX_SOURCE_BYTES, '插件运行文件无效或过大，请重新安装插件。');
+    const sharedBundle = Buffer.concat([regionsBytes, SCRIPT_SEPARATOR, sourceBytes, SCRIPT_SEPARATOR, webmBytes, SCRIPT_SEPARATOR]);
     const availableRuntimeBytes = MAX_RUNTIME_BYTES - sharedBundle.length;
     const rendererBytes = await readRuntimeSource(rendererPath, availableRuntimeBytes, '插件运行文件无效或过大，请重新安装插件。');
     const rendererBundle = Buffer.concat([sharedBundle, rendererBytes]);

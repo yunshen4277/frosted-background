@@ -6,7 +6,7 @@ function escapeAttribute(value) {
   return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 }
 
-function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, sourceUri, hlsUri, nonce, language = 'en' }) {
+function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, sourceUri, hlsUri, webmUri, nonce, language = 'en' }) {
   language = normalizeLanguage(language);
   const text = key => escapeAttribute(t(language, key));
   const label = key => `<span data-i18n="${escapeAttribute(key)}">${text(key)}</span>`;
@@ -134,6 +134,7 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, 
   ${sourceUri ? `<script nonce="${token}" src="${escapeAttribute(sourceUri)}"></script>` : ''}
   ${regionsUri ? `<script nonce="${token}" src="${escapeAttribute(regionsUri)}"></script>` : ''}
   ${hlsUri ? `<script nonce="${token}" src="${escapeAttribute(hlsUri)}"></script>` : ''}
+  ${webmUri ? `<script nonce="${token}" src="${escapeAttribute(webmUri)}"></script>` : ''}
   <script nonce="${token}" src="${escapeAttribute(scriptUri)}"></script>
 </body>
 </html>`;

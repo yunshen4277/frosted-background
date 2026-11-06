@@ -25,7 +25,7 @@ function activate(context) {
   let runtimeReady = false;
   let panel;
   let updater;
-  const extensionVersion = context.extension?.packageJSON?.version || '0.11.0';
+  const extensionVersion = context.extension?.packageJSON?.version || '0.11.1';
   const readSelection = () => context.globalState.get('mediaSource') || context.globalState.get('mediaPath');
   const windowSession = typeof vscode.env.sessionId === 'string' && vscode.env.sessionId !== 'someValue.sessionId' ? vscode.env.sessionId : '';
   const bootstrapKey = windowSession ? 'bootstrapRequired:' + windowSession : undefined;

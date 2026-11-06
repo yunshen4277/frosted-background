@@ -49,6 +49,7 @@ class BackgroundPanel {
       regionsUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/regions.js'))).toString(),
       hlsUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/vendor/hls.min.js'))).toString(),
       sourceUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/source.js'))).toString(),
+      webmUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/webm-player.js'))).toString(),
       language: this.language,
       nonce: crypto.randomBytes(24).toString('base64')
     });
