@@ -32,6 +32,154 @@ test('panel localization catalog covers markup and defaults to English without a
   assert.equal(t('en', '__proto__'), '__proto__');
 });
 
+test('WebM compatibility recovers native code 4 with real MSE and cancels stale bounded loads', {
+  skip: !process.env.PLAYWRIGHT_MODULE,
+  timeout: 30000,
+}, async () => {
+  const { chromium } = require(process.env.PLAYWRIGHT_MODULE);
+  const executablePath = process.env.BROWSER_EXECUTABLE || [
+    'C:/Program Files/Google/Chrome/Application/chrome.exe',
+    'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+  ].find(value => fs.existsSync(value));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'frosted-webm-panel-test-'));
+  const fixtureFile = path.join(directory, 'panel.html');
+  const asset = name => pathToFileURL(path.resolve(__dirname, '../media', name)).href;
+  const bytes = fs.readFileSync(path.resolve(__dirname, 'fixtures/colors.webm'));
+  fs.writeFileSync(fixtureFile, renderPanelHtml({
+    cspSource: 'file:', nonce: 'webm-panel-test-nonce',
+    scriptUri: asset('panel.js'), styleUri: asset('panel.css'), i18nUri: asset('i18n.js'),
+    regionsUri: asset('regions.js'), webmUri: asset('webm-player.js'),
+  }));
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true, executablePath });
+    const page = await browser.newPage({ viewport: { width: 280, height: 620 }, reducedMotion: 'no-preference' });
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.route('https://panel.example/**', route => route.fulfill({ status: 200, contentType: 'video/webm', headers: { 'access-control-allow-origin': '*' }, body: bytes }));
+    await page.addInitScript(fixture => {
+      window.__messages = []; window.__violations = []; window.__fetches = []; window.__fetchMode = 'normal';
+      window.acquireVsCodeApi = () => ({ getState: () => window.__saved, setState: value => { window.__saved = value; }, postMessage: value => window.__messages.push(value) });
+      document.addEventListener('securitypolicyviolation', event => window.__violations.push(event.violatedDirective));
+      const fetch = window.fetch.bind(window);
+      window.fetch = (url, options) => {
+        window.__fetches.push({ url, signal: options.signal });
+        if (window.__fetchMode === 'defer') return new Promise(resolve => { window.__releaseFetch = () => resolve(new Response(new Uint8Array(fixture))); });
+        if (window.__fetchMode === 'oversize') return Promise.resolve(new Response(new Uint8Array([1]), { headers: { 'content-length': String(500 * 1024 * 1024 + 1) } }));
+        if (window.__fetchMode === 'format') return Promise.resolve(new Response(new Uint8Array([1, 2, 3, 4])));
+        return fetch(url, options);
+      };
+      const create = URL.createObjectURL.bind(URL), revoke = URL.revokeObjectURL.bind(URL);
+      window.__mediaSources = []; window.__revoked = [];
+      URL.createObjectURL = value => { const url = create(value); if (value instanceof MediaSource) window.__mediaSources.push(url); return url; };
+      URL.revokeObjectURL = url => { window.__revoked.push(url); revoke(url); };
+      const append = SourceBuffer.prototype.appendBuffer;
+      SourceBuffer.prototype.appendBuffer = function (bytes) {
+        if (window.__fetchMode === 'quota') throw new DOMException('Simulated buffer capacity', 'QuotaExceededError');
+        return append.call(this, bytes);
+      };
+    }, Array.from(bytes));
+    await page.goto(pathToFileURL(fixtureFile).href);
+    let serial = 0;
+    let state = { type: 'state', language: 'en', config: { ...DEFAULTS, paused: true, pauseWhenUnfocused: false, respectReducedMotion: false }, defaults: DEFAULTS, enabled: true, busy: false, liveEnabled: false, resetDraft: true, error: null };
+    const sendState = async changes => {
+      state = { ...state, ...changes };
+      await page.evaluate(message => window.dispatchEvent(new MessageEvent('message', { data: message })), state);
+    };
+    const selectVideo = async () => {
+      await sendState({ media: { kind: 'video', name: 'Local WebM sample.webm', uri: `https://panel.example/${++serial}.webm` }, resetDraft: false });
+      await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2);
+    };
+    const nativeError = async code => page.locator('video').evaluate((video, value) => {
+      Object.defineProperty(video, 'error', { configurable: true, get: () => ({ code: value }) });
+      try { video.dispatchEvent(new Event('error')); } finally { delete video.error; }
+    }, code);
+    await sendState({ media: { kind: 'video', name: 'Video.mp4', uri: 'https://panel.example/video.mp4?filename=video.webm' } });
+    await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2);
+    await nativeError(4);
+    assert.equal(await page.evaluate(() => window.__fetches.length), 0, 'MP4 code 4 is not reread as WebM, even when its query mentions WebM');
+    assert.equal(await page.locator('#preview-error').textContent(), dictionaries.en['此视频的容器或编码不受支持。']);
+    await selectVideo();
+    await page.locator('#blur').fill('27');
+    await page.locator('#blur').dispatchEvent('input');
+    await page.evaluate(() => { window.__originalVideo = document.querySelector('video'); window.__fetchMode = 'defer'; });
+    await nativeError(4);
+    await page.waitForFunction(() => window.__fetches.length === 1);
+    assert.equal(await page.locator('#preview-loading').textContent(), dictionaries.en['正在以兼容模式加载视频…']);
+    assert.equal(await page.locator('#preview-loading').isVisible(), true);
+    await nativeError(4);
+    assert.equal(await page.evaluate(() => window.__fetches.length), 1, 'repeated native code 4 never creates another fetch');
+    await page.locator('#language').selectOption('es');
+    assert.equal(await page.locator('#preview-loading').textContent(), dictionaries.es['正在以兼容模式加载视频…']);
+    await page.evaluate(() => window.__releaseFetch());
+    await page.waitForFunction(() => document.querySelector('video')?.currentSrc.startsWith('blob:') && document.querySelector('video').readyState >= 2);
+    assert.equal(await page.locator('#preview-loading').isVisible(), false);
+    assert.equal(await page.locator('#preview-error').isVisible(), false);
+    assert.equal(await page.evaluate(() => document.querySelector('video') === window.__originalVideo), true);
+    assert.equal(await page.locator('video').evaluate(video => video.paused), true);
+    assert.equal(await page.locator('#blur').inputValue(), '27');
+    assert.equal(await page.evaluate(() => window.__saved.dirty), true, 'compatibility playback preserves the unapplied effect draft');
+    assert.equal(await page.locator('html').getAttribute('lang'), 'es');
+    await page.locator('#toggle-playback').click();
+    const start = await page.locator('video').evaluate(video => video.currentTime);
+    await page.waitForFunction(time => { const video = document.querySelector('video'); return !video.paused && video.currentTime > time + 0.1; }, start);
+    await page.locator('#toggle-playback').click();
+    const pausedTime = await page.locator('video').evaluate(video => video.currentTime);
+    await page.locator('#opacity').fill('0.6');
+    await page.locator('#opacity').dispatchEvent('input');
+    await page.locator('#language').selectOption('zh-CN');
+    assert.equal(await page.locator('video').evaluate(video => video.currentTime), pausedTime);
+    assert.equal(await page.evaluate(() => window.__mediaSources.length), 1, 'effects, pause and language reuse one MediaSource');
+    const ownedSource = await page.evaluate(() => window.__mediaSources[0]);
+
+    await page.evaluate(() => { window.__fetchMode = 'normal'; });
+    await selectVideo();
+    assert.equal(await page.evaluate(url => window.__revoked.includes(url), ownedSource), true, 'source replacement revokes the owned MediaSource URL');
+    await page.evaluate(() => { window.__fetchMode = 'defer'; });
+    await nativeError(4);
+    await page.waitForFunction(() => window.__fetches.length === 2);
+    await sendState({ media: { kind: 'image', name: 'Wallpaper.png', uri: pathToFileURL(path.resolve(__dirname, 'fixtures/wallpaper.png')).href } });
+    await page.locator('img').evaluate(image => image.decode());
+    assert.equal(await page.evaluate(() => window.__fetches[1].signal.aborted), true, 'source replacement aborts the pending read');
+    await page.evaluate(async () => { window.__releaseFetch(); await new Promise(resolve => setTimeout(resolve, 30)); });
+    assert.equal(await page.locator('video').count(), 0);
+    assert.equal(await page.locator('#preview-error').isVisible(), false, 'a late completion cannot replace the new media or show an old error');
+    assert.equal(await page.evaluate(() => window.__mediaSources.length), 1);
+
+    for (const [mode, key] of [
+      ['oversize', '无法读取视频，请确认文件可访问且不超过 500 MB。'],
+      ['format', '此视频的容器或编码不受支持。'],
+      ['quota', '视频超出当前播放器的缓冲区容量，请选择较小的文件。'],
+    ]) {
+      await selectVideo();
+      await page.evaluate(value => { window.__fetchMode = value; }, mode);
+      await nativeError(4);
+      await page.waitForFunction(() => !document.querySelector('#preview-error').hidden);
+      for (const language of ['en', 'zh-CN', 'es']) {
+        await page.locator('#language').selectOption(language);
+        assert.equal(await page.locator('#preview-error').textContent(), dictionaries[language][key]);
+      }
+      assert.equal(await page.locator('#preview-loading').isVisible(), false);
+    }
+    await selectVideo();
+    await nativeError(3);
+    assert.equal(await page.locator('#preview-error').textContent(), dictionaries.en['视频解码失败，请检查文件是否损坏或更换编码。']);
+    await selectVideo();
+    await page.evaluate(() => { window.__fetchMode = 'defer'; });
+    await nativeError(4);
+    await page.waitForFunction(() => window.__fetches.length === 6);
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+    assert.equal(await page.evaluate(() => window.__fetches.at(-1).signal.aborted), true, 'pagehide aborts a pending compatibility read');
+    await page.evaluate(async () => { window.__releaseFetch(); await new Promise(resolve => setTimeout(resolve, 30)); });
+    assert.equal(await page.evaluate(() => window.__mediaSources.length), 2, 'only the successful playback and quota failure created MediaSources');
+    assert.deepEqual(await page.evaluate(() => window.__violations), []);
+    assert.deepEqual(errors, []);
+  } finally {
+    if (browser) await browser.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('external links and explicit pause preserve one preview player and clean up HLS safely', {
   skip: !process.env.PLAYWRIGHT_MODULE,
   timeout: 30000,
@@ -915,7 +1063,7 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
       assert.equal(await page.locator('html').getAttribute('lang'), language, 'text changes before the host responds');
       assert.equal(await page.locator('h1').textContent(), heading);
       assert.equal(await page.getByRole('button', { name: closeName }).getAttribute('title'), closeName);
-      assert.equal(await page.locator('#preview-error').textContent(), dictionaries[language]['此视频无法预览，请尝试 WebM 格式。'], 'an existing preview error changes language in place');
+      assert.equal(await page.locator('#preview-error').textContent(), dictionaries[language]['此视频的容器或编码不受支持。'], 'an existing preview error changes language in place');
       assert.equal(await page.locator('video').evaluate(video => video === window.__previewNode), true);
       assert.equal(await page.locator('video').evaluate(video => video.currentTime), languageTime);
       assert.deepEqual(await page.evaluate(() => window.__saved), languageDraft, 'language does not change the saved effect draft');

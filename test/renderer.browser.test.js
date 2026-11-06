@@ -10,6 +10,7 @@ const { randomUUID } = require('node:crypto');
 const bundledRuntime = (name, streaming = false) => Buffer.concat([
   fs.readFileSync(path.join(__dirname, '../media/regions.js')), Buffer.from('\n;\n'),
   fs.readFileSync(path.join(__dirname, '../media/source.js')), Buffer.from('\n;\n'),
+  fs.readFileSync(path.join(__dirname, '../media/webm-player.js')), Buffer.from('\n;\n'),
   ...(streaming ? [fs.readFileSync(path.join(__dirname, '../media/vendor/hls.min.js')), Buffer.from(`\n;\n
     // Keep the real Hls implementation; record lifetime and configuration only.
     window.__hlsInstances = [];
@@ -742,6 +743,137 @@ test('live state swaps media without reload, preserves video settings updates an
     await browser.close();
     fs.rmSync(localDirectory, { recursive: true, force: true });
   }
+});
+
+test('isolated WebM retries native code 4 through real MSE while preserving pause, regions and lifetime', {
+  skip: !process.env.PLAYWRIGHT_MODULE,
+  timeout: 45000,
+}, async () => {
+  const { chromium } = require(process.env.PLAYWRIGHT_MODULE);
+  const executablePath = process.env.BROWSER_EXECUTABLE || [
+    'C:/Program Files/Google/Chrome/Application/chrome.exe',
+    'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+  ].find(value => fs.existsSync(value));
+  const prefix = './frosted-background-assets/';
+  const videoName = `media-${'6'.repeat(64)}.webm`;
+  const playerName = `video-host-${'7'.repeat(64)}.html`;
+  const region = { id: 'left', name: 'Focus', points: [[0, 0], [0.5, 0], [0.5, 1], [0, 1]], feather: 0.08, blur: 0, opacity: 1, tintOpacity: 0, brightness: 0.2, saturation: 1 };
+  const initial = {
+    enabled: true, kind: 'video', source: prefix + videoName, videoPlayer: prefix + playerName, liveState: prefix + 'live-state.json',
+    blur: 0, opacity: 1, tintOpacity: 0, saturation: 1, brightness: 1,
+    fit: 'fill', position: 'center center', playbackRate: 1,
+    pauseWhenUnfocused: false, respectReducedMotion: false, paused: true,
+    regions: { enabled: true, items: [region] },
+  };
+  let state = { protocol: 1, revision: randomUUID(), settings: initial };
+  const publish = settings => { state = { protocol: 1, revision: randomUUID(), settings }; };
+  const fixture = `<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self'; media-src 'self'; frame-src 'self'; connect-src 'self';"><style>:root{--vscode-editor-background:#181818}body{margin:0}.part.editor{position:absolute;inset:20px}.content,.editor-group-container,.editor-container,.editor-instance,.monaco-editor{width:100%;height:100%}</style><main class="part editor"><div class="content"><div class="editor-group-container"><div class="editor-container"><div class="editor-instance"><div class="monaco-editor">code stays sharp</div></div></div></div></div></main><script src="./renderer.js" data-frosted-config="${JSON.stringify(initial).replace(/&/g, '&amp;').replace(/"/g, '&quot;')}"></script>`;
+  const playerHtml = '<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'self\'; connect-src \'self\'; media-src blob:; style-src \'unsafe-inline\'; base-uri \'none\'; form-action \'none\';"><body><script src="./player.js" defer></script></body>';
+  const files = new Map([
+    ['/index.html', ['text/html', fixture]],
+    ['/renderer.js', ['text/javascript', bundledRuntime('renderer.js')]],
+    [`/frosted-background-assets/${playerName}`, ['text/html', playerHtml]],
+    ['/frosted-background-assets/player.js', ['text/javascript', bundledRuntime('video-player.js')]],
+  ]);
+  let mediaBytes = fs.readFileSync(path.join(__dirname, 'fixtures/colors.webm'));
+  let mediaRequests = 0;
+  const errors = [];
+  const browser = await chromium.launch({ headless: true, executablePath });
+  try {
+    const page = await browser.newPage({ viewport: { width: 720, height: 480 } });
+    page.on('pageerror', error => errors.push(error.message));
+    await page.addInitScript(() => {
+      window.__urlEvents = [];
+      window.__nativeMediaErrors = [];
+      window.__playerErrors = [];
+      window.__playbackBlockedEvents = 0;
+      window.__cspViolations = [];
+      document.addEventListener('securitypolicyviolation', event => window.__cspViolations.push(event.effectiveDirective));
+      document.addEventListener('error', event => {
+        if (event.target instanceof HTMLVideoElement) top.__nativeMediaErrors.push(event.target.error?.code);
+      }, true);
+      window.addEventListener('message', event => {
+        if (event.data?.type === 'frosted-background-player' && event.data.event === 'error') window.__playerErrors.push({ detail: event.data.detail, diagnostic: event.data.diagnostic });
+        if (event.data?.type === 'frosted-background-player' && event.data.event === 'playback-blocked') window.__playbackBlockedEvents++;
+      });
+      const create = URL.createObjectURL.bind(URL), revoke = URL.revokeObjectURL.bind(URL);
+      URL.createObjectURL = object => {
+        const isMediaSource = object instanceof MediaSource;
+        // Model Electron builds without a native WebM demuxer. The first
+        // native Blob really fails with MediaError 4; the helper still receives
+        // the unmodified fixture bytes and uses the real MediaSource decoder.
+        const value = create(object instanceof Blob ? new Blob(['unsupported native WebM demuxer'], { type: 'video/webm' }) : object);
+        top.__urlEvents.push({ event: 'create', kind: isMediaSource ? 'mse' : 'native', url: value });
+        return value;
+      };
+      URL.revokeObjectURL = url => { top.__urlEvents.push({ event: 'revoke', url }); revoke(url); };
+    });
+    await page.route('https://webm-compat.test/**', async route => {
+      const url = new URL(route.request().url());
+      if (url.pathname.endsWith('/live-state.json')) return route.fulfill({ contentType: 'application/json', body: JSON.stringify(state) });
+      if (url.pathname.endsWith('/' + videoName)) { mediaRequests++; return route.fulfill({ contentType: 'video/webm', body: mediaBytes }); }
+      const file = files.get(url.pathname);
+      if (!file) return route.abort();
+      return route.fulfill({ contentType: file[0], body: file[1] });
+    });
+    await page.goto('https://webm-compat.test/index.html');
+    await page.waitForSelector('.frosted-background-ready');
+    const frame = page.frames().find(value => value.url().includes(playerName));
+    await frame.waitForFunction(() => document.querySelector('video')?.readyState >= 2 && document.querySelector('canvas')?.width > 0);
+    assert.deepEqual(await page.evaluate(() => window.__nativeMediaErrors), [4], 'actual native error 4 initiates compatibility playback once');
+    assert.equal(mediaRequests, 1, 'the MSE path reuses the already-fetched local bytes');
+    const decoded = await frame.locator('video').evaluate(video => { window.__originalVideo = video; return { paused: video.paused, muted: video.muted, loop: video.loop, width: video.videoWidth, readyState: video.readyState }; });
+    assert.ok(decoded.paused && decoded.muted && decoded.loop && decoded.width > 0 && decoded.readyState >= 2);
+    assert.equal(await frame.locator('canvas').evaluate(canvas => [...canvas.getContext('2d').getImageData(Math.floor(canvas.width * 0.75), Math.floor(canvas.height / 2), 1, 1).data].some((value, i) => i < 3 && value > 30)), true, 'the regional compositor draws the real MSE-decoded first frame');
+    await page.locator('iframe').evaluate(element => { window.__originalFrame = element; });
+    assert.deepEqual(await page.evaluate(() => window.__playerErrors), [], 'recoverable native failure never reports a terminal player error');
+    await frame.locator('video').evaluate(video => {
+      const play = video.play.bind(video);
+      let blocked = false;
+      video.play = () => {
+        if (!blocked) { blocked = true; return Promise.reject(new DOMException('Test autoplay policy', 'NotAllowedError')); }
+        return play();
+      };
+    });
+    publish({ ...initial, paused: false });
+    await page.waitForFunction(() => window.__playbackBlockedEvents === 1);
+    assert.equal(await frame.locator('video').evaluate(video => video.error), null, 'autoplay policy failure is not a decoder error');
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await frame.waitForFunction(() => !document.querySelector('video').paused && document.querySelector('video').currentTime > 0.15);
+    assert.equal(await page.evaluate(() => window.__urlEvents.filter(value => value.event === 'create' && value.kind === 'mse').length), 1, 'focus retries a blocked play without entering a second recovery or replacing MSE');
+    publish({ ...initial, fit: 'contain', playbackRate: 1.25, regions: { enabled: true, items: [{ ...region, brightness: 0.6 }] } });
+    await frame.waitForFunction(() => document.querySelector('video').paused && document.querySelector('video').style.objectFit === 'contain' && document.querySelector('video').playbackRate === 1.25);
+    const pausedTime = await frame.locator('video').evaluate(video => video.currentTime);
+    await page.waitForTimeout(180);
+    assert.equal(await frame.locator('video').evaluate(video => video.currentTime), pausedTime);
+    assert.equal(await frame.evaluate(() => document.querySelector('video') === window.__originalVideo), true);
+    assert.equal(await page.evaluate(() => document.querySelector('iframe') === window.__originalFrame), true);
+    assert.equal(await page.evaluate(() => window.__urlEvents.filter(value => value.event === 'create' && value.kind === 'mse').length), 1, 'settings changes preserve the MediaSource instance');
+    await frame.locator('video').evaluate(video => { video.currentTime = Math.max(0, video.duration - 0.08); });
+    await frame.waitForFunction(() => !document.querySelector('video').seeking);
+    publish({ ...initial, paused: false });
+    await frame.waitForFunction(() => !document.querySelector('video').paused && document.querySelector('video').currentTime < 0.5);
+    assert.equal(await page.evaluate(() => window.__urlEvents.filter(value => value.event === 'create' && value.kind === 'mse').length), 1, 'a local MSE video loops without rebuilding its decoder');
+    assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
+    assert.deepEqual(await frame.evaluate(() => window.__cspViolations), []);
+    publish({ enabled: false });
+    await page.waitForFunction(() => !document.querySelector('iframe'));
+    const lifecycle = await page.evaluate(() => window.__urlEvents);
+    assert.deepEqual(lifecycle.filter(value => value.event === 'revoke').map(value => value.url).sort(), lifecycle.filter(value => value.event === 'create').map(value => value.url).sort(), 'disabling disposes both the rejected native URL and the MediaSource URL');
+
+    // A malformed WebM can fail the fallback only once, without reflecting
+    // decoder paths or signed URL details back into the workbench.
+    mediaBytes = Buffer.from('invalid WebM bytes https://secret.invalid/video?token=private C:\\private\\video.webm');
+    publish(initial);
+    await page.waitForFunction(() => document.querySelector('.frosted-background-layer')?.dataset.state === 'error');
+    const failures = await page.evaluate(() => window.__playerErrors);
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].diagnostic.stage, 'compatibility');
+    assert.equal(failures[0].diagnostic.sourceType, 'webm');
+    assert.equal(failures[0].diagnostic.reason, 'WEBM_FORMAT');
+    assert.doesNotMatch(JSON.stringify(failures), /secret\.invalid|token=private|private\\/);
+    assert.deepEqual(errors, [], 'native failure, MSE playback and cleanup cause no uncaught errors');
+  } finally { await browser.close(); }
 });
 
 test('isolated HLS decodes real segments, preserves manual pause and disposes bounded recovery', {

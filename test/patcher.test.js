@@ -23,6 +23,7 @@ async function fixture(t, variant = 'electron-browser') {
   const mediaPath = path.join(appRoot, '壁纸 & image.jpg');
   await fs.writeFile(path.join(appRoot, 'regions.js'), '(function(root) { root.FrostedRegions = { version: 1 }; })(globalThis);');
   await fs.writeFile(path.join(appRoot, 'source.js'), '(function(root) { root.FrostedSource = { version: 1 }; })(globalThis);');
+  await fs.writeFile(path.join(appRoot, 'webm-player.js'), '(function(root) { root.FrostedWebm = { version: 1 }; })(globalThis);');
   await fs.mkdir(path.join(appRoot, 'vendor'));
   await fs.writeFile(path.join(appRoot, 'vendor', 'hls.min.js'), 'globalThis.Hls = { version: 1 };');
   await fs.writeFile(rendererPath, '(() => { /* renderer fixture */ })();');
@@ -138,7 +139,7 @@ test('video uses an owned standalone player without altering the workbench CSP',
   assert.doesNotMatch(page, /unsafe-eval|srcdoc|https:/);
   const player = /src="\.\/(video-player-[a-f0-9]{64}\.js)"/.exec(page)[1];
   const directory = path.join(path.dirname(data.workbenchPath), patcher.ASSET_DIRECTORY);
-  assert.equal(await fs.readFile(path.join(directory, player), 'utf8'), (await fs.readFile(path.join(data.appRoot, 'regions.js'), 'utf8')) + '\n;\n' + (await fs.readFile(path.join(data.appRoot, 'source.js'), 'utf8')) + '\n;\n' + (await fs.readFile(path.join(data.appRoot, 'video-player.js'), 'utf8')));
+  assert.equal(await fs.readFile(path.join(directory, player), 'utf8'), (await fs.readFile(path.join(data.appRoot, 'regions.js'), 'utf8')) + '\n;\n' + (await fs.readFile(path.join(data.appRoot, 'source.js'), 'utf8')) + '\n;\n' + (await fs.readFile(path.join(data.appRoot, 'webm-player.js'), 'utf8')) + '\n;\n' + (await fs.readFile(path.join(data.appRoot, 'video-player.js'), 'utf8')));
   await fs.writeFile(path.join(directory, 'video-host-not-owned.html'), 'keep');
   await patcher.restore(data);
   assert.equal(await fs.readFile(data.workbenchPath, 'utf8'), ORIGINAL);
@@ -685,7 +686,7 @@ test('cached scripts execute the shared regions module first and both hashes inc
     const renderer = await fs.readFile(path.join(assetDirectory(data), rendererName));
     const player = await fs.readFile(path.join(assetDirectory(data), playerName));
     const shared = await fs.readFile(regionsPath);
-    const prefix = Buffer.concat([shared, Buffer.from('\n;\n'), await fs.readFile(path.join(data.appRoot, 'source.js')), Buffer.from('\n;\n')]);
+    const prefix = Buffer.concat([shared, Buffer.from('\n;\n'), await fs.readFile(path.join(data.appRoot, 'source.js')), Buffer.from('\n;\n'), await fs.readFile(path.join(data.appRoot, 'webm-player.js')), Buffer.from('\n;\n')]);
     assert.deepEqual(renderer, Buffer.concat([prefix, await fs.readFile(data.rendererPath)]));
     assert.deepEqual(player, Buffer.concat([prefix, await fs.readFile(playerPath)]));
     assert.equal(rendererName, `renderer-${crypto.createHash('sha256').update(renderer).digest('hex')}.js`);
@@ -733,7 +734,7 @@ test('missing, empty, oversized or nonregular regions modules fail before any wo
 });
 
 test('all bundled runtime sources reject symbolic links without reading their target', async t => {
-  for (const sourceName of ['regions.js', 'source.js', 'renderer.js', 'video-player.js', 'vendor/hls.min.js']) {
+  for (const sourceName of ['regions.js', 'source.js', 'webm-player.js', 'renderer.js', 'video-player.js', 'vendor/hls.min.js']) {
     await t.test(sourceName, async child => {
       const data = await fixture(child);
       const video = path.join(data.appRoot, 'clip.webm');
@@ -794,6 +795,7 @@ test('HLS applies an owned bundled player without downloading media or changing 
   assert.deepEqual(bytes, Buffer.concat([
     await fs.readFile(path.join(data.appRoot, 'regions.js')), Buffer.from('\n;\n'),
     await fs.readFile(path.join(data.appRoot, 'source.js')), Buffer.from('\n;\n'),
+    await fs.readFile(path.join(data.appRoot, 'webm-player.js')), Buffer.from('\n;\n'),
     await fs.readFile(path.join(data.appRoot, 'vendor', 'hls.min.js')), Buffer.from('\n;\n'),
     await fs.readFile(path.join(data.appRoot, 'video-player.js')),
   ]));
@@ -949,7 +951,7 @@ test('HLS restore publishes the disabled tombstone and removes only owned helper
 });
 
 test('source validation and HLS runtime modules reject missing, empty, nonregular and oversized files before staging', async t => {
-  for (const [name, limit] of [['source.js', 256 * 1024], ['vendor/hls.min.js', 2 * 1024 * 1024]]) {
+  for (const [name, limit] of [['source.js', 256 * 1024], ['webm-player.js', 256 * 1024], ['vendor/hls.min.js', 2 * 1024 * 1024]]) {
     for (const kind of ['missing', 'empty', 'directory', 'oversized']) {
       await t.test(`${name}: ${kind}`, async child => {
         const data = await fixture(child);
