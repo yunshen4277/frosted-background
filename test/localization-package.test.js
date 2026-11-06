@@ -11,28 +11,6 @@ const spanish = require('../package.nls.es.json');
 const { manifestFor, selectPackageFiles } = require('../scripts/package');
 const { t, describeError } = require('../src/localization');
 
-test('YouTube helper and resolver diagnostics and progress have complete native translations', () => {
-  const keys = new Set([
-    '正在准备 YouTube 背景…', '首次使用正在准备 YouTube 辅助工具…',
-    '正在读取 YouTube 视频…', '正在缓存 YouTube 背景视频…',
-  ]);
-  for (const name of ['youtube-tools.js', 'youtube-media.js']) {
-    const source = fs.readFileSync(path.resolve(__dirname, '../src', name), 'utf8');
-    const diagnostics = [...source.matchAll(/\berror\('([^']*[\u3400-\u9fff][^']*)'\)/gu)].map(match => match[1]);
-    assert.ok(diagnostics.length > 0, `${name} diagnostics are included in the coverage scan`);
-    for (const key of diagnostics) keys.add(key);
-  }
-  for (const key of keys) {
-    assert.equal(t('zh-CN', key), key);
-    for (const language of ['en', 'es']) {
-      const translated = t(language, key);
-      assert.notEqual(translated, key, `${language} translation is missing: ${key}`);
-      assert.doesNotMatch(translated, /[\u3400-\u9fff]/u, `${language} contains untranslated Chinese: ${key}`);
-      assert.equal(describeError(language, Object.assign(new Error(key), { localizationKey: key })), translated, 'native error presentation uses the selected language');
-    }
-  }
-});
-
 test('every visible manifest label has complete English, Chinese and Spanish translations', () => {
   const fields = [pkg.displayName, pkg.description, pkg.contributes.configuration.title];
   for (const command of pkg.contributes.commands) fields.push(command.title, command.category);
@@ -79,8 +57,8 @@ test('VSIX metadata resolves default catalog strings and escapes the translated 
   assert.throws(() => manifestFor(pkg, {}), /Missing default localization: extension\.displayName/);
 });
 
-test('packaging requires all localization catalogs, translators and the shared regions runtime', () => {
-  const localization = ['package.nls.json', 'package.nls.zh-cn.json', 'package.nls.es.json', 'src/localization.js', 'media/i18n.js', 'media/regions.js', 'src/remote-media.js', 'src/youtube-tools.js', 'src/youtube-media.js', 'media/source.js', 'media/webm-player.js', 'media/vendor/hls.min.js', 'media/vendor/HLS-LICENSE.txt'];
+test('packaging requires all localization catalogs, translators and the Wallpaper Engine bridge', () => {
+  const localization = ['package.nls.json', 'package.nls.zh-cn.json', 'package.nls.es.json', 'src/localization.js', 'media/i18n.js', 'media/webm-player.js', 'src/wallpaper-engine.js'];
   const files = ['package.json', 'README.md', 'LICENSE', 'CHANGELOG.md', 'src/extension.js', 'src/patcher.js',
     'src/panel.js', 'src/panel-ui.js', 'src/updater.js', 'src/github-update.js', 'media/renderer.js', 'media/video-player.js',
     'media/panel.js', 'media/panel.css', 'media/background-icon.svg', ...localization,

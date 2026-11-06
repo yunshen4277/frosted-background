@@ -14,13 +14,15 @@ test('panel localization catalog covers markup and defaults to English without a
   assert.equal(normalizeLanguage('es'), 'es');
   assert.equal(normalizeLanguage('zh-CN'), 'zh-CN');
   for (const value of [undefined, null, 'fr', 'EN', {}, '__proto__']) assert.equal(normalizeLanguage(value), 'en');
-  const options = { cspSource: 'file:', nonce: 'test', scriptUri: 'panel.js', styleUri: 'panel.css', i18nUri: 'i18n.js', regionsUri: 'regions.js' };
+  const options = { cspSource: 'file:', nonce: 'test', scriptUri: 'panel.js', styleUri: 'panel.css', i18nUri: 'i18n.js' };
   const html = renderPanelHtml(options);
   assert.match(html, /<html lang="en">/);
   assert.match(html, /<title[^>]*>Frosted Background<\/title>/);
   assert.ok(html.indexOf('src="i18n.js"') < html.indexOf('src="panel.js"'));
+  assert.doesNotMatch(html, /region-canvas|region-overlay|source-link-card|source-url|regions\.js|source\.js|hls\.min\.js|<canvas/);
+  assert.doesNotMatch(html, /connect-src https:|media-src [^;]* https:/, 'the local-only panel does not grant arbitrary HTTPS media or fetch access');
   assert.deepEqual([...html.matchAll(/>([^<>]*[\u3400-\u9fff][^<>]*)</g)].map(match => match[1]), ['简体中文'], 'only the native language name is Chinese in the English first render');
-  for (const match of html.matchAll(/data-i18n(?:-aria-label|-title)?="([^"]+)"/g)) {
+  for (const match of html.matchAll(/data-i18n(?:-aria-label|-title|-placeholder)?="([^"]+)"/g)) {
     for (const language of ['en', 'zh-CN', 'es']) assert.equal(typeof dictionaries[language][match[1]], 'string', `${language}: ${match[1]}`);
   }
   for (const language of ['en', 'zh-CN', 'es']) {
@@ -46,9 +48,9 @@ test('WebM compatibility recovers native code 4 with real MSE and cancels stale 
   const asset = name => pathToFileURL(path.resolve(__dirname, '../media', name)).href;
   const bytes = fs.readFileSync(path.resolve(__dirname, 'fixtures/colors.webm'));
   fs.writeFileSync(fixtureFile, renderPanelHtml({
-    cspSource: 'file:', nonce: 'webm-panel-test-nonce',
+    cspSource: 'file: https://panel.example', nonce: 'webm-panel-test-nonce',
     scriptUri: asset('panel.js'), styleUri: asset('panel.css'), i18nUri: asset('i18n.js'),
-    regionsUri: asset('regions.js'), webmUri: asset('webm-player.js'),
+    webmUri: asset('webm-player.js'),
   }));
   let browser;
   try {
@@ -180,7 +182,7 @@ test('WebM compatibility recovers native code 4 with real MSE and cancels stale 
   }
 });
 
-test('external links and explicit pause preserve one preview player and clean up HLS safely', {
+test('Wallpaper Engine library filters local items, applies opaque IDs and keeps drafts across languages', {
   skip: !process.env.PLAYWRIGHT_MODULE,
   timeout: 30000,
 }, async () => {
@@ -189,184 +191,117 @@ test('external links and explicit pause preserve one preview player and clean up
     'C:/Program Files/Google/Chrome/Application/chrome.exe',
     'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
   ].find(value => fs.existsSync(value));
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'frosted-source-panel-test-'));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'frosted-wallpaper-library-test-'));
   const fixtureFile = path.join(directory, 'panel.html');
   const asset = name => pathToFileURL(path.resolve(__dirname, '../media', name)).href;
-  fs.writeFileSync(fixtureFile, renderPanelHtml({
-    cspSource: 'file:', nonce: 'source-panel-test-nonce',
-    scriptUri: asset('panel.js'), styleUri: asset('panel.css'), i18nUri: asset('i18n.js'),
-    regionsUri: asset('regions.js'), sourceUri: asset('source.js'), hlsUri: asset('vendor/hls.min.js'),
-  }));
+  fs.writeFileSync(fixtureFile, renderPanelHtml({ cspSource: 'file:', nonce: 'wallpaper-test', scriptUri: asset('panel.js'), styleUri: asset('panel.css'), i18nUri: asset('i18n.js'), webmUri: asset('webm-player.js') }));
   let browser;
   try {
     browser = await chromium.launch({ headless: true, executablePath });
     const page = await browser.newPage({ viewport: { width: 280, height: 620 }, reducedMotion: 'no-preference' });
-    page.setDefaultTimeout(6000);
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
-    await page.addInitScript(() => {
+    await page.addInitScript(defaults => {
       window.__messages = []; window.__violations = [];
+      window.__saved = { draft: { ...defaults, blur: 22, paused: true, regions: { enabled: true, items: [] }, sourceUrl: 'https://old.example/removed.mp4' }, dirty: true };
       window.acquireVsCodeApi = () => ({ getState: () => window.__saved, setState: value => { window.__saved = value; }, postMessage: value => window.__messages.push(value) });
       document.addEventListener('securitypolicyviolation', event => window.__violations.push(event.violatedDirective));
-    });
+    }, DEFAULTS);
     await page.goto(pathToFileURL(fixtureFile).href);
-    assert.equal(await page.evaluate(() => typeof Hls.isSupported), 'function', 'the actual local HLS vendor loads under the webview CSP');
-    const localUri = pathToFileURL(path.resolve(__dirname, 'fixtures/colors.webm')).href;
-    const media = { kind: 'video', name: 'colors.webm', uri: localUri };
-    let state = { type: 'state', language: 'en', config: { ...DEFAULTS, paused: true, pauseWhenUnfocused: false, respectReducedMotion: false }, defaults: DEFAULTS, media, enabled: true, busy: false, liveEnabled: true, liveAck: 0, resetDraft: true, error: null };
+    const media = { name: 'Local preview.webm', kind: 'video', uri: pathToFileURL(path.resolve(__dirname, 'fixtures/colors.webm')).href };
+    let state = { type: 'state', language: 'en', config: { ...DEFAULTS }, defaults: DEFAULTS, enabled: true, media, busy: false, liveEnabled: false, resetDraft: false, error: null, wallpaperEngine: { loading: false, connected: false, items: [] } };
     const sendState = async changes => {
       state = { ...state, ...changes };
       await page.evaluate(message => window.dispatchEvent(new MessageEvent('message', { data: message })), state);
     };
-    const acknowledgeLive = async () => {
-      const previous = state.liveAck;
-      await page.waitForFunction(id => window.__messages.some(message => message.type === 'liveConfig' && message.requestId > id), previous);
-      const message = await page.evaluate(() => window.__messages.filter(item => item.type === 'liveConfig').at(-1));
-      await sendState({ config: message.config, liveAck: message.requestId, resetDraft: true });
-      return message;
-    };
     await sendState();
-    await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2);
-    await page.evaluate(() => { window.__originalVideo = document.querySelector('video'); });
-    assert.equal(await page.locator('video').evaluate(video => video.paused && video.loop), true, 'saved pause is applied to the first decoded frame');
-    assert.equal(await page.locator('#toggle-playback').getAttribute('aria-label'), 'Play');
-    await page.locator('#toggle-playback').click();
-    await page.waitForFunction(() => !document.querySelector('video').paused);
-    assert.equal((await acknowledgeLive()).config.paused, false);
-    await page.locator('#toggle-playback').click();
-    assert.equal((await acknowledgeLive()).config.paused, true);
-    const pausedTime = await page.locator('video').evaluate(video => video.currentTime);
-    await page.locator('#blur').fill('29');
-    await page.locator('#blur').dispatchEvent('input');
-    assert.equal((await acknowledgeLive()).config.paused, true, 'effect changes retain manual pause');
-    assert.equal(await page.locator('video').evaluate(video => video.currentTime), pausedTime, 'effect edits do not advance a paused preview');
-    assert.equal(await page.evaluate(() => document.querySelector('video') === window.__originalVideo), true);
+    await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2 && !document.querySelector('video').seeking);
+    await page.evaluate(() => { window.__previewVideo = document.querySelector('video'); });
+    const time = await page.locator('video').evaluate(video => video.currentTime);
+    assert.equal(await page.locator('#blur').inputValue(), '22');
+    assert.equal(await page.evaluate(() => Object.hasOwn(window.__saved.draft, 'regions') || Object.hasOwn(window.__saved.draft, 'sourceUrl')), false, 'removed feature values are not retained in the live draft');
+    assert.equal(await page.locator('#wallpaper-status').textContent(), dictionaries.en['连接本机壁纸库']);
+    assert.equal(await page.locator('#wallpaper-workshop').isDisabled(), true, 'Workshop search needs a query');
+    await page.locator('#wallpaper-refresh').click();
+    assert.deepEqual(await page.evaluate(() => window.__messages.at(-1)), { type: 'refreshWallpapers' });
+    assert.equal(await page.locator('#wallpaper-folder').isDisabled(), true);
+    assert.equal(await page.locator('#wallpaper-search').isEnabled(), true, 'local search remains usable while a host action is busy');
+    await sendState({ busy: false, wallpaperEngine: { loading: true, connected: false, items: [] } });
+    assert.equal(await page.locator('#wallpaper-refresh').isDisabled(), true);
+    assert.equal(await page.locator('#wallpaper-status').textContent(), dictionaries.en['正在读取壁纸库…']);
 
-    await page.locator('#source-link-card summary').click();
-    const chooseMessages = () => page.evaluate(() => window.__messages.filter(message => message.type === 'chooseUrl'));
-    for (const url of ['http://example.com/clip.mp4', 'javascript:alert(1)', 'https://user:private-credential@example.com/video.mp4', 'https://localhost/video.mp4']) {
-      await page.locator('#source-url').fill(url);
-      await page.locator('#source-url').press('Enter');
-      assert.equal((await chooseMessages()).length, 0);
-      assert.equal(await page.locator('#source-error').isVisible(), true);
-      assert.ok(!(await page.locator('#source-error').textContent()).includes('private-credential'));
+    const previewUri = pathToFileURL(path.resolve(__dirname, 'fixtures/wallpaper.png')).href;
+    const items = Array.from({ length: 61 }, (_, index) => ({ id: index.toString(16).padStart(64, '0'), title: index < 3 ? `Nebula ${index} <b>sample</b>` : `Cloud ${index}`, type: index % 2 ? 'image' : 'video', previewUri, supported: true }));
+    for (const [index, [type, reason]] of [['scene', 'unsupported-type'], ['web', 'unsupported-type'], ['application', 'unsupported-type'], ['video', 'missing-media'], ['video', 'too-large'], ['unknown', '<img onerror=alert(1)>Invalid metadata']].entries()) {
+      items.push({ id: (100 + index).toString(16).padStart(64, '0'), title: `Unsupported ${type} ${index}`, type, supported: false, reason });
     }
-    const directUrl = 'https://media.example.com/clip.mp4?token=private-value';
-    await page.locator('#source-url').fill(directUrl);
-    await page.locator('#source-kind').selectOption('video');
-    await page.locator('#choose-url').click();
-    const choosing = (await chooseMessages()).at(-1);
-    assert.equal(choosing.kind, 'video'); assert.equal(choosing.url, directUrl);
-    assert.equal(choosing.config.blur, 29); assert.equal(choosing.config.paused, true);
-    assert.equal(await page.locator('#choose-url').textContent(), 'Loading…');
-    assert.equal(await page.locator('#source-url').isDisabled(), true);
-    await sendState({ busy: false, media: { ...media, sourceUrl: directUrl }, config: choosing.config });
-    assert.equal(await page.locator('#media-origin').textContent(), 'https://media.example.com');
-    assert.ok(!(await page.locator('.media-caption').textContent()).includes('private-value'));
-    assert.equal(await page.evaluate(() => document.querySelector('video') === window.__originalVideo), true);
-    const youtubeUrl = 'https://youtu.be/abcdefghijk';
-    await page.locator('#source-url').fill(youtubeUrl);
-    for (const language of ['en', 'zh-CN', 'es']) {
-      await page.locator('#language').selectOption(language);
-      assert.equal(await page.locator('#source-kind').isEnabled(), true, 'YouTube permits auto or video selection');
-      assert.equal(await page.locator('#choose-url').textContent(), dictionaries[language]['载入背景']);
-      assert.equal(await page.locator('#source-hint').textContent(), dictionaries[language]['YouTube 视频会先缓存，再作为背景播放。首次使用会下载辅助工具。']);
-      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${language} YouTube explanation fits 280px`);
-      assert.equal(await page.evaluate(() => document.querySelector('video') === window.__originalVideo), true);
-    }
-    await page.locator('#language').selectOption('en');
-    for (const kind of ['auto', 'video']) {
-      await page.locator('#source-kind').selectOption(kind);
-      await page.locator('#choose-url').click();
-      const request = (await chooseMessages()).at(-1);
-      assert.equal(request.url, youtubeUrl); assert.equal(request.kind, kind);
-      assert.equal(request.config.paused, true); assert.equal(request.config.blur, 29);
-      assert.equal(await page.locator('#choose-url').textContent(), 'Loading…');
-      await sendState({ busy: false, language: 'en', config: request.config, media: { kind: 'video', name: 'Cached YouTube video.webm', uri: pathToFileURL(path.resolve(__dirname, 'fixtures/edges.webm')).href, sourceUrl: 'https://www.youtube.com/watch?v=abcdefghijk' } });
-      await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2);
-      assert.equal(await page.locator('video').evaluate(video => video.paused && video.loop), true, 'the cached YouTube result uses ordinary local playback and preserves pause');
-      assert.equal(await page.locator('#media-origin').textContent(), 'https://www.youtube.com');
-    }
-    assert.equal(await page.evaluate(() => document.querySelector('video') === window.__originalVideo), false, 'the cached YouTube result replaces the background source');
-    await page.evaluate(() => { window.__youtubeVideo = document.querySelector('video'); });
-    await page.locator('#source-url').fill('https://www.twitch.tv/example_channel');
-    assert.equal(await page.locator('#source-kind').isDisabled(), true);
-    assert.equal(await page.locator('#choose-url').textContent(), 'Open page');
-    assert.equal(await page.locator('#source-hint').textContent(), dictionaries.en['此链接将在官方浏览器页面打开，不会用作背景。']);
-    await page.locator('#choose-url').click();
-    await sendState({ busy: false });
-    assert.equal(await page.evaluate(() => document.querySelector('video') === window.__youtubeVideo), true, 'opening Twitch leaves the cached background player intact');
+    const library = { loading: false, connected: true, installPath: 'D:/Private wallpaper folder', items, truncated: true, total: 67 };
+    await sendState({ wallpaperEngine: library });
+    assert.equal(await page.locator('.wallpaper-card').count(), 50);
+    assert.equal(await page.locator('.wallpaper-apply').count(), 50);
+    assert.equal(await page.locator('#wallpaper-count').textContent(), 'Showing 50 / 61');
+    assert.equal(await page.locator('.wallpaper-thumbnail img').first().getAttribute('loading'), 'lazy');
+    assert.equal(await page.locator('.wallpaper-title b').count(), 0, 'titles remain text');
+    await page.locator('#wallpaper-more').click();
+    assert.equal(await page.locator('.wallpaper-card').count(), 61);
+    assert.equal(await page.locator('#wallpaper-more').isVisible(), false);
+    await page.locator('#wallpaper-supported').uncheck();
+    await page.locator('#wallpaper-more').click();
+    assert.equal(await page.locator('.wallpaper-card').count(), 67);
+    assert.equal(await page.locator('.wallpaper-card.is-unavailable button').count(), 0, 'unsupported and incomplete wallpapers never expose Apply');
+    assert.equal(await page.locator('.wallpaper-reason img').count(), 0, 'host reasons remain text');
+    assert.equal(await page.locator('.wallpaper-reason').filter({ hasText: dictionaries.en['文件超过 500 MB。'] }).count(), 1);
 
-    // Use the real vendor above for packaging/CSP coverage, then a deterministic
-    // adapter for lifecycle and private URL checks without contacting a stream.
-    await page.evaluate(() => {
-      window.__hlsPlayers = [];
-      window.Hls = class {
-        static Events = { MEDIA_ATTACHED: 'attached', MANIFEST_PARSED: 'parsed', ERROR: 'error' };
-        static isSupported() { return true; }
-        constructor(config) { this.config = config; this.handlers = {}; this.destroyed = 0; window.__hlsPlayers.push(this); }
-        on(name, handler) { this.handlers[name] = handler; }
-        emit(name, value) { this.handlers[name]?.(name, value); }
-        attachMedia(media) { this.media = media; this.emit('attached'); }
-        loadSource(url) { this.url = url; }
-        destroy() { this.destroyed++; }
-      };
-    });
-    const stream = { kind: 'video', type: 'hls', name: 'stream.example.com / live.m3u8', uri: 'https://stream.example.com/live.m3u8?token=secret-stream-token' };
-    await page.locator('#source-url').fill(stream.uri);
-    await page.locator('#source-kind').selectOption('auto');
-    assert.match(await page.locator('#source-hint').textContent(), /cross-origin/);
-    await page.locator('#choose-url').click();
-    await sendState({ media: stream, busy: false });
-    assert.equal(await page.locator('#preview-loading').isVisible(), true);
-    assert.equal(await page.locator('video').evaluate(video => video.loop), false);
-    assert.equal(await page.locator('#media-origin').textContent(), 'https://stream.example.com');
-    assert.deepEqual(await page.evaluate(() => {
-      const player = window.__hlsPlayers[0], xhr = { withCredentials: true };
-      player.config.xhrSetup(xhr, player.url);
-      const request = player.config.fetchSetup({ url: player.url }, {});
-      return { count: window.__hlsPlayers.length, worker: player.config.enableWorker, credentials: xhr.withCredentials, fetchCredentials: request.credentials, crossOrigin: player.media.crossOrigin };
-    }), { count: 1, worker: false, credentials: false, fetchCredentials: 'omit', crossOrigin: 'anonymous' });
-    assert.equal(await page.evaluate(() => {
-      const config = window.__hlsPlayers[0].config;
-      return ['https://127.0.0.1/key', 'https://user:private-credential@example.com/segment.ts', 'http://example.com/segment.ts'].every(url => {
-        let blocked = 0;
-        try { config.xhrSetup({}, url); } catch { blocked++; }
-        try { config.fetchSetup({ url }, {}); } catch { blocked++; }
-        return blocked === 2;
-      });
-    }), true, 'segment and key requests receive the same public HTTPS validation as the manifest');
-    await page.evaluate(bytes => {
-      const player = window.__hlsPlayers[0];
-      window.__streamFixture = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: 'video/webm' }));
-      player.media.src = window.__streamFixture; player.emit('parsed');
-    }, Array.from(fs.readFileSync(path.resolve(__dirname, 'fixtures/colors.webm'))));
-    await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2);
-    assert.equal(await page.locator('#preview-loading').isVisible(), false);
-    for (const language of ['es', 'zh-CN', 'en']) {
+    await page.locator('#wallpaper-search').fill('Cloud');
+    assert.equal(await page.locator('.wallpaper-card').count(), 50);
+    const messagesBeforeLanguage = await page.evaluate(() => window.__messages.length);
+    for (const language of ['zh-CN', 'es', 'en']) {
       await page.locator('#language').selectOption(language);
-      assert.equal(await page.locator('#toggle-playback').textContent(), dictionaries[language]['继续播放']);
-      assert.equal(await page.locator('#toggle-playback').getAttribute('aria-label'), dictionaries[language]['继续播放']);
-      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${language} external controls fit 280px`);
+      await sendState({ language, wallpaperEngine: { ...library } });
+      assert.equal(await page.locator('#wallpaper-search').inputValue(), 'Cloud');
+      assert.equal(await page.locator('#wallpaper-supported').isChecked(), false);
+      assert.equal(await page.locator('#wallpaper-folder').textContent(), dictionaries[language]['选择文件夹']);
+      assert.equal(await page.locator('#wallpaper-search').getAttribute('placeholder'), dictionaries[language]['搜索本机壁纸']);
+      assert.equal(await page.locator('#blur').inputValue(), '22');
+      assert.equal(await page.evaluate(() => document.querySelector('video') === window.__previewVideo), true);
+      assert.equal(await page.locator('video').evaluate(video => video.currentTime), time);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${language} library fits 280px`);
     }
-    await page.locator('#toggle-playback').click();
-    await acknowledgeLive();
-    await page.waitForFunction(() => !document.querySelector('video').paused);
-    assert.equal(await page.evaluate(() => window.__hlsPlayers.length), 1, 'language, acknowledgements, and pause do not create another HLS instance');
-    await page.evaluate(() => window.__hlsPlayers[0].emit('error', { fatal: true, details: '<img src=x> secret-stream-token' }));
-    assert.equal(await page.locator('#preview-error').isVisible(), true);
-    assert.ok(!(await page.locator('#preview-error').textContent()).includes('secret-stream-token'));
-    assert.equal(await page.locator('#preview-error img').count(), 0);
-    assert.equal(await page.evaluate(() => window.__hlsPlayers[0].destroyed), 1);
-    await page.locator('#choose-url').click();
+    assert.equal(await page.evaluate(() => window.__messages.length), messagesBeforeLanguage + 3, 'search, filter and state refresh send no apply operation');
+    await page.locator('#wallpaper-search').fill('scene');
+    assert.equal(await page.locator('.wallpaper-card').count(), 1, 'search matches raw type as well as title');
+    assert.equal(await page.locator('.wallpaper-type').textContent(), dictionaries.en['场景壁纸']);
+    await page.locator('#wallpaper-search').fill('Nebula');
+    assert.equal(await page.locator('.wallpaper-card').count(), 3);
+    await page.locator('.wallpaper-apply').first().focus();
+    await page.keyboard.press('Enter');
+    const applied = await page.evaluate(() => window.__messages.at(-1));
+    assert.equal(applied.type, 'applyWallpaper'); assert.equal(applied.id, items[0].id);
+    assert.equal(applied.config.blur, 22); assert.equal(applied.config.paused, true);
+    assert.deepEqual(Object.keys(applied).sort(), ['config', 'id', 'type']);
+    assert.equal(Object.keys(applied.config).length, Object.keys(DEFAULTS).length, 'only current global effects are applied');
+    assert.equal(await page.locator('.wallpaper-apply').first().isDisabled(), true);
+    assert.equal(await page.locator('#language').isEnabled(), true);
     await sendState({ busy: false });
-    assert.equal(await page.evaluate(() => window.__hlsPlayers.length), 2, 'explicit retry recreates the failed stream');
-    await sendState({ media });
-    assert.equal(await page.evaluate(() => window.__hlsPlayers[1].destroyed), 1, 'changing media destroys HLS');
-    await sendState({ media: stream });
-    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
-    assert.equal(await page.evaluate(() => window.__hlsPlayers[2].destroyed), 1, 'closing the webview destroys HLS');
-    await page.evaluate(() => URL.revokeObjectURL(window.__streamFixture));
+    await page.locator('#wallpaper-folder').click();
+    assert.deepEqual(await page.evaluate(() => window.__messages.at(-1)), { type: 'chooseWallpaperFolder' });
+    await sendState({ busy: false });
+    await page.locator('#wallpaper-search').fill('猫 & space');
+    assert.equal(await page.locator('#wallpaper-workshop-hint').textContent(), dictionaries.en['将打开 Steam 官方页面；订阅并下载后，请刷新本机壁纸库。']);
+    await page.locator('#wallpaper-workshop').click();
+    assert.deepEqual(await page.evaluate(() => window.__messages.at(-1)), { type: 'searchWorkshop', query: '猫 & space' });
+    await sendState({ busy: false, wallpaperEngine: { ...library, error: '<b>Library unavailable</b>' } });
+    assert.equal(await page.locator('#wallpaper-error').textContent(), '<b>Library unavailable</b>');
+    assert.equal(await page.locator('#wallpaper-error b').count(), 0);
+    assert.equal(await page.locator('#wallpaper-search').inputValue(), '猫 & space');
+    const saved = await page.evaluate(() => window.__saved);
+    // Recreate from the saved VS Code state in a separate webview document.
+    const reopened = await browser.newPage({ viewport: { width: 280, height: 620 } });
+    await reopened.addInitScript(value => { window.__saved = value; window.acquireVsCodeApi = () => ({ getState: () => window.__saved, setState: next => { window.__saved = next; }, postMessage() {} }); }, saved);
+    await reopened.goto(pathToFileURL(fixtureFile).href);
+    assert.equal(await reopened.locator('#wallpaper-search').inputValue(), '猫 & space');
+    assert.equal(await reopened.locator('#wallpaper-supported').isChecked(), false);
+    await reopened.close();
     assert.deepEqual(await page.evaluate(() => window.__violations), []);
     assert.deepEqual(errors, []);
   } finally {
@@ -391,7 +326,6 @@ test('live controls coalesce edits, preserve newer drafts across acknowledgement
     scriptUri: pathToFileURL(path.resolve(__dirname, '../media/panel.js')).href,
     styleUri: pathToFileURL(path.resolve(__dirname, '../media/panel.css')).href,
     i18nUri: pathToFileURL(path.resolve(__dirname, '../media/i18n.js')).href,
-    regionsUri: pathToFileURL(path.resolve(__dirname, '../media/regions.js')).href,
   }));
   let browser;
   try {
@@ -536,352 +470,6 @@ test('live controls coalesce edits, preserve newer drafts across acknowledgement
   }
 });
 
-test('regions preview independent effects, keep source coordinates, and support templates, drawing and video', {
-  skip: !process.env.PLAYWRIGHT_MODULE,
-  timeout: 45000,
-}, async () => {
-  const { chromium } = require(process.env.PLAYWRIGHT_MODULE);
-  const executablePath = process.env.BROWSER_EXECUTABLE || ['C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'].find(value => fs.existsSync(value));
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'frosted-regions-panel-'));
-  const fixtureFile = path.join(directory, 'regions.html');
-  fs.writeFileSync(fixtureFile, renderPanelHtml({
-    cspSource: 'file:', nonce: 'regions-test',
-    scriptUri: pathToFileURL(path.resolve(__dirname, '../media/panel.js')).href,
-    styleUri: pathToFileURL(path.resolve(__dirname, '../media/panel.css')).href,
-    i18nUri: pathToFileURL(path.resolve(__dirname, '../media/i18n.js')).href,
-    regionsUri: pathToFileURL(path.resolve(__dirname, '../media/regions.js')).href,
-  }));
-  let browser;
-  try {
-    browser = await chromium.launch({ headless: true, executablePath });
-    const page = await browser.newPage({ viewport: { width: 280, height: 900 } });
-    const errors = [];
-    page.on('pageerror', error => errors.push(error.message));
-    await page.addInitScript(() => {
-      window.__messages = []; window.__violations = [];
-      window.acquireVsCodeApi = () => ({ getState: () => window.__saved, setState: value => { window.__saved = value; }, postMessage: message => window.__messages.push(message) });
-      document.addEventListener('securitypolicyviolation', event => window.__violations.push(event.violatedDirective));
-    });
-    await page.goto(pathToFileURL(fixtureFile).href);
-    await page.clock.install({ time: new Date('2030-01-01T00:00:00Z') });
-    await page.clock.pauseAt(new Date('2030-01-01T00:01:00Z'));
-    const imageUri = await page.evaluate(() => {
-      const canvas = document.createElement('canvas'); canvas.width = 320; canvas.height = 180;
-      const context = canvas.getContext('2d');
-      for (let x = 0; x < 320; x += 4) { context.fillStyle = (x / 4) % 2 ? '#fff' : '#000'; context.fillRect(x, 0, 4, 180); }
-      return canvas.toDataURL();
-    });
-    let state = { type: 'state', language: 'en', config: { ...DEFAULTS, fit: 'fill', blur: 24, opacity: 1, tintOpacity: 0 }, defaults: DEFAULTS, media: { kind: 'image', name: 'stripes.png', uri: imageUri }, enabled: true, busy: false, needsReload: false, liveEnabled: true, liveApplying: false, liveAck: 0, resetDraft: false, error: null, notice: null, update: { currentVersion: '0.8.0', status: 'idle', mode: 'automatic', message: 'Already up to date.' } };
-    const sendState = async changes => {
-      state = { ...state, resetDraft: false, ...changes };
-      await page.evaluate(message => window.dispatchEvent(new MessageEvent('message', { data: message })), state);
-    };
-    const acknowledge = async () => {
-      await page.clock.runFor(250);
-      const message = await page.evaluate(() => window.__messages.filter(item => item.type === 'liveConfig').at(-1));
-      assert.ok(message, 'regional edits use the live config channel');
-      await sendState({ config: message.config, liveAck: message.requestId, resetDraft: true });
-      return message.config;
-    };
-    await sendState();
-    await page.locator('#preview-media img').evaluate(image => image.decode());
-    assert.equal(await page.locator('#notice').isVisible(), false, 'routine background success is silent');
-    assert.equal(await page.locator('#draft-label').isVisible(), false);
-    assert.equal(await page.locator('.panel-footnote').count(), 0);
-    assert.equal(await page.locator('#update-message').isVisible(), false, 'idle updater feedback is quiet');
-    await sendState({ notice: 'Effects applied, but preferences could not be saved.' });
-    assert.equal(await page.locator('#notice').isVisible(), true, 'a useful settings-save warning remains visible without reload');
-    await sendState({ notice: null });
-    await page.locator('#regions-section summary').click();
-    assert.equal(await page.locator('#region-template').inputValue(), '', 'the placeholder allows the first left/right selection to trigger change');
-    assert.equal(await page.locator('#region-template-apply').count(), 0, 'templates need no extra apply button');
-    await page.locator('#region-template').selectOption('vertical');
-    assert.equal(await page.locator('#region-overlay').isVisible(), true, 'choosing a template immediately opens its editable outlines');
-    assert.equal(await page.locator('#region-overlay polygon').count(), 2);
-    const initial = await acknowledge();
-    assert.equal(initial.regions.enabled, true);
-    assert.equal(initial.regions.items.length, 2);
-    assert.ok(initial.regions.items.every(region => region.feather === 0.06));
-    assert.equal(await page.locator('#region-template').inputValue(), 'vertical');
-    assert.equal(await page.evaluate(() => window.__saved.dirty), false, 'structurally equal acknowledged region objects are clean');
-    assert.equal(await page.locator('#region-canvas').isVisible(), true);
-    const contrast = await page.locator('#region-canvas').evaluate(canvas => {
-      const context = canvas.getContext('2d');
-      const variation = (start, end) => {
-        const values = []; for (let x = Math.floor(start * canvas.width); x < end * canvas.width; x++) values.push(context.getImageData(x, Math.floor(canvas.height * 0.6), 1, 1).data[0]);
-        const average = values.reduce((sum, value) => sum + value, 0) / values.length;
-        return Math.sqrt(values.reduce((sum, value) => sum + (value - average) ** 2, 0) / values.length);
-      };
-      return { clear: variation(0.1, 0.4), blurred: variation(0.6, 0.9) };
-    });
-    assert.ok(contrast.clear > 70 && contrast.blurred < 30, `canvas visibly preserves a sharp region beside blur: ${JSON.stringify(contrast)}`);
-    for (const [template, count] of [['horizontal', 2], ['columns', 3], ['grid', 4], ['center', 1]]) {
-      await page.locator('#region-template').selectOption(template);
-      const config = await acknowledge();
-      assert.equal(config.regions.items.length, count);
-      assert.ok(config.regions.items.every(region => region.points.every(point => point.every(value => value >= 0 && value <= 1))));
-    }
-    await page.locator('#region-name').fill('<b>My focus</b>');
-    await page.locator('#region-name').dispatchEvent('input');
-    for (const [key, value] of Object.entries({ blur: 17, opacity: 0.7, tintOpacity: 0.2, brightness: 1.3, saturation: 0.6, feather: 0.12 })) {
-      await page.locator(`#region-${key}`).fill(String(value));
-      await page.locator(`#region-${key}`).dispatchEvent('input');
-    }
-    let config = await acknowledge();
-    assert.equal(config.regions.items[0].name, '<b>My focus</b>');
-    assert.equal(config.regions.items[0].blur, 17);
-    assert.equal(config.regions.items[0].opacity, 0.7);
-    assert.equal(config.regions.items[0].tintOpacity, 0.2);
-    assert.equal(config.regions.items[0].brightness, 1.3);
-    assert.equal(config.regions.items[0].saturation, 0.6);
-    assert.equal(config.regions.items[0].feather, 0.12, 'feather is included in the live request and acknowledgement');
-    assert.equal(await page.locator('#region-feather-value').textContent(), '12%');
-    assert.equal(await page.locator('#region-template').inputValue(), '', 'custom changes do not claim to still match a template');
-    assert.equal(await page.locator('#region-select b').count(), 0, 'region names are text, never markup');
-    await page.locator('#region-sharp').click();
-    config = await acknowledge();
-    assert.equal(config.regions.items[0].blur, 0);
-    assert.equal(config.blur, 24, 'regional sliders never overwrite the global effect');
-    await page.locator('[data-region-tool="polygon"]').click();
-    await page.locator('#region-overlay').focus(); await page.keyboard.press('Space');
-    assert.equal(await page.locator('#region-overlay .drawing-vertex').count(), 1);
-    await page.locator('#region-template').selectOption('center');
-    config = await acknowledge();
-    assert.equal(config.regions.items[0].feather, 0.06, 'reselecting the same template after customization resets it immediately');
-    assert.equal(await page.locator('[data-region-tool="select"]').getAttribute('aria-pressed'), 'true', 'a new template is ready to select and drag, regardless of the previous drawing tool');
-    assert.equal(await page.locator('#region-overlay .drawing-shape').count(), 0);
-
-    const portrait = await page.evaluate(() => {
-      const canvas = document.createElement('canvas'); canvas.width = 180; canvas.height = 320;
-      const context = canvas.getContext('2d'); context.fillStyle = '#537a9a'; context.fillRect(0, 0, 180, 320);
-      context.fillStyle = '#f9c760'; context.fillRect(10, 10, 160, 300); return canvas.toDataURL();
-    });
-    await sendState({ config: { ...config, fit: 'cover', regions: { enabled: true, items: [] } }, media: { kind: 'image', name: 'portrait.png', uri: portrait }, resetDraft: true });
-    await page.locator('#preview-media img').evaluate(image => image.decode());
-    if (await page.locator('#region-edit').getAttribute('aria-pressed') !== 'true') await page.locator('#region-edit').click();
-    assert.equal(await page.locator('.preview-code').isVisible(), false);
-    assert.equal(await page.locator('#preview-media img').evaluate(image => getComputedStyle(image).objectFit), 'contain');
-    await page.locator('[data-region-tool="rect"]').click();
-    await page.locator('#region-overlay').scrollIntoViewIfNeeded();
-    async function displayBounds() {
-      return page.locator('#region-overlay').evaluate(svg => {
-        const rect = svg.getBoundingClientRect();
-        const media = document.querySelector('#preview-media > *');
-        const width = media.naturalWidth || media.videoWidth, height = media.naturalHeight || media.videoHeight;
-        const scale = Math.min(rect.width / width, rect.height / height);
-        return { left: rect.left, top: rect.top, x: (rect.width - width * scale) / 2, y: (rect.height - height * scale) / 2, width: width * scale, height: height * scale };
-      });
-    }
-    async function waitForRegionLayout() {
-      // CSS layout changes before ResizeObserver reprojects the SVG. Poll from
-      // Node because this scenario intentionally pauses the page's clock.
-      const deadline = Date.now() + 5000;
-      let dimensions;
-      do {
-        dimensions = await page.locator('#region-overlay').evaluate(svg => {
-          const preview = document.getElementById('preview');
-          return { width: preview.clientWidth, height: preview.clientHeight, svgWidth: svg.viewBox.baseVal.width, svgHeight: svg.viewBox.baseVal.height };
-        });
-        if (dimensions.svgWidth === dimensions.width && dimensions.svgHeight === dimensions.height) return;
-        await new Promise(resolve => setTimeout(resolve, 20));
-      } while (Date.now() < deadline);
-      assert.fail(`Region projection did not receive the new layout: ${JSON.stringify(dimensions)}`);
-    }
-    let bounds = await displayBounds();
-    await page.mouse.move(bounds.left + 3, bounds.top + 30); await page.mouse.down(); await page.mouse.up();
-    assert.equal(await page.evaluate(() => window.__saved.draft.regions.items.length), 0, 'portrait letterbox margins cannot start a region');
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.1, bounds.top + bounds.y + bounds.height * 0.2);
-    await page.mouse.down();
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.9, bounds.top + bounds.y + bounds.height * 0.8, { steps: 8 });
-    await page.mouse.up();
-    config = await acknowledge();
-    let rectangle = config.regions.items[0];
-    assert.ok(Math.abs(rectangle.points[0][0] - 0.1) < 0.01 && Math.abs(rectangle.points[0][1] - 0.2) < 0.01);
-    assert.ok(Math.abs(rectangle.points[2][0] - 0.9) < 0.01 && Math.abs(rectangle.points[2][1] - 0.8) < 0.01);
-    await page.evaluate(() => document.documentElement.style.setProperty('--vscode-editor-background', '#f7f6f4'));
-    assert.deepEqual(await page.locator('#region-canvas').evaluate(canvas => Array.from(canvas.getContext('2d').getImageData(2, Math.floor(canvas.height / 2), 1, 1).data).slice(0, 3)), [247, 246, 244], 'theme changes redraw the canvas tint immediately');
-    await page.evaluate(() => document.documentElement.style.removeProperty('--vscode-editor-background'));
-    await page.setViewportSize({ width: 360, height: 900 });
-    await waitForRegionLayout();
-    bounds = await displayBounds();
-    const projected = await page.locator('#region-overlay polygon').evaluate(polygon => ({ x: polygon.points.getItem(0).x, y: polygon.points.getItem(0).y }));
-    assert.ok(Math.abs(projected.x - (bounds.x + rectangle.points[0][0] * bounds.width)) < 1);
-    assert.ok(Math.abs(projected.y - (bounds.y + rectangle.points[0][1] * bounds.height)) < 1);
-    assert.deepEqual(await page.evaluate(() => window.__saved.draft.regions.items[0].points), rectangle.points, 'resizing does not alter source anchors');
-
-    await page.locator('[data-region-tool="lasso"]').click();
-    await page.locator('#region-overlay').scrollIntoViewIfNeeded();
-    bounds = await displayBounds();
-    const circlePoint = angle => [bounds.left + bounds.x + bounds.width * (0.5 + 0.4 * Math.cos(angle)), bounds.top + bounds.y + bounds.height * (0.5 + 0.4 * Math.sin(angle))];
-    await page.mouse.click(bounds.left + bounds.x + bounds.width * 0.5, bounds.top + bounds.y + bounds.height * 0.5);
-    assert.equal(await page.locator('#region-drawing-error').isVisible(), true, 'an accidental lasso click gives useful feedback');
-    assert.equal(await page.locator('#region-overlay .drawing-shape').count(), 0, 'a short lasso never continues into the next gesture');
-    await page.mouse.move(...circlePoint(0)); await page.mouse.down();
-    for (let index = 1; index <= 130; index++) await page.mouse.move(...circlePoint(index * Math.PI * 2 / 130));
-    await page.mouse.up();
-    config = await acknowledge();
-    const freehand = config.regions.items[1];
-    assert.ok(freehand.points.length >= 8 && freehand.points.length <= 64);
-    assert.ok(Math.min(...freehand.points.map(point => point[0])) < 0.13 && Math.max(...freehand.points.map(point => point[0])) > 0.87);
-    assert.ok(Math.min(...freehand.points.map(point => point[1])) < 0.13 && Math.max(...freehand.points.map(point => point[1])) > 0.87, 'a long lasso preserves the late half of the stroke');
-    const distanceToSegment = (point, a, b) => {
-      const dx = b[0] - a[0], dy = b[1] - a[1];
-      const t = dx || dy ? Math.max(0, Math.min(1, ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / (dx * dx + dy * dy))) : 0;
-      return Math.hypot(point[0] - a[0] - t * dx, point[1] - a[1] - t * dy);
-    };
-    const simplifiedPixels = freehand.points.map(([x, y]) => [x * bounds.width, y * bounds.height]);
-    const maxError = Math.max(...Array.from({ length: 131 }, (_, index) => {
-      const angle = index * Math.PI * 2 / 130;
-      const point = [(0.5 + 0.4 * Math.cos(angle)) * bounds.width, (0.5 + 0.4 * Math.sin(angle)) * bounds.height];
-      return Math.min(...simplifiedPixels.map((a, i) => distanceToSegment(point, a, simplifiedPixels[(i + 1) % simplifiedPixels.length])));
-    }));
-    assert.ok(maxError <= 2, `lasso simplification stays within two preview pixels (${maxError})`);
-    assert.equal(freehand.feather, 0.06);
-
-    const clickPoint = async (x, y, options) => page.mouse.click(bounds.left + bounds.x + bounds.width * x, bounds.top + bounds.y + bounds.height * y, options);
-    await page.locator('[data-region-tool="polygon"]').click();
-    await page.locator('#region-overlay').scrollIntoViewIfNeeded(); bounds = await displayBounds();
-    await clickPoint(0.2, 0.2); await clickPoint(0.8, 0.2); await clickPoint(0.8, 0.8);
-    assert.equal(await page.evaluate(() => window.__saved.draft.regions.items.length), 2, 'click polygons stay open after three points');
-    assert.equal(await page.locator('#region-overlay .drawing-vertex').count(), 3);
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.2, bounds.top + bounds.y + bounds.height * 0.8);
-    assert.equal(await page.locator('#region-overlay .drawing-shape').evaluate(line => line.points.numberOfItems), 4, 'an open polygon previews the next edge under the pointer');
-    await page.keyboard.press('Backspace');
-    assert.equal(await page.locator('#region-overlay .drawing-vertex').count(), 2);
-    await clickPoint(0.8, 0.8); await clickPoint(0.2, 0.8);
-    await page.keyboard.press('Enter');
-    config = await acknowledge();
-    assert.equal(config.regions.items.length, 3);
-    assert.equal(config.regions.items[2].points.length, 4);
-    await page.locator('[data-region-tool="polygon"]').click();
-    await page.locator('#region-overlay').scrollIntoViewIfNeeded(); bounds = await displayBounds();
-    await clickPoint(0.3, 0.3); await clickPoint(0.7, 0.3);
-    await page.mouse.dblclick(bounds.left + bounds.x + bounds.width * 0.5, bounds.top + bounds.y + bounds.height * 0.7);
-    config = await acknowledge();
-    assert.equal(config.regions.items.length, 4, 'double click closes a polygon without duplicate vertices');
-    assert.equal(config.regions.items[3].points.length, 3);
-    await page.locator('[data-region-tool="polygon"]').click();
-    await page.locator('#region-overlay').scrollIntoViewIfNeeded(); bounds = await displayBounds();
-    await clickPoint(0.2, 0.3); await clickPoint(0.3, 0.4); await page.keyboard.press('Escape');
-    assert.equal(await page.locator('#region-overlay .drawing-shape').count(), 0);
-    assert.equal(await page.evaluate(() => window.__saved.draft.regions.items.length), 4);
-    await page.locator('[data-region-tool="rect"]').click();
-    await page.locator('#region-overlay').focus();
-    await page.keyboard.press('Space'); await page.keyboard.press('Shift+ArrowRight'); await page.keyboard.press('Shift+ArrowDown'); await page.keyboard.press('Enter');
-    config = await acknowledge();
-    assert.equal(config.regions.items.length, 5, 'a rectangle can be created with the keyboard alone');
-    await page.locator('[data-region-tool="select"]').click();
-    await page.locator('#region-overlay').scrollIntoViewIfNeeded(); bounds = await displayBounds();
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.12, bounds.top + bounds.y + bounds.height * 0.22);
-    await page.mouse.down();
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 1.2, bounds.top + bounds.y + bounds.height * 1.2, { steps: 8 });
-    assert.deepEqual(await page.evaluate(() => window.__saved.draft.regions.items[0].points), rectangle.points, 'moving only previews geometry until release');
-    await page.mouse.up();
-    config = await acknowledge();
-    const moved = config.regions.items[0];
-    assert.ok(Math.abs(moved.points[2][0] - 1) < 0.001 && Math.abs(moved.points[2][1] - 1) < 0.001, 'dragging clamps the whole region to source bounds');
-    assert.ok(Math.abs((moved.points[2][0] - moved.points[0][0]) - (rectangle.points[2][0] - rectangle.points[0][0])) < 0.001, 'dragging preserves the region shape');
-    rectangle = moved;
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.21, bounds.top + bounds.y + bounds.height * 0.95); await page.mouse.down();
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.15, bounds.top + bounds.y + bounds.height * 0.85);
-    await page.keyboard.press('ArrowRight'); await page.mouse.up();
-    assert.deepEqual(await page.evaluate(() => window.__saved.draft.regions), config.regions, 'changing selection cancels a drag instead of writing its geometry into another region');
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.21, bounds.top + bounds.y + bounds.height * 0.95); await page.mouse.down();
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.15, bounds.top + bounds.y + bounds.height * 0.85);
-    const externalPoints = [[0.1, 0.1], [0.3, 0.1], [0.3, 0.3], [0.1, 0.3]];
-    config = { ...config, regions: { ...config.regions, items: config.regions.items.map((region, index) => index ? region : { ...region, points: externalPoints }) } };
-    await sendState({ config, resetDraft: false }); await page.mouse.up();
-    assert.deepEqual(await page.evaluate(() => window.__saved.draft.regions.items[0].points), externalPoints, 'external config replacement cancels stale drag geometry even without resetDraft');
-    rectangle = config.regions.items[0];
-    await page.locator('[data-region-tool="rect"]').click();
-    await page.locator('#region-overlay').scrollIntoViewIfNeeded(); bounds = await displayBounds();
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.2, bounds.top + bounds.y + bounds.height * 0.2); await page.mouse.down();
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.4, bounds.top + bounds.y + bounds.height * 0.4);
-    await sendState({ busy: true });
-    assert.equal(await page.locator('#region-overlay .drawing-shape').count(), 0, 'busy state cancels a pending gesture');
-    await page.mouse.up(); await sendState({ busy: false });
-    assert.equal(await page.evaluate(() => window.__saved.draft.regions.items.length), 5);
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.2, bounds.top + bounds.y + bounds.height * 0.2); await page.mouse.down();
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.3, bounds.top + bounds.y + bounds.height * 0.3);
-    await page.locator('#region-overlay').dispatchEvent('pointercancel', { pointerId: 1, isPrimary: true });
-    assert.equal(await page.locator('#region-overlay .drawing-shape').count(), 0, 'pointer cancellation releases the unfinished gesture');
-    await page.mouse.up();
-    assert.equal(await page.evaluate(() => window.__saved.draft.regions.items.length), 5);
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.2, bounds.top + bounds.y + bounds.height * 0.2); await page.mouse.down();
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.3, bounds.top + bounds.y + bounds.height * 0.3);
-    await page.evaluate(() => window.dispatchEvent(new Event('blur')));
-    assert.equal(await page.locator('#region-overlay .drawing-shape').count(), 0, 'losing window focus cancels an unfinished gesture');
-    await page.mouse.up();
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.2, bounds.top + bounds.y + bounds.height * 0.2); await page.mouse.down();
-    await page.mouse.move(bounds.left + bounds.x + bounds.width * 0.3, bounds.top + bounds.y + bounds.height * 0.3);
-    await page.setViewportSize({ width: 340, height: 900 });
-    await page.waitForFunction(() => !document.querySelector('#region-overlay .drawing-shape'));
-    await page.mouse.up();
-    assert.equal(await page.evaluate(() => window.__saved.draft.regions.items.length), 5, 'resizing cancels an unfinished gesture without committing a shifted region');
-    await page.setViewportSize({ width: 360, height: 900 });
-    assert.equal(await page.locator('#region-canvas').isVisible(), true, 'editing can show the actual regional effects');
-    await page.locator('#region-show-effects').uncheck();
-    assert.equal(await page.locator('#region-canvas').isVisible(), false);
-    assert.equal(await page.locator('#preview-media img').evaluate(image => getComputedStyle(image).filter), 'none');
-    await page.locator('#region-show-effects').check();
-    await page.locator('#region-done').click();
-    assert.equal(await page.locator('#region-overlay').isVisible(), false);
-    assert.equal(await page.locator('#preview-media img').evaluate(image => getComputedStyle(image).objectFit), 'cover');
-    await page.locator('input[name="fit"][value="fill"]').check();
-    config = await acknowledge();
-    assert.deepEqual(config.regions.items[0].points, rectangle.points, 'switching cover to fill keeps source coordinates');
-
-    const many = Array.from({ length: 8 }, (_, index) => ({ ...rectangle, id: `limit-${index}`, name: `Area ${index + 1}` }));
-    await sendState({ config: { ...config, regions: { enabled: true, items: many } }, resetDraft: true });
-    await page.locator('#region-edit').click();
-    assert.equal(await page.locator('[data-region-tool="rect"]').isEnabled(), false);
-    assert.equal(await page.locator('#region-limit').isVisible(), true);
-    await page.locator('#region-delete').click();
-    config = await acknowledge();
-    assert.equal(config.regions.items.length, 7);
-    assert.equal(await page.locator('[data-region-tool="rect"]').isEnabled(), true);
-    for (const language of ['zh-CN', 'es', 'en']) {
-      await page.locator('#language').selectOption(language);
-      assert.equal(await page.locator('#region-template option[value=""]').textContent(), dictionaries[language]['选择模板']);
-      assert.equal(await page.locator('label[for="region-feather"]').textContent(), dictionaries[language]['渐变过渡']);
-      assert.equal(await page.locator('#region-overlay').getAttribute('aria-label'), dictionaries[language]['区域绘制画布']);
-      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
-    }
-    await page.clock.resume();
-    await page.emulateMedia({ reducedMotion: 'reduce' });
-    await page.locator('[data-region-tool="polygon"]').click();
-    await page.locator('#region-overlay').scrollIntoViewIfNeeded(); bounds = await displayBounds();
-    await clickPoint(0.2, 0.2); await clickPoint(0.3, 0.3);
-    assert.equal(await page.locator('#region-overlay .drawing-vertex').count(), 2);
-    const video = { kind: 'video', name: 'edges.webm', uri: pathToFileURL(path.resolve(__dirname, 'fixtures/edges.webm')).href };
-    await sendState({ media: video, language: 'en' });
-    assert.equal(await page.locator('#region-overlay .drawing-shape').count(), 0, 'switching media discards the old source drawing');
-    await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2);
-    await page.locator('video').evaluate(video => { window.__regionVideo = video; });
-    await page.locator('#region-edit').click();
-    await page.locator('#region-edit').click();
-    assert.equal(await page.locator('video').count(), 1, 'regional video preview uses one decoder');
-    assert.equal(await page.locator('video').evaluate(video => video === window.__regionVideo), true, 'opening and closing the editor preserves the media element');
-    await sendState({ media: { kind: 'image', name: 'missing.png', uri: 'data:image/png;base64,AA==' } });
-    await page.waitForFunction(() => !document.querySelector('#preview-error').hidden);
-    assert.equal(await page.locator('#region-canvas').isVisible(), false, 'a failed new media source cannot display the previous canvas bitmap');
-    assert.equal(await page.locator('#region-canvas').evaluate(canvas => canvas.width), 1);
-    await sendState({ media: { kind: 'image', name: 'portrait.png', uri: portrait }, error: 'A real error remains visible.' });
-    await page.locator('#preview-media img').evaluate(image => image.decode());
-    assert.equal(await page.locator('#error').isVisible(), true);
-    await page.setViewportSize({ width: 280, height: 620 });
-    await page.locator('#region-feather').scrollIntoViewIfNeeded();
-    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
-    const sliderBox = await page.locator('#region-feather').boundingBox(), footerBox = await page.locator('.action-bar').boundingBox();
-    assert.ok(sliderBox.y >= 0 && sliderBox.y + sliderBox.height <= footerBox.y, 'all regional controls are reachable above the sticky footer');
-    assert.deepEqual(await page.evaluate(() => window.__violations), []);
-    assert.deepEqual(errors, []);
-  } finally {
-    if (browser) await browser.close();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
-
 test('sidebar previews drafts, sends explicit actions, and stays usable across widths and themes', {
   skip: !process.env.PLAYWRIGHT_MODULE,
   timeout: 30000,
@@ -898,7 +486,6 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
     scriptUri: pathToFileURL(path.resolve(__dirname, '../media/panel.js')).href,
     styleUri: pathToFileURL(path.resolve(__dirname, '../media/panel.css')).href,
     i18nUri: pathToFileURL(path.resolve(__dirname, '../media/i18n.js')).href,
-    regionsUri: pathToFileURL(path.resolve(__dirname, '../media/regions.js')).href,
   }));
   let browser;
   try {
@@ -1125,7 +712,6 @@ test('sidebar previews drafts, sends explicit actions, and stays usable across w
       scriptUri: pathToFileURL(path.resolve(__dirname, '../media/panel.js')).href,
       styleUri: pathToFileURL(path.resolve(__dirname, '../media/panel.css')).href,
       i18nUri: pathToFileURL(path.resolve(__dirname, '../media/i18n.js')).href,
-    regionsUri: pathToFileURL(path.resolve(__dirname, '../media/regions.js')).href,
     }));
     const reopened = await browser.newPage({ viewport: { width: 280, height: 620 } });
     await reopened.addInitScript(saved => {

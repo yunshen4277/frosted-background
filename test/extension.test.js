@@ -25,7 +25,7 @@ function harness(options = {}) {
     asAbsolutePath: name => path.resolve(path.dirname(extensionFile), '..', name),
     globalState: {
       get: (key, fallback) => state.has(key) ? state.get(key) : fallback,
-      update: async (key, value) => { calls.state.push([key, value]); state.set(key, value); }
+      update: async (key, value) => { calls.state.push([key, value]); state.set(key, value); if (options.updateState) await options.updateState(key, value); }
     }
   };
   const patcher = {
@@ -110,13 +110,15 @@ function harness(options = {}) {
     require: name => {
       if (name === 'vscode') return vscode;
       if (name === './patcher') return patcher;
+      if (name === './wallpaper-engine') return {
+        discoverLibrary: async data => { calls.wallpaperScans = [...(calls.wallpaperScans || []), data]; return options.library ? await options.library(data) : { installPath: null, items: [] }; },
+        resolveMedia: async item => { calls.wallpaperResolve = [...(calls.wallpaperResolve || []), item.id]; if (options.resolveWallpaper) return options.resolveWallpaper(item); return item.mediaPath; },
+        buildWorkshopSearchUrl: query => 'https://steamcommunity.com/workshop/browse/?appid=431960&searchtext=' + encodeURIComponent(query)
+      };
       if (name === './config') return require('../src/config');
       if (name === './panel') return require('../src/panel');
       if (name === './updater') return require('../src/updater');
       if (name === './localization') return require('../src/localization');
-      if (name === '../media/source') return require('../media/source');
-      if (name === './remote-media') return { resolveMediaLink: async (...args) => { calls.remote.push(args.slice(0, 2)); if (options.resolveMediaLink) return options.resolveMediaLink(...args); return options.remoteMedia; } };
-      if (name === './youtube-media') return { resolveYouTubeLink: async (...args) => { calls.youtube.push(args.slice(0, 2)); if (options.resolveYouTubeLink) return options.resolveYouTubeLink(...args); return options.youtubeMedia; } };
       return require(name);
     },
     setTimeout: options.captureTimers ? (callback, delay) => {
@@ -138,125 +140,93 @@ function harness(options = {}) {
 
 async function settle() { for (let index = 0; index < 5; index++) await new Promise(resolve => setImmediate(resolve)); }
 
-test('Twitch links open only the official page without changing or applying the background', async t => {
-  const env = harness({ state: { mediaPath: 'D:/existing.png', language: 'en' } });
-  t.after(() => env.dispose());
+test('removed external link messages cannot trigger network, selection or application', async t => {
+  const env = harness({ state: { mediaPath: 'D:/old.png' } }); t.after(() => env.dispose());
   const panel = attachPanel(env); await settle();
-  await panel.send({ type: 'chooseUrl', kind: 'auto', url: 'https://www.twitch.tv/nasa', config: DEFAULTS });
-  assert.deepEqual(env.calls.external, ['https://www.twitch.tv/nasa']);
-  assert.equal(env.calls.apply.length, 0);
-  assert.equal(env.calls.warning.length, 0);
-  assert.equal(env.calls.remote.length, 0);
-  assert.equal(env.state.get('mediaPath'), 'D:/existing.png');
-  assert.match(panel.latest().notice, /official player/);
-  await panel.send({ type: 'chooseUrl', kind: 'auto', url: 'https://account:secret@www.twitch.tv/nasa', config: DEFAULTS });
-  assert.equal(env.calls.external.length, 1);
-  assert.doesNotMatch(panel.latest().error, /secret/);
+  for (const url of ['https://youtube.com/watch?v=x','https://cdn.example.test/a.mp4','https://cdn.example.test/live.m3u8']) {
+    await panel.send({ type: 'chooseUrl', kind: 'auto', url, config: DEFAULTS });
+  }
+  assert.equal(env.calls.external.length, 0); assert.equal(env.calls.apply.length, 0);
+  assert.equal(env.state.get('mediaPath'), 'D:/old.png');
 });
 
-test('YouTube links cache and apply a local video in the editor without opening a browser', async t => {
-  const env = harness({ version: '0.11.0', liveProtocol: 1, youtubeMedia: 'D:/YouTube-1aBvGJHetUM.webm',
-    state: { enabled: true, mediaPath: 'D:/old.png', injectionConsent: true, lastAppliedExtensionVersion: '0.11.0' } });
-  t.after(() => env.dispose());
-  const panel = attachPanel(env); await settle();
-  await panel.send({ type: 'chooseUrl', kind: 'video', url: 'https://youtu.be/1aBvGJHetUM?si=tracking', config: { ...DEFAULTS, paused: true, blur: 12, fit: 'fill' } });
-  assert.deepEqual(env.calls.youtube, [['https://www.youtube.com/watch?v=1aBvGJHetUM', 'video']]);
-  assert.equal(env.calls.external.length, 0);
-  assert.equal(env.calls.remote.length, 0);
-  assert.equal(env.calls.apply.length, 1);
-  assert.equal(env.calls.apply[0].mediaPath, 'D:/YouTube-1aBvGJHetUM.webm');
-  assert.equal(env.calls.apply[0].config.paused, true);
-  assert.equal(env.calls.apply[0].config.blur, 12);
-  assert.equal(env.calls.apply[0].config.fit, 'fill');
-  assert.equal(env.state.get('mediaPath'), 'D:/YouTube-1aBvGJHetUM.webm');
-  assert.equal(env.state.get('mediaSource'), undefined);
-  assert.equal(panel.latest().media.kind, 'video');
+test('upgrade disables a legacy stream and never reapplies the removed source', async t => {
+  const env = harness({ version: '0.12.0', state: { enabled: true, injectionConsent: true,
+    mediaSource: { type: 'hls', url: 'https://cdn.example.test/live.m3u8' }, lastAppliedExtensionVersion: '0.11.1' } });
+  t.after(() => env.dispose()); const panel = attachPanel(env); await settle(); await panel.send({ type: 'ready' });
+  assert.equal(env.calls.restore.length, 1); assert.equal(env.calls.reapply.length, 0);
+  assert.equal(env.state.get('enabled'), false); assert.equal(env.state.get('mediaSource'), undefined);
+  assert.equal(panel.latest().media, null);
+});
+
+test('Wallpaper Engine discovery applies only a host-owned item and keeps visual settings', async t => {
+  const id = 'a'.repeat(64);
+  const item = { id, title: '<b>Local video</b>', type: 'video', supported: true, mediaPath: 'D:/library/local.mp4', previewPath: 'D:/library/preview.png' };
+  const env = harness({ version: '0.12.0', liveProtocol: 1, library: async () => ({ installPath: 'D:/wallpaper_engine', items: [item] }),
+    state: { enabled: true, injectionConsent: true, mediaPath: 'D:/old.png', lastAppliedExtensionVersion: '0.12.0' } });
+  t.after(() => env.dispose()); const panel = attachPanel(env); await settle();
+  await panel.send({ type: 'ready' }); await panel.send({ type: 'ready' });
+  assert.equal(env.calls.wallpaperScans.length, 1);
+  const shown = panel.latest().wallpaperEngine.items[0];
+  assert.equal(shown.title, item.title); assert.equal(shown.mediaPath, undefined);
+  assert.match(shown.previewUri, /vscode-webview-resource/);
+  await panel.send({ type: 'applyWallpaper', id, mediaPath: 'D:/injected.mp4', config: { ...DEFAULTS, paused: true, blur: 7, fit: 'fill', regions: { enabled: true } } });
+  assert.equal(env.calls.apply.length, 1); assert.equal(env.calls.apply[0].mediaPath, item.mediaPath);
+  assert.equal(env.calls.apply[0].config.paused, true); assert.equal(env.calls.apply[0].config.blur, 7);
+  assert.equal(env.calls.apply[0].config.regions, undefined);
+  assert.equal(env.state.get('mediaPath'), item.mediaPath); assert.equal(env.calls.external.length, 0);
   assert.equal(panel.latest().needsReload, false);
-  assert.equal(env.calls.command.length, 0);
+  await panel.send({ type: 'applyWallpaper', id: 'b'.repeat(64), config: DEFAULTS });
+  assert.equal(env.calls.apply.length, 1); assert.equal(env.calls.wallpaperResolve.length, 1);
 });
 
-test('YouTube load failure preserves the background and does not fall back to opening a browser', async t => {
-  const env = harness({ resolveYouTubeLink: async () => { throw new Error('YouTube video unavailable'); }, state: { mediaPath: 'D:/old.png' } });
-  t.after(() => env.dispose());
-  const panel = attachPanel(env); await settle();
-  await panel.send({ type: 'chooseUrl', kind: 'auto', url: 'https://youtu.be/1aBvGJHetUM', config: DEFAULTS });
+test('a changed wallpaper preserves the current background and reports a localized error', async t => {
+  const item = { id: 'c'.repeat(64), title: 'Video', type: 'video', supported: true };
+  const env = harness({ library: async () => ({ installPath: 'D:/wallpaper_engine', items: [item] }),
+    resolveWallpaper: async () => { throw Object.assign(new Error('private path'), { code: 'WE_CHANGED' }); },
+    state: { language: 'es', mediaPath: 'D:/old.png' } });
+  t.after(() => env.dispose()); const panel = attachPanel(env); await panel.send({ type: 'ready' });
+  await panel.send({ type: 'applyWallpaper', id: item.id, config: DEFAULTS });
+  assert.equal(env.calls.apply.length, 0); assert.equal(env.state.get('mediaPath'), 'D:/old.png');
+  assert.match(panel.latest().error, /han cambiado/); assert.doesNotMatch(panel.latest().error, /private/);
+});
+
+test('Workshop search opens only a generated official search page without applying a background', async t => {
+  const env = harness(); t.after(() => env.dispose()); const panel = attachPanel(env);
+  await panel.send({ type: 'searchWorkshop', query: '海边 & night', url: 'file:///C:/bad.exe' });
+  assert.equal(env.calls.external.length, 1);
+  const url = new URL(env.calls.external[0]); assert.equal(url.hostname, 'steamcommunity.com');
+  assert.equal(url.searchParams.get('appid'), '431960'); assert.equal(url.searchParams.get('searchtext'), '海边 & night');
   assert.equal(env.calls.apply.length, 0);
-  assert.equal(env.calls.external.length, 0);
-  assert.equal(env.state.get('mediaPath'), 'D:/old.png');
-  assert.match(panel.latest().error, /YouTube/);
-  assert.equal(panel.latest().busy, false);
 });
 
-test('extension disposal cancels YouTube loading and prevents late media application', async () => {
-  let finish, signal;
-  const env = harness({ resolveYouTubeLink: async (_url, _kind, options) => {
-    signal = options.signal; return new Promise(resolve => { finish = resolve; });
-  }, state: { mediaPath: 'D:/old.png', injectionConsent: true } });
-  const panel = attachPanel(env); await settle();
-  const work = panel.send({ type: 'chooseUrl', kind: 'auto', url: 'https://youtu.be/1aBvGJHetUM', config: DEFAULTS });
-  await settle();
-  env.dispose(); assert.equal(signal.aborted, true);
-  finish('D:/late.webm'); await work;
-  assert.equal(env.calls.apply.length, 0);
-  assert.equal(env.state.get('mediaPath'), 'D:/old.png');
+test('folder cancellation and late discovery after disposal do not overwrite the library or media', async t => {
+  let resolve; const waiting = new Promise(done => { resolve = done; });
+  const env = harness({ library: () => waiting, state: { mediaPath: 'D:/old.png' } });
+  const panel = attachPanel(env); await panel.send({ type: 'chooseWallpaperFolder' });
+  assert.equal(env.calls.wallpaperScans, undefined);
+  const operation = panel.send({ type: 'refreshWallpapers' }); await settle(); env.dispose();
+  resolve({ installPath: 'D:/wallpaper_engine', items: [] }); await operation;
+  assert.equal(env.state.get('mediaPath'), 'D:/old.png'); assert.equal(env.state.get('wallpaperEnginePath'), undefined);
 });
 
-test('HLS selection persists separately, live pause keeps the source, and local selection clears it', async t => {
-  const source = { type: 'hls', kind: 'video', url: 'https://cdn.example.com/live.m3u8?sig=private' };
-  const env = harness({ version: '0.10.0', liveProtocol: 1, remoteMedia: source,
-    files: [{ scheme: 'file', fsPath: 'D:/new.webm' }],
-    state: { enabled: true, mediaPath: 'D:/old.png', injectionConsent: true, lastAppliedExtensionVersion: '0.10.0' }
-  });
-  t.after(() => env.dispose());
-  const panel = attachPanel(env); await settle();
-  await panel.send({ type: 'chooseUrl', kind: 'hls', url: source.url, config: DEFAULTS });
-  assert.deepEqual(env.calls.apply[0].mediaSource, source);
-  assert.equal(env.calls.apply[0].mediaPath, undefined);
-  assert.deepEqual(env.state.get('mediaSource'), source);
-  assert.equal(env.state.get('mediaPath'), undefined);
-  assert.equal(panel.latest().media.type, 'hls');
-  assert.doesNotMatch(panel.latest().media.name, /private/);
-  assert.equal(panel.latest().liveEnabled, true);
-  await panel.send({ type: 'liveConfig', requestId: 1, config: { ...DEFAULTS, paused: true } });
-  assert.equal(env.calls.updateConfig[0].config.paused, true);
-  assert.equal(env.configuration.paused, true);
-  assert.equal(env.calls.apply.length, 1);
-  assert.deepEqual(env.state.get('mediaSource'), source);
-  await panel.send({ type: 'chooseMedia', kind: 'video', config: { ...DEFAULTS, paused: true } });
-  assert.equal(env.state.get('mediaSource'), undefined);
-  assert.equal(env.state.get('mediaPath'), 'D:/new.webm');
-  assert.equal(env.calls.command.length, 0);
+test('a failed legacy stream restore is visible and does not falsely clear enabled state', async t => {
+  const env = harness({ restore: async () => { throw new Error('restore locked'); },
+    state: { enabled: true, mediaSource: { type: 'hls', url: 'https://cdn.test/live.m3u8' } } });
+  t.after(() => env.dispose()); const panel = attachPanel(env); await settle();
+  assert.equal(env.state.get('enabled'), true); assert.ok(env.state.get('mediaSource'));
+  assert.match(panel.latest().error, /restore locked/); assert.equal(env.calls.reapply.length, 0);
 });
 
-test('failed external download retains the current background and does not reload', async t => {
-  const env = harness({ version: '0.10.0', liveProtocol: 1,
-    resolveMediaLink: async () => { throw new Error('无法下载媒体，请检查网络、链接或站点访问限制。'); },
-    state: { enabled: true, mediaPath: 'D:/old.png', injectionConsent: true, lastAppliedExtensionVersion: '0.10.0' }
-  });
-  t.after(() => env.dispose());
-  const panel = attachPanel(env); await settle();
-  await panel.send({ type: 'chooseUrl', kind: 'image', url: 'https://cdn.example.com/a.png?sig=private', config: DEFAULTS });
-  assert.equal(env.calls.apply.length, 0);
-  assert.equal(env.calls.command.length, 0);
-  assert.equal(env.state.get('mediaPath'), 'D:/old.png');
-  assert.equal(panel.latest().liveEnabled, true);
-  assert.equal(panel.latest().busy, false);
-  assert.ok(panel.latest().error);
-});
-
-test('extension disposal cancels an active link download and cannot apply its late result', async () => {
-  let finish, signal;
-  const env = harness({ resolveMediaLink: async (_url, _kind, options) => {
-    signal = options.signal; return new Promise(resolve => { finish = resolve; });
-  }, state: { mediaPath: 'D:/old.png', injectionConsent: true } });
-  const panel = attachPanel(env); await settle();
-  const work = panel.send({ type: 'chooseUrl', kind: 'image', url: 'https://cdn.example.com/a.png', config: DEFAULTS });
-  await settle();
-  assert.ok(signal);
-  env.dispose(); assert.equal(signal.aborted, true);
-  finish('D:/late.png'); await work;
-  assert.equal(env.calls.apply.length, 0);
-  assert.equal(env.state.get('mediaPath'), 'D:/old.png');
+test('a failed folder save rolls back optimistic preference and preserves the usable library', async t => {
+  const env = harness({ state: { wallpaperEnginePath: 'D:/old' }, files: [{ scheme: 'file', fsPath: 'D:/new' }],
+    library: async ({ installPath }) => ({ installPath, items: [] }),
+    updateState: async (key, value) => { if (key === 'wallpaperEnginePath' && value === 'D:/new') throw new Error('disk locked'); } });
+  t.after(() => env.dispose()); const panel = attachPanel(env); await panel.send({ type: 'ready' });
+  await panel.send({ type: 'chooseWallpaperFolder' });
+  assert.equal(env.state.get('wallpaperEnginePath'), 'D:/old');
+  assert.equal(panel.latest().wallpaperEngine.installPath, 'D:/old');
+  assert.match(panel.latest().wallpaperEngine.error, /无法保存/);
 });
 
 test('a loaded live renderer applies new media and settings without reload or repeated media copies', async () => {
@@ -376,31 +346,6 @@ function attachPanel(env) {
     latest: () => messages.at(-1)
   };
 }
-
-test('region changes are saved structurally and successful live edits remain quiet', async () => {
-  const env = harness({ version: '0.9.0', liveProtocol: 1, captureTimers: true,
-    state: { enabled: true, mediaPath: 'D:/saved.png', injectionConsent: true, lastAppliedExtensionVersion: '0.9.0' } });
-  const panel = attachPanel(env);
-  await settle();
-  const regions = { enabled: true, items: [{ id: 'left', name: 'Clear', points: [[0, 0], [0.5, 0], [0.5, 1], [0, 1]], feather: 0.06, blur: 0, opacity: 1, tintOpacity: 0, brightness: 1, saturation: 1 }] };
-  await panel.send({ type: 'liveConfig', requestId: 1, config: { ...DEFAULTS, regions } });
-  assert.deepEqual(env.calls.updateConfig[0].config.regions, regions);
-  assert.deepEqual(env.calls.configurationWrites, [{ key: 'regions', value: regions, target: 1 }]);
-  assert.equal(panel.latest().notice, null);
-  assert.equal(panel.latest().needsReload, false);
-  await panel.send({ type: 'liveConfig', requestId: 2, config: { ...DEFAULTS, regions: JSON.parse(JSON.stringify(regions)) } });
-  assert.equal(env.calls.configurationWrites.length, 1, 'equivalent region objects are not repeatedly persisted');
-  assert.equal(env.timers.size, 0, 'internal writes do not schedule a competing effect update');
-  const softerRegions = { ...regions, items: regions.items.map(region => ({ ...region, feather: 0.12 })) };
-  await panel.send({ type: 'liveConfig', requestId: 3, config: { ...DEFAULTS, regions: softerRegions } });
-  assert.equal(env.calls.configurationWrites.length, 2, 'a feather-only edit persists once');
-  assert.deepEqual(env.calls.updateConfig.at(-1).config.regions, softerRegions);
-  assert.equal(panel.latest().needsReload, false);
-  await panel.send({ type: 'apply', config: { ...DEFAULTS, regions: softerRegions } });
-  assert.equal(panel.latest().notice, null, 'manual successful live apply has no redundant banner');
-  assert.equal(env.calls.command.length, 0);
-  env.dispose();
-});
 
 test('canceling either file picker never patches or requests first-use consent', async () => {
   for (const command of ['selectImage', 'selectVideo']) {
