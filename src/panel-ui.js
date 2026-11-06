@@ -6,7 +6,7 @@ function escapeAttribute(value) {
   return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 }
 
-function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, sourceUri, hlsUri, webmUri, nonce, language = 'en' }) {
+function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, webmUri, nonce, language = 'en' }) {
   language = normalizeLanguage(language);
   const text = key => escapeAttribute(t(language, key));
   const label = key => `<span data-i18n="${escapeAttribute(key)}">${text(key)}</span>`;
@@ -17,7 +17,7 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, 
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${asset} data:; media-src ${asset} https: blob:; connect-src https:; style-src ${asset}; script-src 'nonce-${token}';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${asset} data:; media-src ${asset} blob:; connect-src ${asset}; style-src ${asset}; script-src 'nonce-${token}';">
   <link href="${escapeAttribute(styleUri)}" rel="stylesheet">
   <title data-i18n="毛玻璃背景">${text("毛玻璃背景")}</title>
 </head>
@@ -33,9 +33,7 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, 
       <div class="preview" id="preview">
         <div class="preview-base" aria-hidden="true"></div>
         <div class="preview-media" id="preview-media" aria-hidden="true"></div>
-        <canvas class="region-canvas" id="region-canvas" aria-hidden="true" hidden></canvas>
         <div class="preview-tint" aria-hidden="true"></div>
-        <svg class="region-overlay" id="region-overlay" tabindex="0" role="application" data-i18n-aria-label="区域绘制画布" aria-label="${text("区域绘制画布")}" aria-describedby="region-drawing-help" hidden></svg>
         <div class="preview-topline"><span class="preview-caption">${label("效果预览")}</span><span class="preview-live"><span></span>${label("实时")}</span></div>
         <div class="preview-code" aria-hidden="true">
           <div><i>01</i><span class="syntax-muted">${label("// 留一点风景给灵感")}</span></div>
@@ -48,43 +46,26 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, 
         <span class="preview-error" id="preview-error" hidden></span>
         <span class="preview-loading" id="preview-loading" role="status" hidden></span>
       </div>
-      <div class="region-drawing-tools" id="region-drawing-tools" hidden>
-        <div class="region-tool-buttons" role="group" data-i18n-aria-label="绘制工具" aria-label="${text("绘制工具")}"><button type="button" data-region-tool="select" aria-pressed="true">${label("选择")}</button><button type="button" data-region-tool="rect" aria-pressed="false">${label("矩形")}</button><button type="button" data-region-tool="lasso" aria-pressed="false">${label("套索")}</button><button type="button" data-region-tool="polygon" aria-pressed="false">${label("多边形")}</button></div>
-        <label class="region-preview-switch"><input type="checkbox" id="region-show-effects" checked>${label("显示效果")}</label>
-        <div class="region-draw-actions"><button type="button" class="text-button" id="region-finish">${label("完成选区")}</button><button type="button" class="text-button" id="region-cancel">${label("取消绘制")}</button><button type="button" class="text-button" id="region-done">${label("完成编辑")}</button></div>
-        <p class="region-help" id="region-drawing-help">${label("拖动选区可移动位置。方向键切换区域，Delete删除。")}</p>
-        <p class="region-drawing-error" id="region-drawing-error" role="alert" hidden></p>
-      </div>
       <div class="media-caption"><span class="media-kind" id="media-kind">${label("未选择背景")}</span><span class="media-name" id="media-name">${label("从本机选择文件")}</span></div>
-      <div class="media-origin" id="media-origin" hidden></div>
       <div class="media-actions">
         <button type="button" class="secondary-button" id="choose-image"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><rect x="2.5" y="3.5" width="15" height="13" rx="2"/><circle cx="7" cy="7.5" r="1.3"/><path d="m3 14 4-4 3.5 3 2.5-2.5 4 4"/></svg>${label("选择图片")}</button>
         <button type="button" class="secondary-button" id="choose-video"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><rect x="2.5" y="3.5" width="15" height="13" rx="2"/><path d="m8 7 5 3-5 3Z"/></svg>${label("选择视频")}</button>
       </div>
-      <details class="source-link-card" id="source-link-card">
-        <summary>${label("外部链接")}</summary>
-        <label for="source-url" class="sr-only">${label("媒体链接")}</label><input id="source-url" type="url" placeholder="https://…" inputmode="url" autocomplete="off" spellcheck="false" maxlength="8192" aria-describedby="source-hint source-error">
-        <div class="source-link-actions"><label for="source-kind" class="sr-only">${label("链接类型")}</label><select id="source-kind"><option value="auto" data-i18n="自动识别">${text("自动识别")}</option><option value="image" data-i18n="图片">${text("图片")}</option><option value="video" data-i18n="视频">${text("视频")}</option><option value="hls" data-i18n="HLS直播">${text("HLS直播")}</option></select><button type="button" class="secondary-button" id="choose-url" disabled>${label("载入链接")}</button></div>
-        <p class="source-hint" id="source-hint">${label("支持图片、视频直链、YouTube 视频与 HLS 直播；Twitch 在官方网页打开。")}</p>
-        <p class="source-error" id="source-error" role="alert" hidden></p>
-      </details>
     </section>
 
-    <details class="regions-section" id="regions-section">
-      <summary><span>${label("区域效果")}</span><span class="region-count" id="region-count"></span></summary>
-      <label class="switch-control" for="regions-enabled"><span>${label("启用独立区域")}</span><input type="checkbox" role="switch" id="regions-enabled"><span class="switch-track" aria-hidden="true"></span></label>
-      <div class="region-template-row"><select id="region-template" data-i18n-aria-label="区域模板" aria-label="${text("区域模板")}" data-i18n-title="选择模板立即替换当前区域" title="${text("选择模板立即替换当前区域")}"><option value="" data-i18n="选择模板">${text("选择模板")}</option><option value="vertical" data-i18n="左右分区">${text("左右分区")}</option><option value="horizontal" data-i18n="上下分区">${text("上下分区")}</option><option value="columns" data-i18n="三列">${text("三列")}</option><option value="grid" data-i18n="四宫格">${text("四宫格")}</option><option value="center" data-i18n="中心清晰">${text("中心清晰")}</option></select></div>
-      <div class="region-edit-actions"><button type="button" class="secondary-button" id="region-edit" aria-pressed="false">${label("编辑选区")}</button><button type="button" class="text-button" id="region-clear">${label("清空区域")}</button></div>
-      <p class="region-help" id="region-empty">${label("先套用模板，或在预览中绘制。最多8个区域；重叠时后面的区域优先。")}</p>
-      <div id="region-properties" hidden>
-        <div class="select-control"><label for="region-select">${label("当前区域")}</label><select id="region-select"></select></div>
-        <label class="region-name-label" for="region-name">${label("区域名称")}</label><input type="text" class="region-name-input" id="region-name" maxlength="40">
-        <div class="region-property-actions"><button type="button" class="text-button" id="region-sharp">${label("设为清晰")}</button><button type="button" class="text-button" id="region-delete">${label("删除区域")}</button></div>
-        ${[['blur', '模糊程度', 0, 60, 1, 14], ['opacity', '背景浓度', 0.05, 1, 0.01, 0.35], ['tintOpacity', '玻璃蒙层', 0, 0.9, 0.01, 0.18], ['brightness', '亮度', 0.2, 2, 0.05, 1], ['saturation', '饱和度', 0, 2, 0.05, 1], ['feather', '渐变过渡', 0, 0.3, 0.01, 0.06]].map(([key, name, min, max, step, value]) => `<div class="range-control"><div class="control-label"><label for="region-${key}">${label(name)}</label><output for="region-${key}" id="region-${key}-value"></output></div><input type="range" id="region-${key}" min="${min}" max="${max}" step="${step}" value="${value}"></div>`).join('')}
-        <p class="region-help">${label("按画面短边计算，0%为清晰边界。")}</p>
-      </div>
-      <p class="region-help" id="region-limit" role="status" hidden>${label("已达到8个区域，请先删除一个区域。")}</p>
-    </details>
+    <section class="wallpaper-section" id="wallpaper-section" aria-labelledby="wallpaper-heading">
+      <div class="section-heading"><h2 id="wallpaper-heading">Wallpaper Engine</h2><button type="button" class="text-button" id="wallpaper-refresh">${label("刷新")}</button></div>
+      <p class="wallpaper-status" id="wallpaper-status" role="status">${label("连接本机壁纸库")}</p>
+      <label class="sr-only" for="wallpaper-search">${label("搜索本机壁纸")}</label><input type="search" id="wallpaper-search" maxlength="120" autocomplete="off" data-i18n-placeholder="搜索本机壁纸" placeholder="${text("搜索本机壁纸")}" data-i18n-aria-label="搜索本机壁纸" aria-label="${text("搜索本机壁纸")}">
+      <label class="wallpaper-filter"><input type="checkbox" id="wallpaper-supported" checked>${label("仅显示可用于代码区的壁纸")}</label>
+      <div class="wallpaper-actions"><button type="button" class="secondary-button" id="wallpaper-folder">${label("选择文件夹")}</button><button type="button" class="secondary-button" id="wallpaper-workshop" aria-describedby="wallpaper-workshop-hint">${label("在创意工坊搜索")} ↗</button></div>
+      <p class="wallpaper-help" id="wallpaper-workshop-hint">${label("将打开 Steam 官方页面；订阅并下载后，请刷新本机壁纸库。")}</p>
+      <div class="wallpaper-error" id="wallpaper-error" role="alert" hidden></div>
+      <p class="wallpaper-help" id="wallpaper-empty"></p>
+      <div class="wallpaper-list" id="wallpaper-list"></div>
+      <div class="wallpaper-footer"><span id="wallpaper-count" class="wallpaper-help"></span><button type="button" class="text-button" id="wallpaper-more" hidden>${label("载入更多")}</button></div>
+      <p class="wallpaper-help" id="wallpaper-truncated" hidden>${label("壁纸库较大，仅显示部分结果。")}</p>
+    </section>
 
     <section class="effects-section" aria-labelledby="effects-heading">
       <div class="section-heading"><h2 id="effects-heading">${label("玻璃质感")}</h2><button type="button" class="text-button" id="reset" data-i18n-title="将效果恢复为默认值" title="${text("将效果恢复为默认值")}">${label("恢复默认")}</button></div>
@@ -131,9 +112,6 @@ function renderPanelHtml({ cspSource, scriptUri, styleUri, i18nUri, regionsUri, 
     <div class="footer-secondary"><button type="button" class="text-button" id="restore" disabled>${label("关闭背景并恢复")}</button></div>
   </footer>
   <script nonce="${token}" src="${escapeAttribute(i18nUri)}"></script>
-  ${sourceUri ? `<script nonce="${token}" src="${escapeAttribute(sourceUri)}"></script>` : ''}
-  ${regionsUri ? `<script nonce="${token}" src="${escapeAttribute(regionsUri)}"></script>` : ''}
-  ${hlsUri ? `<script nonce="${token}" src="${escapeAttribute(hlsUri)}"></script>` : ''}
   ${webmUri ? `<script nonce="${token}" src="${escapeAttribute(webmUri)}"></script>` : ''}
   <script nonce="${token}" src="${escapeAttribute(scriptUri)}"></script>
 </body>

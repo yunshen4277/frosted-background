@@ -5,9 +5,7 @@ const crypto = require('node:crypto');
 const { DEFAULTS, normalizeConfig } = require('./config');
 const { renderPanelHtml } = require('./panel-ui');
 const { normalizeLanguage, t, describeError } = require('./localization');
-const { normalizeRemoteSource, displayName } = require('../media/source');
-
-const readSelection = context => context.globalState.get('mediaSource') || context.globalState.get('mediaPath');
+const readSelection = context => !context.globalState.get('mediaSource') && typeof context.globalState.get('mediaPath') === 'string' ? context.globalState.get('mediaPath') : undefined;
 const sameSelection = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 
 // A webview can change values, but only the native file picker chooses paths.
@@ -46,9 +44,6 @@ class BackgroundPanel {
       scriptUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/panel.js'))).toString(),
       styleUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/panel.css'))).toString(),
       i18nUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/i18n.js'))).toString(),
-      regionsUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/regions.js'))).toString(),
-      hlsUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/vendor/hls.min.js'))).toString(),
-      sourceUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/source.js'))).toString(),
       webmUri: webview.asWebviewUri(this.vscode.Uri.file(this.context.asAbsolutePath('media/webm-player.js'))).toString(),
       language: this.language,
       nonce: crypto.randomBytes(24).toString('base64')
@@ -74,12 +69,7 @@ class BackgroundPanel {
     this.view.title = t(this.language, '背景控制面板');
     const roots = [this.vscode.Uri.file(this.context.asAbsolutePath('media'))];
     let media = null;
-    if (this.mediaPath && typeof this.mediaPath === 'object') {
-      try {
-        const source = normalizeRemoteSource(this.mediaPath);
-        media = { name: displayName(source.url), kind: 'video', type: 'hls', uri: source.url, sourceUrl: new URL(source.url).origin };
-      } catch { this.error = new Error('请输入有效的 HTTPS 媒体链接，不支持本机地址或包含账号密码的链接。'); }
-    } else if (this.mediaPath) {
+    if (typeof this.mediaPath === 'string' && this.mediaPath) {
       roots.push(this.vscode.Uri.file(path.dirname(this.mediaPath)));
       media = {
         name: path.basename(this.mediaPath),
@@ -87,14 +77,36 @@ class BackgroundPanel {
         uri: webview.asWebviewUri(this.vscode.Uri.file(this.mediaPath)).toString()
       };
     }
-    webview.options = { enableScripts: true, localResourceRoots: roots };
+    const library = this.callbacks.readWallpaperState?.();
+    const wallpaperEngine = library ? {
+      connected: Boolean(library.connected), loading: Boolean(library.loading), installPath: library.installPath || null,
+      error: this.feedback(library.error), truncated: Boolean(library.truncated), total: library.items.length,
+      items: library.items.map(item => {
+        let previewUri;
+        if (item.previewPath) {
+          roots.push(this.vscode.Uri.file(path.dirname(item.previewPath)));
+          previewUri = webview.asWebviewUri(this.vscode.Uri.file(item.previewPath)).toString();
+        }
+        const reasons = {
+          'unsupported-type': '此壁纸需要 Wallpaper Engine 渲染，不能直接用于代码区。',
+          'missing-media': '壁纸文件未下载完整，请在 Steam 中完成下载后刷新。',
+          'too-large': '壁纸超过 500 MB，请选择较小的文件。',
+          'invalid-project': '壁纸项目无效或尚未下载完整。',
+          'unsafe-path': '壁纸引用的文件不在项目文件夹内，无法应用。'
+        };
+        return { id: item.id, title: item.title, type: item.type, supported: Boolean(item.supported), previewUri,
+          reason: item.supported ? null : t(this.language, reasons[item.reason] || '此壁纸暂不支持用于代码区。') };
+      })
+    } : { connected: false, loading: false, items: [], error: null };
+    const uniqueRoots = [...new Map(roots.map(uri => [uri.toString(), uri])).values()];
+    webview.options = { enableScripts: true, localResourceRoots: uniqueRoots };
     const update = this.callbacks.readUpdateState?.() || null;
     const state = {
       type: 'state', language: this.language, config: this.callbacks.readConfig(), defaults: { ...DEFAULTS },
       enabled: this.context.globalState.get('enabled', false), media,
       busy: this.pending || this.callbacks.isBusy(), error: this.feedback(this.languageError || this.error),
       notice: this.feedback(this.notice), needsReload: this.needsReload || Boolean(this.callbacks.needsBootstrap?.()) || Boolean(update?.pendingVersion), resetDraft, update,
-      liveEnabled: this.canApplyLive(), liveApplying: this.liveApplying, liveAck: this.liveAck
+      liveEnabled: this.canApplyLive(), liveApplying: this.liveApplying, liveAck: this.liveAck, wallpaperEngine
     };
     return Promise.resolve(webview.postMessage(state)).catch(error => this.callbacks.log(error));
   }
@@ -154,8 +166,11 @@ class BackgroundPanel {
 
   async receive(message) {
     if (this.disposed || !message || typeof message !== 'object' || Array.isArray(message)) return;
-    if (!['ready', 'closePanel', 'setLanguage', 'liveConfig', 'chooseMedia', 'chooseUrl', 'apply', 'restore', 'reload', 'checkUpdates', 'setUpdateMode'].includes(message.type)) return;
-    if (message.type === 'ready') return this.refresh();
+    if (!['ready', 'closePanel', 'setLanguage', 'liveConfig', 'chooseMedia', 'applyWallpaper', 'refreshWallpapers', 'chooseWallpaperFolder', 'searchWorkshop', 'apply', 'restore', 'reload', 'checkUpdates', 'setUpdateMode'].includes(message.type)) return;
+    if (message.type === 'ready') {
+      await this.refresh();
+      return this.callbacks.ensureWallpapers?.();
+    }
     // Hiding the controls must remain available while an unrelated operation is
     // pending, without changing media, enabled state, or the unsaved draft.
     if (message.type === 'closePanel') return this.callbacks.closePanel?.();
@@ -163,7 +178,8 @@ class BackgroundPanel {
     if (message.type === 'liveConfig') return this.receiveLiveConfig(message);
     if (this.pending || this.callbacks.isBusy()) return;
     if (message.type === 'chooseMedia' && !['image', 'video'].includes(message.kind)) return;
-    if (message.type === 'chooseUrl' && (typeof message.url !== 'string' || message.url.length > 8192 || !['auto', 'image', 'video', 'hls'].includes(message.kind))) return;
+    if (message.type === 'applyWallpaper' && (typeof message.id !== 'string' || !/^[a-f0-9]{64}$/.test(message.id))) return;
+    if (message.type === 'searchWorkshop' && (typeof message.query !== 'string' || message.query.length > 200)) return;
     if (message.type === 'apply' && (!message.config || typeof message.config !== 'object' || Array.isArray(message.config))) return;
     if (message.type === 'setUpdateMode' && !['automatic', 'notify', 'off'].includes(message.mode)) return;
     this.pending = true;
@@ -177,12 +193,16 @@ class BackgroundPanel {
       await this.liveWork;
       this.error = null;
       this.notice = null;
-      if (message.type === 'chooseMedia' || message.type === 'chooseUrl') {
-        const selected = message.type === 'chooseUrl' ? await this.callbacks.chooseUrl(message.url, message.kind) : await this.callbacks.chooseMedia(message.kind);
+      if (message.type === 'refreshWallpapers') {
+        await this.callbacks.refreshWallpapers?.();
+      } else if (message.type === 'chooseWallpaperFolder') {
+        await this.callbacks.chooseWallpaperFolder?.();
+      } else if (message.type === 'searchWorkshop') {
+        await this.callbacks.searchWorkshop?.(message.query);
+      } else if (message.type === 'chooseMedia' || message.type === 'applyWallpaper') {
+        const selected = message.type === 'applyWallpaper' ? await this.callbacks.chooseWallpaper?.(message.id) : await this.callbacks.chooseMedia(message.kind);
         if (this.disposed) return;
-        if (selected?.openedExternal) {
-          this.notice = { key: '已在浏览器打开官方播放页，当前背景保持不变。' };
-        } else if (selected) {
+        if (typeof selected === 'string' && selected) {
           this.mediaPath = selected;
           this.mediaApplyFailed = true;
           const config = message.config && typeof message.config === 'object' && !Array.isArray(message.config)

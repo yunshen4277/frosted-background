@@ -7,9 +7,7 @@ const patcher = require('./patcher');
 const { BackgroundPanel } = require('./panel');
 const { UpdateController } = require('./updater');
 const { normalizeLanguage, t, localizedError, describeError: translateError } = require('./localization');
-const { resolveMediaLink } = require('./remote-media');
-const { resolveYouTubeLink } = require('./youtube-media');
-const { classifyLink, normalizeRemoteSource, displayName } = require('../media/source');
+const wallpaperEngine = require('./wallpaper-engine');
 
 function activate(context) {
   const readLanguage = () => normalizeLanguage(context.globalState.get('language'));
@@ -19,14 +17,26 @@ function activate(context) {
   let busy = false;
   let changeTimer;
   let disposed = false;
-  const mediaDownloads = new Set();
   let savingConfig = false;
   let liveConfigBusy = false;
   let runtimeReady = false;
   let panel;
   let updater;
-  const extensionVersion = context.extension?.packageJSON?.version || '0.11.1';
-  const readSelection = () => context.globalState.get('mediaSource') || context.globalState.get('mediaPath');
+  const extensionVersion = context.extension?.packageJSON?.version || '0.12.0';
+  const readSelection = () => !context.globalState.get('mediaSource') && typeof context.globalState.get('mediaPath') === 'string' ? context.globalState.get('mediaPath') : undefined;
+  let wallpaperState = { connected: false, loading: false, items: [], error: null };
+  let wallpaperItems = new Map();
+  let wallpaperScan = 0;
+  let wallpaperLoaded = false;
+  const legacyMigration = (async () => {
+    if (!context.globalState.get('mediaSource')) return;
+    if (vscode.env.uiKind === vscode.UIKind.Desktop && context.globalState.get('enabled', false)) {
+      await patcher.restore({ appRoot: vscode.env.appRoot });
+    }
+    await context.globalState.update('enabled', false);
+    await context.globalState.update('mediaSource', undefined);
+    await context.globalState.update('mediaPath', undefined);
+  })();
   const windowSession = typeof vscode.env.sessionId === 'string' && vscode.env.sessionId !== 'someValue.sessionId' ? vscode.env.sessionId : '';
   const bootstrapKey = windowSession ? 'bootstrapRequired:' + windowSession : undefined;
   const markBootstrapRequired = async () => {
@@ -35,7 +45,7 @@ function activate(context) {
   // Snapshot the renderer that this window loaded. Publishing new files does
   // not load a bootstrap into an already-running window.
   const appliedVersionAtActivation = context.globalState.get('lastAppliedExtensionVersion');
-  const initialStatus = vscode.env.uiKind === vscode.UIKind.Desktop && context.globalState.get('enabled', false)
+  const initialStatus = legacyMigration.then(() => vscode.env.uiKind === vscode.UIKind.Desktop && context.globalState.get('enabled', false)
     ? patcher.status({ appRoot: vscode.env.appRoot }).then(async state => {
       if (disposed) return state;
       // The workbench session survives extension-host restarts, unlike activate().
@@ -48,8 +58,10 @@ function activate(context) {
     }) : Promise.resolve().then(async () => {
       if (vscode.env.uiKind === vscode.UIKind.Desktop) await markBootstrapRequired();
       return { installed: false };
-    });
-  initialStatus.catch(() => {});
+    }));
+  initialStatus.catch(error => {
+    if (!disposed && panel) { panel.error = error; panel.refresh(); }
+  });
 
   const readConfig = () => {
     const config = vscode.workspace.getConfiguration('frostedBackground');
@@ -120,7 +132,7 @@ function activate(context) {
     clearTimeout(changeTimer);
     try {
       for (const key of Object.keys(DEFAULTS)) {
-        const changed = key === 'regions' ? JSON.stringify(current[key]) !== JSON.stringify(values[key]) : current[key] !== values[key];
+        const changed = current[key] !== values[key];
         if (changed) await config.update(key, values[key], vscode.ConfigurationTarget.Global);
       }
     } finally { savingConfig = false; }
@@ -128,7 +140,7 @@ function activate(context) {
 
   async function applyMedia(mediaPath, configOverride, fromPanel = false) {
     if (disposed) return { cancelled: true };
-    const remote = typeof mediaPath === 'object' ? normalizeRemoteSource(mediaPath) : undefined;
+    if (typeof mediaPath !== 'string') throw localizedError('请选择本机上的图片或视频。远程工作区中的文件需要先保存到本机。');
     if (!(await confirmFirstUse())) return { cancelled: true };
     await initialStatus.catch(() => {});
     await markBootstrapRequired();
@@ -139,12 +151,12 @@ function activate(context) {
       const result = await patcher.apply({
         appRoot: vscode.env.appRoot,
         rendererPath: context.asAbsolutePath('media/renderer.js'),
-        ...(remote ? { mediaSource: remote } : { mediaPath }),
+        mediaPath,
         config
       });
       // Retain the source path only on this machine. It is never written to workspace settings.
-      await context.globalState.update('mediaPath', remote ? undefined : mediaPath);
-      await context.globalState.update('mediaSource', remote);
+      await context.globalState.update('mediaPath', mediaPath);
+      await context.globalState.update('mediaSource', undefined);
       await context.globalState.update('enabled', true);
       await context.globalState.update('lastVersion', vscode.version);
       await context.globalState.update('lastAppliedExtensionVersion', extensionVersion);
@@ -203,33 +215,70 @@ function activate(context) {
     if (mediaPath) return applyMedia(mediaPath);
   }
 
-  async function chooseMediaLink(url, kind) {
-    const source = classifyLink(url, kind);
-    const youtube = source.type === 'platform' && source.platform === 'YouTube';
-    if (source.type === 'platform' && !youtube) {
-      const opened = await vscode.env.openExternal(vscode.Uri.parse(source.url));
-      if (!opened) throw localizedError('无法打开官方播放页，请检查默认浏览器。');
-      return { openedExternal: true };
+  function wallpaperError(error) {
+    const key = {
+      WE_INVALID_FOLDER: '请选择有效的 Wallpaper Engine 安装文件夹。',
+      WE_NOT_FOUND: '未找到 Wallpaper Engine，请选择安装文件夹。',
+      WE_CHANGED: '壁纸文件已变化，请刷新壁纸库后重新选择。',
+      WE_UNSUPPORTED: '此壁纸需要 Wallpaper Engine 渲染，不能直接用于代码区。',
+      WE_TOO_LARGE: '壁纸超过 500 MB，请选择较小的文件。',
+      WE_SAVE: '无法保存壁纸库文件夹，请重试。',
+      WE_PLATFORM: 'Wallpaper Engine 壁纸库目前仅支持 Windows。'
+    }[error?.code] || '读取壁纸库失败，请检查安装文件夹并重试。';
+    return localizedError(key);
+  }
+
+  async function refreshWallpapers({ installPath, persist = false } = {}) {
+    requireDesktop();
+    const request = ++wallpaperScan;
+    wallpaperState = { ...wallpaperState, loading: true, error: null };
+    panel?.refresh();
+    try {
+      const library = await wallpaperEngine.discoverLibrary({ installPath: installPath || context.globalState.get('wallpaperEnginePath') });
+      if (disposed || request !== wallpaperScan) return;
+      if (persist && !library.installPath) throw Object.assign(new Error('Invalid folder'), { code: 'WE_INVALID_FOLDER' });
+      if (persist) {
+        const previous = context.globalState.get('wallpaperEnginePath');
+        try { await context.globalState.update('wallpaperEnginePath', library.installPath); }
+        catch {
+          try { await context.globalState.update('wallpaperEnginePath', previous); } catch { /* Retain the last usable library and expose the write failure. */ }
+          throw Object.assign(new Error('Library preference was not saved'), { code: 'WE_SAVE' });
+        }
+      }
+      if (disposed || request !== wallpaperScan) return;
+      wallpaperItems = new Map(library.items.map(item => [item.id, item]));
+      wallpaperState = { connected: Boolean(library.installPath), loading: false, installPath: library.installPath,
+        items: library.items, total: library.items.length, truncated: Boolean(library.truncated), error: null };
+      wallpaperLoaded = true;
+    } catch (error) {
+      if (disposed || request !== wallpaperScan) return;
+      wallpaperState = { ...wallpaperState, loading: false, error: wallpaperError(error) };
+      output.appendLine(wallpaperError(error).message);
+    } finally {
+      if (!disposed && request === wallpaperScan) panel?.refresh();
     }
-    const abort = new AbortController();
-    mediaDownloads.add(abort);
-    try { return await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: text(youtube ? '正在准备 YouTube 背景…' : '正在加载外部媒体…'), cancellable: true }, async (progress, token) => {
-      const cancellation = token?.onCancellationRequested(() => abort.abort());
-      if (token?.isCancellationRequested) abort.abort();
-      try {
-        const resolve = youtube ? resolveYouTubeLink : resolveMediaLink;
-        const selected = await resolve(source.url, kind, {
-          directory: path.join(context.globalStorageUri.fsPath, youtube ? 'youtube-media' : 'external-media'), signal: abort.signal,
-          onStage: stage => {
-            const key = { prepare: '首次使用正在准备 YouTube 辅助工具…', resolve: '正在读取 YouTube 视频…', download: '正在缓存 YouTube 背景视频…' }[stage];
-            if (key) progress?.report({ message: text(key) });
-          },
-          onProgress: bytes => progress?.report({ message: text('已下载 {size} MB', { size: Math.round(bytes / 1024 / 1024) }) })
-        });
-        if (disposed || abort.signal.aborted) throw localizedError('已取消链接加载或加载超时。');
-        return selected;
-      } finally { cancellation?.dispose(); }
-    }); } finally { mediaDownloads.delete(abort); }
+  }
+
+  async function chooseWallpaperFolder() {
+    requireDesktop();
+    const selected = await vscode.window.showOpenDialog({ title: text('选择 Wallpaper Engine 安装文件夹'),
+      openLabel: text('连接壁纸库'), canSelectFolders: true, canSelectFiles: false, canSelectMany: false });
+    if (!selected?.[0]) return;
+    if (selected[0].scheme !== 'file') throw localizedError('请选择本机上的图片或视频。远程工作区中的文件需要先保存到本机。');
+    await refreshWallpapers({ installPath: selected[0].fsPath, persist: true });
+  }
+
+  async function chooseWallpaper(id) {
+    requireDesktop();
+    const item = wallpaperItems.get(id);
+    if (!item) throw localizedError('壁纸文件已变化，请刷新壁纸库后重新选择。');
+    try { return await wallpaperEngine.resolveMedia(item); }
+    catch (error) { throw wallpaperError(error); }
+  }
+
+  async function searchWorkshop(query) {
+    const url = wallpaperEngine.buildWorkshopSearchUrl(query);
+    if (!await vscode.env.openExternal(vscode.Uri.parse(url))) throw localizedError('无法打开创意工坊，请检查默认浏览器。');
   }
 
   async function restoreBackground(fromPanel = false) {
@@ -258,7 +307,12 @@ function activate(context) {
     needsBootstrap: () => context.globalState.get('enabled', false) && !runtimeReady,
     liveConfig: applyLiveConfig,
     chooseMedia: kind => runExclusive(() => chooseMediaFile(kind)),
-    chooseUrl: (url, kind) => runExclusive(() => chooseMediaLink(url, kind)),
+    readWallpaperState: () => wallpaperState,
+    ensureWallpapers: () => { if (!wallpaperLoaded && !wallpaperState.loading) return refreshWallpapers(); },
+    refreshWallpapers: () => refreshWallpapers(),
+    chooseWallpaperFolder,
+    chooseWallpaper: id => runExclusive(() => chooseWallpaper(id)),
+    searchWorkshop,
     apply: (mediaPath, config) => runExclusive(() => applyMedia(mediaPath, config, true)),
     restore: () => runExclusive(() => restoreBackground(true)),
     reload: () => vscode.commands.executeCommand('workbench.action.reloadWindow'),
@@ -317,7 +371,7 @@ function activate(context) {
     await vscode.window.showInformationMessage(
       text('毛玻璃背景：{status}{media}。当前 VS Code {version}。', {
         status: text(state.installed ? '已应用' : '未应用'),
-        media: mediaPath ? text('；上次选择：{name}', { name: typeof mediaPath === 'string' ? path.basename(mediaPath) : displayName(mediaPath.url) }) : '', version: vscode.version
+        media: mediaPath ? text('；上次选择：{name}', { name: path.basename(mediaPath) }) : '', version: vscode.version
       })
     );
   });
@@ -345,7 +399,7 @@ function activate(context) {
     };
     changeTimer = setTimeout(applyChangedConfig, 300);
   }));
-  context.subscriptions.push({ dispose: () => { disposed = true; clearTimeout(changeTimer); for (const download of mediaDownloads) download.abort(); mediaDownloads.clear(); } });
+  context.subscriptions.push({ dispose: () => { disposed = true; clearTimeout(changeTimer); wallpaperScan++; wallpaperItems.clear(); } });
 
   // An extension update can refresh an already-enabled, consented background.
   // A missing patch (such as after VS Code itself updates) always needs manual apply.
